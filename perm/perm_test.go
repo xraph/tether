@@ -8,11 +8,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/warden"
+	"github.com/xraph/warden/assignment"
 	wid "github.com/xraph/warden/id"
 	"github.com/xraph/warden/keysmithbridge"
 	"github.com/xraph/warden/role"
@@ -324,7 +326,8 @@ func TestLoadRejectsBadIdentity(t *testing.T) {
 		"nil":        nil,
 		"no tenant":  {PrincipalKind: auth.PrincipalKindAPIKey, PrincipalID: testKey},
 		"no key":     {Tenant: e.ten, PrincipalKind: auth.PrincipalKindAPIKey},
-		"other kind": {Tenant: e.ten, PrincipalKind: "user", PrincipalID: testKey},
+		"no user ID": {Tenant: e.ten, PrincipalKind: auth.PrincipalKindUser},
+		"no kind":    {Tenant: e.ten, PrincipalID: testKey},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -333,6 +336,86 @@ func TestLoadRejectsBadIdentity(t *testing.T) {
 			require.Error(t, err)
 			assert.ErrorIs(t, err, tether.ErrInvalidInput)
 		})
+	}
+}
+
+// assignKind gives the subject of kind (a warden subject kind) and id the role
+// with slug, the way warden's own bridges do.
+func (e *env) assignKind(t *testing.T, kind warden.SubjectKind, subjectID, slug string) {
+	t.Helper()
+
+	r, err := e.eng.Store().GetRoleBySlug(e.ctx, testOrg, "", slug)
+	require.NoError(t, err)
+
+	require.NoError(t, e.eng.Store().CreateAssignment(e.ctx, &assignment.Assignment{
+		ID:          wid.NewAssignmentID(),
+		TenantID:    testOrg,
+		RoleID:      r.ID,
+		SubjectKind: string(kind),
+		SubjectID:   subjectID,
+		CreatedAt:   time.Now().UTC(),
+	}))
+}
+
+func TestLoadUserAndServiceAccountSubjects(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		kind  string
+		wkind warden.SubjectKind
+	}{
+		{"user", auth.PrincipalKindUser, warden.SubjectUser},
+		{"service account", auth.PrincipalKindServiceAccount, warden.SubjectServiceAcct},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			e := newEnv(t)
+			e.createRole(t, "base", "", tetherMD([]string{"shared/%c"}, nil))
+			e.createRole(t, "viewer", "base", tetherMD(nil, []string{"users/%u/inbox"}))
+			e.assignKind(t, tc.wkind, "ausr_alice", "viewer")
+
+			ident := &auth.Identity{Tenant: e.ten, PrincipalKind: tc.kind, PrincipalID: "ausr_alice"}
+
+			rules, roleIDs, err := perm.NewLoader(e.eng).Load(t.Context(), ident)
+			require.NoError(t, err)
+
+			assert.Equal(t, []string{"shared/%c"}, rules.Publish, "inherited grants come along")
+			assert.Equal(t, []string{"users/%u/inbox"}, rules.Subscribe)
+			assert.ElementsMatch(t, []string{e.roleID(t, "base"), e.roleID(t, "viewer")}, roleIDs)
+		})
+	}
+}
+
+func TestLoadDoesNotCrossSubjectKinds(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	e.createRole(t, "viewer", "", tetherMD([]string{"x"}, nil))
+	e.assignKind(t, warden.SubjectUser, "same-id", "viewer")
+
+	l := perm.NewLoader(e.eng)
+
+	for _, kind := range []string{auth.PrincipalKindAPIKey, auth.PrincipalKindServiceAccount} {
+		rules, roleIDs, err := l.Load(t.Context(), &auth.Identity{Tenant: e.ten, PrincipalKind: kind, PrincipalID: "same-id"})
+		require.NoError(t, err)
+
+		assert.Empty(t, rules.Publish, kind)
+		assert.Empty(t, roleIDs, kind)
+	}
+}
+
+func TestLoadRefusesPrincipalsThatCannotConnect(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	l := perm.NewLoader(e.eng)
+
+	for _, kind := range []string{"agent", "workload", "robot", "service_acct"} {
+		_, _, err := l.Load(t.Context(), &auth.Identity{Tenant: e.ten, PrincipalKind: kind, PrincipalID: "x"})
+		require.ErrorIs(t, err, auth.ErrNotAuthorized, kind)
+		assert.False(t, errors.Is(err, tether.ErrInvalidInput), kind)
 	}
 }
 

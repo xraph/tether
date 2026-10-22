@@ -4,8 +4,7 @@ import (
 	"context"
 
 	"github.com/mochi-mqtt/server/v2/packets"
-
-	"github.com/xraph/tether/auth"
+	"github.com/xraph/warden"
 )
 
 // BrokerControl is the part of *broker.Broker the reactor drives.
@@ -31,8 +30,9 @@ type reactor struct {
 //     Live connections stay; the previous secret keeps working for its grace
 //     window, and the next CONNECT validates against keysmith again.
 //   - RolesChanged: reload the connections whose grants came from the role.
-//   - SubjectChanged for an "api_key" subject: reload that key's
-//     connections. Other subject kinds are ignored, since only keys connect.
+//   - SubjectChanged for an "api_key", "user" or "service_acct" subject:
+//     reload that principal's connections. Other subject kinds are ignored,
+//     since only those connect.
 //
 // Eviction comes first, so a client that reconnects after the disconnect is
 // validated against keysmith, not the cache. Empty IDs are ignored.
@@ -63,9 +63,22 @@ func (r *reactor) RolesChanged(ctx context.Context, roleID string) {
 }
 
 func (r *reactor) SubjectChanged(ctx context.Context, subjectKind, subjectID string) {
-	if subjectKind != auth.PrincipalKindAPIKey || subjectID == "" {
+	if subjectID == "" || !connects(subjectKind) {
 		return
 	}
 
 	r.b.ReloadPrincipal(ctx, subjectID)
+}
+
+// connects reports whether warden subjects of this kind can hold an MQTT
+// connection: API keys (devices), users and service accounts (JWT clients).
+// It names warden's kinds, which are the ones assignment events carry; see
+// perm.SubjectKind for the mapping from Identity.PrincipalKind.
+func connects(subjectKind string) bool {
+	switch warden.SubjectKind(subjectKind) {
+	case warden.SubjectAPIKey, warden.SubjectUser, warden.SubjectServiceAcct:
+		return true
+	default:
+		return false
+	}
 }

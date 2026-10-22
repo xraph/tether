@@ -3,6 +3,7 @@ package extension
 import (
 	"github.com/xraph/forge"
 
+	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/store"
 )
@@ -19,6 +20,19 @@ func WithConfig(cfg Config) Option {
 // WithBrokerConfig sets the broker's listeners and limits.
 func WithBrokerConfig(cfg broker.Config) Option {
 	return func(e *Extension) { e.config.Broker = cfg }
+}
+
+// WithJWT lets users and service accounts connect with an authsome JWT as the
+// MQTT password, next to device keys. The username must be the token's sub.
+// The JWT carries the tenant (app_id and org_id) and warden roles assigned to
+// the user decide the topics. Without it only keysmith device keys connect.
+// The "jwt" block of the config file sets the same thing; the option wins
+// where it differs from the empty default. A config with any field set is
+// validated at Start, which fails if it is incomplete.
+//
+// POST <base>/v1/publish stays device-only.
+func WithJWT(cfg auth.JWTConfig) Option {
+	return func(e *Extension) { e.config.JWT = cfg }
 }
 
 // WithStore uses s for tenants and devices instead of a grove database from

@@ -231,6 +231,10 @@ func TestReactor(t *testing.T) {
 	r.RolesChanged(ctx, "role_1")
 	r.SubjectChanged(ctx, "api_key", "akey_2")
 	r.SubjectChanged(ctx, "user", "usr_1")
+	r.SubjectChanged(ctx, "service_acct", "svc_1")
+	r.SubjectChanged(ctx, "group", "grp_1")
+	r.SubjectChanged(ctx, "service_account", "svc_2")
+	r.SubjectChanged(ctx, "user", "")
 	r.SubjectChanged(ctx, "api_key", "")
 	r.RolesChanged(ctx, "")
 	r.KeyInvalidated(ctx, "", true)
@@ -241,7 +245,9 @@ func TestReactor(t *testing.T) {
 		{"Evict", []any{"akey_rotated"}},
 		{"ReloadRole", []any{"role_1"}},
 		{"ReloadPrincipal", []any{"akey_2"}},
-	}, b.all(), "a rotation only evicts; user subjects and empty IDs are ignored")
+		{"ReloadPrincipal", []any{"usr_1"}},
+		{"ReloadPrincipal", []any{"svc_1"}},
+	}, b.all(), "a rotation only evicts; users, service accounts and keys reload; other subjects and empty IDs are ignored")
 }
 
 func TestReactorNilEvict(t *testing.T) {

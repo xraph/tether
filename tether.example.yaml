@@ -63,6 +63,18 @@ tether:
     # one is refused with reason code 0x90.
     max_topic_length: 1024
 
+  # Lets users and service accounts connect with an authsome JWT as the MQTT
+  # password (username = the token's sub), next to device keys. Off while
+  # this block is absent. The tokens need an org_id claim, which authsome does
+  # not stamp yet. Uncomment all of jwks_url, issuer and audience to turn it on.
+  # jwt:
+  #   jwks_url: "https://auth.example.com/.well-known/jwks.json"
+  #   issuer: "https://auth.example.com"
+  #   audience: ["tether"]
+  #   algorithms: [RS256, EdDSA, ES256]
+  #   refresh_interval: 10m
+  #   leeway: 30s
+
 # The dashboard has its own section (dashboard:), and its auth is off by
 # default. While it is off, Tether's dashboard pages refuse every request
 # unless the binary runs with --insecure-admin. See the Forge dashboard

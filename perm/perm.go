@@ -183,8 +183,26 @@ func NewLoader(eng *warden.Engine, opts ...LoaderOption) *Loader {
 	return l
 }
 
-// Load returns the merged topic grants of every role the identity's API key
-// holds, inherited roles included, and the IDs of those roles.
+// SubjectKind returns the warden subject kind that holds the role assignments
+// of an identity whose [auth.Identity.PrincipalKind] is principalKind: API
+// keys, users and service accounts. Any other kind, "agent" and "workload"
+// included, returns false: such a principal cannot connect.
+func SubjectKind(principalKind string) (warden.SubjectKind, bool) {
+	switch principalKind {
+	case auth.PrincipalKindAPIKey:
+		return warden.SubjectAPIKey, true
+	case auth.PrincipalKindUser:
+		return warden.SubjectUser, true
+	case auth.PrincipalKindServiceAccount:
+		return warden.SubjectServiceAcct, true
+	default:
+		return "", false
+	}
+}
+
+// Load returns the merged topic grants of every role the identity's
+// principal holds, inherited roles included, and the IDs of those roles. The
+// principal is an API key, a user or a service account; see [SubjectKind].
 //
 // Roles are resolved in the identity's tenant by warden's SubjectRoles, which
 // walks namespace ancestors and parent roles and leaves out expired and
@@ -193,21 +211,26 @@ func NewLoader(eng *warden.Engine, opts ...LoaderOption) *Loader {
 //
 // A role whose [MetadataKey] metadata is malformed is skipped, so one bad role
 // cannot lock a device out of the grants of its others. Its slug is logged at
-// warn level when a logger is set. An identity that is nil, has no tenant, or
-// is not an API key principal with an ID is an error wrapping
-// [tether.ErrInvalidInput], as is any warden failure (wrapped as is).
+// warn level when a logger is set. An identity that is nil, has no tenant or
+// has no principal kind or ID is an error wrapping [tether.ErrInvalidInput], as is any
+// warden failure (wrapped as is). A principal kind that cannot connect is an
+// error wrapping [auth.ErrNotAuthorized].
 func (l *Loader) Load(ctx context.Context, ident *auth.Identity) (acl.Rules, []string, error) {
 	switch {
 	case ident == nil || ident.Tenant == nil:
 		return acl.Rules{}, nil, fmt.Errorf("%w: perm: identity with a tenant is required", tether.ErrInvalidInput)
-	case ident.PrincipalKind != auth.PrincipalKindAPIKey || ident.PrincipalID == "":
-		return acl.Rules{}, nil, fmt.Errorf("%w: perm: identity must be an API key principal with an ID, got kind %q",
-			tether.ErrInvalidInput, ident.PrincipalKind)
+	case ident.PrincipalID == "" || ident.PrincipalKind == "":
+		return acl.Rules{}, nil, fmt.Errorf("%w: perm: identity needs a principal kind and ID", tether.ErrInvalidInput)
+	}
+
+	kind, ok := SubjectKind(ident.PrincipalKind)
+	if !ok {
+		return acl.Rules{}, nil, fmt.Errorf("%w: perm: principal kind %q cannot hold grants", auth.ErrNotAuthorized, ident.PrincipalKind)
 	}
 
 	t := ident.Tenant
 
-	_, all, err := l.eng.SubjectRoles(scope.With(ctx, t.AppID, t.ExternalID), warden.SubjectAPIKey, ident.PrincipalID)
+	_, all, err := l.eng.SubjectRoles(scope.With(ctx, t.AppID, t.ExternalID), kind, ident.PrincipalID)
 	if err != nil {
 		return acl.Rules{}, nil, fmt.Errorf("tether/perm: load roles of %s: %w", ident.PrincipalID, err)
 	}

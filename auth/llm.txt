@@ -5,7 +5,7 @@ Import: github.com/xraph/tether/auth
 Turns MQTT CONNECT credentials into a tenant-scoped identity. The broker calls `Authenticator.Authenticate` from mochi's OnConnectAuthenticate hook and maps the error to a CONNACK reason code with `errors.Is`.
 
 - `Credentials{ClientID, Username string; Password []byte; Remote string; SkipClientIDPin bool}`. `SkipClientIDPin` is for non-MQTT callers that have no client ID (the HTTP publish endpoint); the broker never sets it.
-- `Identity{Tenant *tenant.Tenant; PrincipalKind, PrincipalID, Username, DeviceID, ClientID string; ExpiresAt time.Time}`. `ClientID` is the device's pinned client ID (empty when unpinned), not the one a client sent. `PrincipalKind` is `auth.PrincipalKindAPIKey` ("api_key") and `PrincipalID` the key ID for keysmith. Zero `ExpiresAt` means no expiry; the broker disconnects the client at that time. Callers get a copy.
+- `Identity{Tenant *tenant.Tenant; PrincipalKind, PrincipalID, Username, DeviceID, ClientID string; ExpiresAt time.Time}`. `ClientID` is the device's pinned client ID (empty when unpinned), not the one a client sent. `PrincipalKind` is `auth.PrincipalKindAPIKey` ("api_key") and `PrincipalID` the key ID for keysmith; `PrincipalKindUser` ("user") and `PrincipalKindServiceAccount` ("service_account") with the token subject as `PrincipalID` for JWT. Zero `ExpiresAt` means no expiry; the broker disconnects the client at that time. Callers get a copy.
 - `Authenticator`: `Authenticate(ctx, Credentials) (*Identity, error)`.
 - Errors (every failure wraps exactly one): `ErrBadCredentials` (CONNACK 0x86), `ErrNotAuthorized` (0x87), `ErrUnavailable` (0x88), `ErrRateLimited` (0x9F). `ErrUnavailable` comes only from: a device or tenant lookup failing with anything but not-found, a validator error that is not a recognised keysmith credential error, and a validator result with no key. It does NOT cover a keysmith lookup-store outage (see Known limitation).
 
@@ -28,3 +28,19 @@ Cache: `WithCacheTTL(d)`, default 60 s, zero or less turns it off. Only successf
 ## Static
 
 `NewStatic(map[string]*Identity) Authenticator`: looks up by username, ignores the password, unknown username is `ErrBadCredentials`. For tests and examples only.
+
+## JWT (jwt.go, jwks.go, chain.go)
+
+`NewJWT(cfg JWTConfig, t TenantResolver) (*JWT, error)` authenticates authsome access tokens. The MQTT password is the JWT, the username must equal the token's subject (the broker expands `%u` from the CONNECT username, so it cannot be free text). `JWTConfig{JWKSURL, Issuer string; Audience, Algorithms []string; RefreshInterval, Leeway time.Duration}`, yaml/json snake_case (`jwks_url`, `issuer`, `audience`, `algorithms`, `refresh_interval`, `leeway`); `IsZero()` means off. Construction errors wrap `tether.ErrInvalidInput`: JWKS URL must be absolute http or https (http is allowed, for local dev), issuer and at least one non-empty audience are required, algorithms must be in RS256/384/512, PS256/384/512, ES256/384/512, EdDSA (default RS256, EdDSA, ES256; HS* and "none" are refused in config and never accepted), refresh default 10 min, leeway default 30 s (negative means none).
+
+Decisions, in order:
+1. Password empty or over 8 KiB, unparseable, wrong alg (not in the list), bad signature, no `exp`, expired or not yet valid (with leeway), `iss` not equal to Issuer: `ErrBadCredentials`. authsome's own validator checks neither `iss` nor `aud`; this one checks both. `aud` must contain any one configured audience.
+2. `sub` (falling back to `pid`) empty, or username not equal to it: `ErrBadCredentials`.
+3. `pk` (default "user") other than "user" or "service_account" (agent, workload, anything else), a `cnf.jkt` claim (DPoP-bound, MQTT cannot prove it) or a `client_id` claim (third-party OAuth client, its scope is not enforceable here): `ErrNotAuthorized`.
+4. `app_id` or `org_id` missing: `ErrNotAuthorized` naming the claim. authsome does not stamp `org_id`/`env_id` on issued tokens yet, so real tokens fail here until it does.
+5. `TenantResolver.ResolveTenant(app_id, org_id)`: not found or disabled `ErrNotAuthorized`, other errors `ErrUnavailable`. The result is not cached beyond the resolver's own 30 s cache.
+`Identity`: kind and `PrincipalID`/`Username` as above, `ExpiresAt` = `exp` (the broker disconnects then with 0xA0), `DeviceID` and `ClientID` empty. `SkipClientIDPin` is ignored.
+
+JWKS: plain `net/http`, 5 s timeout, at most 3 redirects, 1 MiB body cap (`ErrUnavailable` "too large"). Keys are cached by `kid`. RSA keys under 2048 bits, symmetric keys, `use: enc` keys and malformed keys are skipped; a response with no usable key fails and never replaces good keys. A key's own JWK `alg`, when present, must equal the token's. A token without `kid` matches only when exactly one key of its algorithm family exists. Fetching: lazily on first use and when older than RefreshInterval; a failed refresh keeps the old keys and backs off 10 s; with no keys at all a failed load answers `ErrUnavailable` and is not retried for 10 s. A token naming an unknown `kid` refetches at most once a minute (`unknownKidInterval`), single-flight: concurrent callers share one request, and the request is detached from the caller's context. Unknown kid after that is `ErrBadCredentials`.
+
+`Chain(jwt, keysmith Authenticator) Authenticator`: a password of three non-empty base64url segments whose first starts "ey" goes to jwt, everything else to keysmith. A JWT-shaped password jwt refuses is not retried on keysmith. Nil jwt returns keysmith. Credentials (SkipClientIDPin included) pass through unchanged.

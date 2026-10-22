@@ -221,11 +221,17 @@ func (e *Extension) Start(ctx context.Context) error {
 
 	tenants := service.NewTenants(st)
 	authn := auth.NewKeysmith(ks, tenants, st)
+
+	connectAuth, err := e.connectAuth(authn, tenants)
+	if err != nil {
+		return err
+	}
+
 	loader := perm.NewLoader(wd, perm.WithLogger(slogger))
 	limiter := limits.New()
 
 	b, err := broker.New(e.config.Broker, broker.Deps{
-		Auth:    authn,
+		Auth:    connectAuth,
 		Perms:   loader,
 		Limits:  limiter,
 		Logger:  slogger,
@@ -275,6 +281,21 @@ func (e *Extension) Start(ctx context.Context) error {
 	e.Logger().Info("tether: broker started", forge.F("mqtt", addrString(b)), forge.F("base_path", e.config.BasePath))
 
 	return nil
+}
+
+// connectAuth returns the authenticator MQTT CONNECT uses: keysmith alone, or
+// with the JWT authenticator in front when the config has a jwt block.
+func (e *Extension) connectAuth(ks auth.Authenticator, tenants auth.TenantResolver) (auth.Authenticator, error) {
+	if e.config.JWT.IsZero() {
+		return ks, nil
+	}
+
+	j, err := auth.NewJWT(e.config.JWT, tenants)
+	if err != nil {
+		return nil, fmt.Errorf("tether: jwt config: %w", err)
+	}
+
+	return auth.Chain(j, ks), nil
 }
 
 // engines returns the keysmith and warden engines from the container. The

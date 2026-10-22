@@ -9,7 +9,7 @@ Turns keysmith key changes and warden role changes into reactions on live MQTT c
 `Handler` is what the plugins report to:
 - `KeyInvalidated(ctx, keyID string, disconnect bool)`: disconnect is true when the key may no longer be used (revoked, suspended, expired, or rotated with no grace window), false for a rotation with a grace window.
 - `RolesChanged(ctx, roleID string)`: a role was updated or deleted, or a permission attached to or detached from it.
-- `SubjectChanged(ctx, subjectKind, subjectID string)`: a role was assigned to or unassigned from a warden subject (`"api_key"` for keysmith keys).
+- `SubjectChanged(ctx, subjectKind, subjectID string)`: a role was assigned to or unassigned from a warden subject (`"api_key"` for keysmith keys, `"user"`, `"service_acct"`).
 
 Called synchronously from inside the engine call that made the change (and from keysmith's ValidateKey for `OnKeyExpired`). Implementations must be quick and must not call back into that engine.
 
@@ -25,7 +25,7 @@ Called synchronously from inside the engine call that made the change (and from 
 - `KeyInvalidated(id, true)`: evict, then `DisconnectPrincipal(id, packets.ErrAdministrativeAction)` (0x98). Eviction comes first so a reconnect is validated by keysmith.
 - `KeyInvalidated(id, false)`: evict only. Live connections stay.
 - `RolesChanged(id)`: `ReloadRole`.
-- `SubjectChanged("api_key", id)`: `ReloadPrincipal`. Other kinds are ignored.
+- `SubjectChanged` with kind `"api_key"`, `"user"` or `"service_acct"` (warden's names): `ReloadPrincipal(id)`. Other kinds and empty IDs are ignored. Principal IDs are matched across kinds, which is fine while key, user and service account IDs are typeIDs with distinct prefixes.
 - Empty IDs are ignored.
 
 Wiring (what the extension does, and what `events_test.go` does): build the keysmith plugin and the warden plugin unbound, pass them to the engines at construction, build `auth.NewKeysmith`, `perm.NewLoader` and the broker, then `r := events.NewReactor(authn.Evict, b)` and `Bind(r)` on both plugins. Device roles go through `service.NewDevices(store, tenants, keysmithEngine, service.NewWardenRoles(wardenEngine))`.

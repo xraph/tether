@@ -1,6 +1,9 @@
 package extension
 
-import "github.com/xraph/tether/broker"
+import (
+	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/broker"
+)
 
 // DefaultBasePath is where the REST API mounts when the config names no
 // base path.
@@ -24,6 +27,12 @@ type Config struct {
 
 	// Broker configures the MQTT listeners and protocol limits.
 	Broker broker.Config `json:"broker" yaml:"broker"`
+
+	// JWT turns on authsome JWT authentication next to device keys: a CONNECT
+	// whose password is a JWT is checked against the identity provider's
+	// JWKS, any other password goes to keysmith. The zero value leaves it off.
+	// See auth.JWTConfig for the fields.
+	JWT auth.JWTConfig `json:"jwt" yaml:"jwt"`
 
 	// RequireConfig makes Register fail when the app's config has no
 	// tether section.

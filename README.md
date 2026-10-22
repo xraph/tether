@@ -125,6 +125,31 @@ Add `dashboard.NewExtension()` from `github.com/xraph/forge/extensions/dashboard
 
 Metrics go through the app's `forge.Metrics`: `tether_connections`, `tether_messages_in_total`, `tether_messages_out_total`, `tether_auth_failures_total{reason}` and `tether_acl_denials_total{op}`. Each package has an `llm.txt` with its full surface.
 
+## Users and apps over JWT
+
+Devices aren't the only clients. A person or a service account can connect with a JWT that authsome issued, as long as you point Tether at authsome's keys:
+
+```yaml
+tether:
+  jwt:
+    jwks_url: "https://auth.example.com/.well-known/jwks.json"
+    issuer: "https://auth.example.com"
+    audience: ["tether"]
+    # algorithms: [RS256, EdDSA, ES256]   # the default
+    # refresh_interval: 10m               # the default
+    # leeway: 30s                         # the default
+```
+
+In your own app that's `extension.WithJWT(auth.JWTConfig{...})`. Leave the block out and nothing changes: only device keys connect.
+
+The client sends the JWT as the MQTT password and the token's `sub` as the username. A password with three base64url segments that starts `ey` goes to the JWT check, anything else goes to keysmith, so one broker takes both. Tether checks the signature against the JWKS, then `exp`, `nbf`, `iss` and `aud`. It checks `iss` and `aud` itself because authsome's own validator doesn't, and a token minted for another service would otherwise pass. HMAC algorithms and `alg: none` are refused, and so is a config that lists them.
+
+The tenant comes from the token's `app_id` and `org_id`, the same pair a keysmith key carries. Warden roles assigned to the user (or service account) decide the topics, with `%u` expanding to the `sub`. Connections close when the token expires, with reason code 0xA0, and a role change reaches the open connection the way it does for a device.
+
+Some tokens are refused on purpose. Agents and workloads can't connect yet. A token bound to a DPoP key needs a proof MQTT can't carry, and one issued to a third-party OAuth client has a scope Tether can't enforce.
+
+One prerequisite, and it's on the authsome side: today authsome doesn't put `org_id` or `env_id` on the tokens it issues. Tether refuses a token without `org_id` (the error names the claim), so this works the day authsome stamps it and not before. The device publish endpoint (`POST <base>/v1/publish`) stays keysmith-only either way.
+
 ## Configuration
 
 The binary reads `--config <path>`, or `./tether.yaml` when that exists, and uses the defaults when it doesn't. Leave a key out and it keeps its default. [`tether.example.yaml`](tether.example.yaml) lists every key with a comment, and a test checks that it matches the defaults.
@@ -159,6 +184,7 @@ tether:
 | `tether.broker.max_session_expiry` | `168h` | The longest session a client may ask for |
 | `tether.broker.max_packet_size` | `1048576` | Largest MQTT packet, and the largest HTTP publish payload |
 | `tether.broker.max_topic_length` | `1024` | A longer topic is refused with reason code 0x90 |
+| `tether.jwt` | off | authsome JWT clients: `jwks_url`, `issuer`, `audience`, `algorithms`, `refresh_interval`, `leeway`. See above |
 
 Environment variables are not a config source here. The one exception is `TETHER_ADMIN_TOKEN`, which is read from the environment and never from the file, so the secret stays out of anything you commit. The `dashboard:` section is the Forge dashboard's own, and it's read from the same file.
 
@@ -169,7 +195,7 @@ In your own app the same `tether:` block goes under `extensions.tether` (or a to
 ## What Phase 1 does
 
 - One node. mochi serves MQTT 3.1.1 and 5 over TCP, TLS and WebSocket, with tenancy enforced in hooks: client IDs and topics are namespaced per tenant on the server, and a tenant's `$SYS` topics are its own.
-- Devices authenticate with keysmith keys, and warden roles with `%c` and `%u` placeholders decide publish and subscribe rights. Topic aliases are off, so an ACL check always sees the real topic.
+- Devices authenticate with keysmith keys, users and service accounts can use authsome JWTs, and warden roles with `%c` and `%u` placeholders decide publish and subscribe rights. Topic aliases are off, so an ACL check always sees the real topic.
 - Revoking a key, changing a role or disabling a tenant reaches connections that are already open.
 - Sessions, subscriptions, in-flight messages and retained messages persist in Badger and survive a restart.
 - Per-tenant connection caps and publish rate limits, a 1 MiB packet limit, and a 1 KiB topic limit.

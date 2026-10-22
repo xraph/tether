@@ -45,6 +45,8 @@ Logging goes through `github.com/xraph/go-utils/log`, which is forge's logger. M
 
 The way an MQTT client proves who it is stays the same everywhere. The username is the keysmith key ID (`akey_...`) and the password is the raw key. Device keys use the keysmith prefix `tdk`, the environment `live`, and carry the device ID in the metadata key `tether_device_id`.
 
+Users and service accounts can also connect with an authsome JWT as the password (`auth.NewJWT`, joined to keysmith by `auth.Chain`). The username is the token's `sub`, the tenant comes from its `app_id` and `org_id`, and `iss` and `aud` are checked here because authsome's validator skips them. Never accept an HMAC algorithm or `none`, and never fetch the JWKS outside the single-flight cache in `auth/jwks.go`.
+
 Permissions come from warden. A role holds its topic rules in the metadata key `tether`, as `{"publish": [...], "subscribe": [...]}`, and the placeholders `%c` (the raw client ID) and `%u` (the username) expand inside those filters.
 
 Tether's mochi hook has to be the only hook that provides `OnConnectAuthenticate` and `OnACLCheck`. Mochi ORs the results of every hook that does and stops at the first `true`, so a second hook would quietly open a door. Don't add one.
