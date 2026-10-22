@@ -174,9 +174,17 @@ func newJWKSCache(url string, refresh time.Duration, now func() time.Time) *jwks
 		now:     now,
 		client: &http.Client{
 			Timeout: jwksTimeout,
-			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			// A redirect may move the JWKS within its origin, never to
+			// another scheme or host: the keys that verify every token
+			// have to come from the server the config names.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) > maxRedirects {
 					return errors.New("too many redirects")
+				}
+
+				if first := via[0].URL; req.URL.Scheme != first.Scheme || req.URL.Host != first.Host {
+					return fmt.Errorf("redirect from %s://%s to %s://%s refused: the JWKS must stay on its origin",
+						first.Scheme, first.Host, req.URL.Scheme, req.URL.Host)
 				}
 
 				return nil

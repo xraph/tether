@@ -78,7 +78,9 @@ tether:
   # Lets users and service accounts connect with an authsome JWT as the MQTT
   # password (username = the token's sub), next to device keys. Off while
   # this block is absent. The tokens need an org_id claim, which authsome does
-  # not stamp yet. Uncomment all of jwks_url, issuer and audience to turn it on.
+  # not stamp yet, an iss equal to issuer and an aud naming one of audience.
+  # Uncomment all of jwks_url, issuer and audience to turn it on. leeway is
+  # the clock skew allowed on nbf; it does not stretch exp.
   # jwt:
   #   jwks_url: "https://auth.example.com/.well-known/jwks.json"
   #   issuer: "https://auth.example.com"

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -67,8 +68,11 @@ type JWTConfig struct {
 	// minute.
 	RefreshInterval time.Duration `json:"refresh_interval" yaml:"refresh_interval"`
 
-	// Leeway is the clock skew tolerated on "exp" and "nbf". Default 30
-	// seconds; a negative value means none.
+	// Leeway is the clock skew tolerated on "nbf": a token a little ahead of
+	// this clock is accepted. Default 30 seconds; a negative value means
+	// none. It does not stretch "exp": the broker refuses credentials whose
+	// expiry has passed and disconnects a client when its token expires,
+	// whatever the leeway.
 	Leeway time.Duration `json:"leeway" yaml:"leeway"`
 }
 
@@ -93,9 +97,11 @@ func (c JWTConfig) IsZero() bool {
 // refused as not authorized. The identity is a copy the caller owns.
 //
 // Tokens that need more than a bearer check are refused: ones bound to a
-// DPoP key ("cnf", which MQTT cannot prove) and ones issued to a third-party
-// OAuth client ("client_id", whose scope Tether cannot enforce). So are
-// principals other than users and service accounts.
+// DPoP key ("cnf", which MQTT cannot prove), ones issued to a third-party
+// OAuth client ("client_id", whose scope Tether cannot enforce) and
+// delegated ones ("act", someone acting for the subject, whom the subject's
+// grants say nothing about). So are principals other than users and service
+// accounts.
 type JWT struct {
 	tenants   TenantResolver
 	keys      *jwksCache
@@ -112,11 +118,12 @@ type JWT struct {
 type wireClaims struct {
 	jwt.RegisteredClaims
 
-	AppID         string `json:"app_id,omitempty"`
-	OrgID         string `json:"org_id,omitempty"`
-	PrincipalKind string `json:"pk,omitempty"`
-	PrincipalID   string `json:"pid,omitempty"`
-	ClientID      string `json:"client_id,omitempty"`
+	AppID         string          `json:"app_id,omitempty"`
+	OrgID         string          `json:"org_id,omitempty"`
+	PrincipalKind string          `json:"pk,omitempty"`
+	PrincipalID   string          `json:"pid,omitempty"`
+	ClientID      string          `json:"client_id,omitempty"`
+	Actor         json.RawMessage `json:"act,omitempty"`
 	Confirmation  *struct {
 		JKT string `json:"jkt,omitempty"`
 	} `json:"cnf,omitempty"`
@@ -304,6 +311,10 @@ func (j *JWT) identity(ctx context.Context, claims *wireClaims, c Credentials) (
 
 	if claims.ClientID != "" {
 		return nil, fmt.Errorf("%w: tokens issued to a third-party client (client_id) are not accepted", ErrNotAuthorized)
+	}
+
+	if len(claims.Actor) > 0 && string(claims.Actor) != "null" {
+		return nil, fmt.Errorf("%w: delegated tokens (act) are not accepted", ErrNotAuthorized)
 	}
 
 	if claims.AppID == "" {

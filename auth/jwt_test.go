@@ -442,6 +442,14 @@ func TestJWTRefusesTokensThatNeedMoreThanBearer(t *testing.T) {
 
 	_, err = k.auth(k.rs256(claims))
 	require.ErrorIs(t, err, ErrNotAuthorized, "a third-party OAuth token carries a scope Tether cannot enforce")
+
+	// A delegated token (RFC 8693 "act") is someone acting for the subject:
+	// the grants would be the subject's, the actor never checked.
+	claims = k.claims()
+	claims["act"] = map[string]any{"sub": "agent-7"}
+
+	_, err = k.auth(k.rs256(claims))
+	require.ErrorIs(t, err, ErrNotAuthorized, "an actor token is refused")
 }
 
 func TestJWTAlgNoneRefused(t *testing.T) {
@@ -750,6 +758,44 @@ func TestJWKSFetchFailures(t *testing.T) {
 
 		_, err := k.auth(k.rs256(k.claims()))
 		require.ErrorIs(t, err, ErrUnavailable)
+	})
+}
+
+// A redirect may move the JWKS within its origin, not to another scheme or
+// host: the keys that verify every token must come from the issuer's own
+// server.
+func TestJWKSRedirectsStayOnTheirOrigin(t *testing.T) {
+	t.Run("same origin", func(t *testing.T) {
+		k := newJWTKit(t)
+		k.setOverride(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/moved" {
+				k.setOverride(nil)
+				http.Redirect(w, r, "/.well-known/jwks.json", http.StatusFound)
+
+				return
+			}
+
+			http.Redirect(w, r, "/moved", http.StatusFound)
+		})
+
+		k.mustAuth(k.rs256(k.claims()))
+	})
+
+	t.Run("another host", func(t *testing.T) {
+		k := newJWTKit(t)
+
+		other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			body, _ := json.Marshal(map[string]any{"keys": []map[string]any{rsaJWK("rsa-a", &rsaKeyA.PublicKey)}})
+			_, _ = w.Write(body)
+		}))
+		t.Cleanup(other.Close)
+
+		k.setOverride(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, other.URL+"/jwks.json", http.StatusFound)
+		})
+
+		_, err := k.auth(k.rs256(k.claims()))
+		require.ErrorIs(t, err, ErrUnavailable, "keys from another host are never fetched")
 	})
 }
 

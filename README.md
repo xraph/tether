@@ -141,18 +141,18 @@ tether:
     audience: ["tether"]
     # algorithms: [RS256, EdDSA, ES256]   # the default
     # refresh_interval: 10m               # the default
-    # leeway: 30s                         # the default
+    # leeway: 30s                         # the default, for nbf only
 ```
 
 In your own app that's `extension.WithJWT(auth.JWTConfig{...})`. Leave the block out and nothing changes: only device keys connect.
 
-The client sends the JWT as the MQTT password and the token's `sub` as the username. A password with three base64url segments that starts `ey` goes to the JWT check, anything else goes to keysmith, so one broker takes both. Tether checks the signature against the JWKS, then `exp`, `nbf`, `iss` and `aud`. It checks `iss` and `aud` itself because authsome's own validator doesn't, and a token minted for another service would otherwise pass. HMAC algorithms and `alg: none` are refused, and so is a config that lists them.
+The client sends the JWT as the MQTT password and the token's `sub` as the username. A password with three base64url segments that starts `ey` goes to the JWT check, anything else goes to keysmith, so one broker takes both. Tether checks the signature against the JWKS, then `exp`, `nbf`, `iss` and `aud`. The leeway is for clock skew on `nbf`; it doesn't stretch `exp`, because the broker drops a connection the moment its token expires. A JWKS that redirects is followed only within its own scheme and host. It checks `iss` and `aud` itself because authsome's own validator doesn't, and a token minted for another service would otherwise pass. HMAC algorithms and `alg: none` are refused, and so is a config that lists them.
 
 The tenant comes from the token's `app_id` and `org_id`, the same pair a keysmith key carries. Warden roles assigned to the user (or service account) decide the topics, with `%u` expanding to the `sub`. Connections close when the token expires, with reason code 0xA0, and a role change reaches the open connection the way it does for a device.
 
-Some tokens are refused on purpose. Agents and workloads can't connect yet. A token bound to a DPoP key needs a proof MQTT can't carry, and one issued to a third-party OAuth client has a scope Tether can't enforce.
+Some tokens are refused on purpose. Agents and workloads can't connect yet. A token bound to a DPoP key needs a proof MQTT can't carry, one issued to a third-party OAuth client has a scope Tether can't enforce, and a delegated token (one with an `act` claim) is somebody acting for the subject, which the subject's roles say nothing about.
 
-One prerequisite, and it's on the authsome side: today authsome doesn't put `org_id` or `env_id` on the tokens it issues. Tether refuses a token without `org_id` (the error names the claim), so this works the day authsome stamps it and not before. The device publish endpoint (`POST <base>/v1/publish`) stays keysmith-only either way.
+The prerequisites are on the authsome side. Today authsome doesn't put `org_id` or `env_id` on the tokens it issues, and Tether refuses a token without `org_id` (the error names the claim), so this works the day authsome stamps it and not before. Its tokens also need an `iss` equal to your `issuer` and an `aud` that names one of your `audience` values. authsome's own validator never looks at either, so nothing on that side tells you when they're missing or wrong; Tether refuses such a token as bad credentials. The device publish endpoint (`POST <base>/v1/publish`) stays keysmith-only either way.
 
 ## Configuration
 
