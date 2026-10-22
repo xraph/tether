@@ -17,6 +17,14 @@ gofmt -s -w . && goimports -w -local github.com/xraph/tether .
 GOWORK=off go mod tidy                    # CI fails if this changes go.mod or go.sum
 ```
 
+The Postgres store tests skip unless `TETHER_TEST_POSTGRES` holds a DSN for a server where the role may `CREATE DATABASE`. Each test makes its own throwaway database and drops it afterwards. For a local run, start a disposable server and point the variable at it:
+
+```sh
+docker run --rm -d --name tether-test-pg -e POSTGRES_PASSWORD=tether -p 127.0.0.1:0:5432 postgres:17-alpine
+TETHER_TEST_POSTGRES="postgres://postgres:tether@127.0.0.1:$(docker port tether-test-pg 5432 | cut -d: -f2)/postgres?sslmode=disable" GOWORK=off go test ./store/postgres
+docker stop tether-test-pg
+```
+
 The Makefile wraps the same things: `make test`, `make test-race`, `make vet`, `make lint`, `make fmt`, `make check` and `make coverage`. There's no `cmd/` directory, so there is nothing to build into a binary.
 
 CI is `.github/workflows/ci.yml`. It calls the shared `xraph/workflows` `go-ci.yml@v1` with Go 1.26 on ubuntu, and adds a goimports format check on top.

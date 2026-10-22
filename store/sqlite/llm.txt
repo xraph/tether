@@ -1,0 +1,28 @@
+# tether/store/sqlite
+
+Import: github.com/xraph/tether/store/sqlite
+
+`store.Store` on SQLite through Grove (modernc.org/sqlite, pure Go). Passes `store/storetest.Run` unchanged.
+
+- `New(db *grove.DB) *Store`. `db` must come from `sqlitedriver`. `Store.DB()` returns it. Call `Migrate(ctx)` before first use: it runs the grove group `sqlite.Migrations` (group name `tether`) and is safe to repeat. The package registers the sqlite migrate executor itself.
+- `DSN(path string) string` adds `_pragma=busy_timeout(5000)`, `_pragma=foreign_keys(1)` and `_txlock=immediate` to a file name or `file:` URI, keeping any of the three the caller already set. Open the database with it, because the settings are per pooled connection and only the DSN reaches all of them:
+
+      sdb := sqlitedriver.New()
+      err := sdb.Open(ctx, sqlite.DSN("tether.db"))
+      db, err := grove.Open(sdb)
+      s := sqlite.New(db)
+
+  Do not use ":memory:": every pooled connection would get its own empty database.
+- `Ping` and `Close` pass through to grove. After `Close`, `Ping` fails.
+
+Schema (`Migrations`):
+- `tether_tenants(id PK, app_id, external_id, name, enabled, limits, created_at, updated_at)`, `UNIQUE (app_id, external_id)`.
+- `tether_devices(id PK, tenant_id, name, key_id UNIQUE, client_id, roles, metadata, created_at, updated_at)`, index `(tenant_id, created_at, id)`.
+- No foreign key from devices to tenants, on purpose: `CreateDevice` does not check the tenant and `DeleteTenant` does not cascade. Do not add one.
+- `limits`, `roles` and `metadata` are JSON text. A nil `Roles` or `Metadata` is stored as JSON `null` and comes back nil, an empty one as `[]` or `{}` and comes back empty. Metadata numbers come back as `float64`, as with any JSON decode, so keep device metadata JSON-shaped. A value JSON cannot encode is rejected as `tether.ErrInvalidInput` before anything is written.
+- Timestamps are INTEGER unix microseconds, not TEXT, so ordering and equality do not depend on how modernc formats a `time.Time` or on the DSN. They read back as UTC.
+
+Behaviour:
+- UNIQUE and PRIMARY KEY violations (typed `*sqlite.Error`, not string matching) map to `tether.ErrConflict`. A write that touches no row maps to `tether.ErrNotFound`. Errors read `tether/sqlite: <op>: ... %w`.
+- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`, so the caller's struct gets the stored value.
+- Lists order by `created_at, id`. An offset without a limit gets an effectively unbounded limit, because SQLite rejects a bare OFFSET.

@@ -1,0 +1,28 @@
+# tether/store/postgres
+
+Import: github.com/xraph/tether/store/postgres
+
+`store.Store` on PostgreSQL through Grove (pgx v5). Passes `store/storetest.Run` unchanged.
+
+- `New(db *grove.DB) *Store`. `db` must come from `pgdriver`. `Store.DB()` returns it. Call `Migrate(ctx)` before first use: it runs the grove group `postgres.Migrations` (group name `tether`) under grove's migration lock and is safe to repeat. The package registers the pg migrate executor itself.
+
+      drv := pgdriver.New()
+      err := drv.Open(ctx, "postgres://user:pass@host:5432/db")
+      db, err := grove.Open(drv)
+      s := postgres.New(db)
+
+- `Ping` and `Close` pass through to grove. After `Close`, `Ping` fails.
+
+Schema (`Migrations`):
+- `tether_tenants(id PK, app_id, external_id, name, enabled, limits JSONB, created_at, updated_at)`, `UNIQUE (app_id, external_id)`.
+- `tether_devices(id PK, tenant_id, name, key_id UNIQUE, client_id, roles JSONB, metadata JSONB, created_at, updated_at)`, index `(tenant_id, created_at, id)`.
+- The `id` columns are `COLLATE "C"` and lists order by `created_at, id COLLATE "C"`. The memory store and the conformance suite break ties by Go byte order, and a database default like en_US.UTF-8 would not. Keep both.
+- No foreign key from devices to tenants, on purpose: `CreateDevice` does not check the tenant and `DeleteTenant` does not cascade. Do not add one.
+- Timestamps are `TIMESTAMPTZ` (microsecond precision) and read back as UTC.
+- The JSONB columns are bound as raw JSON text, so a nil `Roles` or `Metadata` is stored as JSON `null` (never SQL NULL) and comes back nil, an empty one comes back empty. Metadata numbers come back as `float64`. A value JSON cannot encode is rejected as `tether.ErrInvalidInput` before anything is written.
+
+Behaviour:
+- SQLSTATE 23505 (`*pgconn.PgError`) maps to `tether.ErrConflict`. A write that touches no row maps to `tether.ErrNotFound`. Errors read `tether/postgres: <op>: ... %w`.
+- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`.
+
+Tests: skipped unless `TETHER_TEST_POSTGRES` holds a DSN whose role may `CREATE DATABASE`. Each test creates and drops its own database. See AGENTS.md for a disposable-server recipe.
