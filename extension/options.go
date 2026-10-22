@@ -73,3 +73,12 @@ func WithoutWardenEvents() Option {
 func WithLogger(l forge.Logger) Option {
 	return func(e *Extension) { e.logger = l }
 }
+
+// WithInsecureDashboard serves the dashboard intents to requests that carry
+// no authenticated user. Without it they answer UNAUTHENTICATED, which is
+// what you get when the dashboard's own auth is off, the same refusal the
+// REST admin API gives without WithAdminMiddleware. Use it only when the
+// dashboard is reachable by trusted callers alone.
+func WithInsecureDashboard() Option {
+	return func(e *Extension) { e.insecureDashboard = true }
+}

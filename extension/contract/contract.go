@@ -2,10 +2,12 @@
 // dashboard as a contract contributor: a declarative manifest plus typed
 // handlers that call the same services the REST API in package api does.
 //
-// The extension registers it from RegisterContractContributor. The handlers
-// do not authenticate: the dashboard does, and its principals carry no tenant
-// claims, so every tenant-scoped intent takes the tenant as an explicit
-// tenantId and refuses without one.
+// The extension registers it from RegisterContractContributor. Every intent
+// is admitted only for a principal with an authenticated user (set
+// Deps.AllowAnonymous to turn that off), because the dashboard's auth is off
+// unless the host enables it. Who may do what beyond that is the dashboard's
+// policy. Its principals carry no tenant claims, so every tenant-scoped
+// intent takes the tenant as an explicit tenantId and refuses without one.
 package contract
 
 import (
@@ -14,6 +16,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"slices"
 
 	dashcontract "github.com/xraph/forge/extensions/dashboard/contract"
 	"github.com/xraph/forge/extensions/dashboard/contract/dispatcher"
@@ -38,6 +41,14 @@ type ServicesProvider func() *api.Services
 // Deps are the data sources the handlers need.
 type Deps struct {
 	Services ServicesProvider
+
+	// AllowAnonymous serves requests whose principal has no authenticated
+	// user. The default refuses them with UNAUTHENTICATED, before any
+	// handler runs: the dashboard's auth is off unless the host turns it on,
+	// and these intents provision device keys and delete tenants. A
+	// principal has no user when the dashboard's auth is off, and also when
+	// it is on but the request did not authenticate.
+	AllowAnonymous bool
 }
 
 // handlerFunc is the shape of a typed intent handler.
@@ -65,31 +76,36 @@ func Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashc
 
 	sp := deps.Services
 
+	var opts []dispatcher.RegisterOption
+	if !deps.AllowAnonymous {
+		opts = append(opts, dispatcher.BeforeDispatch(requireUser))
+	}
+
+	secret := append(slices.Clone(opts), dispatcher.SecretResponse())
+
 	return errors.Join(
 		// Reads.
-		dispatcher.RegisterQuery(disp, ContributorName, "overview.stats", 1, overviewStatsHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "tenants.list", 1, tenantsListHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "tenants.get", 1, tenantsGetHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "devices.list", 1, devicesListHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "devices.get", 1, devicesGetHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "roles.topics.get", 1, rolesTopicsGetHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "clients.list", 1, clientsListHandler(sp)),
-		dispatcher.RegisterQuery(disp, ContributorName, "retained.list", 1, retainedListHandler(sp)),
+		dispatcher.RegisterQuery(disp, ContributorName, "overview.stats", 1, overviewStatsHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "tenants.list", 1, tenantsListHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "tenants.get", 1, tenantsGetHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "devices.list", 1, devicesListHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "devices.get", 1, devicesGetHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "roles.topics.get", 1, rolesTopicsGetHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "clients.list", 1, clientsListHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "retained.list", 1, retainedListHandler(sp), opts...),
 
 		// Commands.
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.create", 1, tenantsCreateHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.update", 1, tenantsUpdateHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, tenantsDeleteHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.provision", 1, devicesProvisionHandler(sp),
-			dispatcher.SecretResponse()),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.rotate", 1, devicesRotateHandler(sp),
-			dispatcher.SecretResponse()),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.revoke", 1, devicesRevokeHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.delete", 1, devicesDeleteHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.roles.set", 1, devicesRolesSetHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "roles.topics.set", 1, rolesTopicsSetHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "clients.kick", 1, clientsKickHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "sessions.delete", 1, sessionsDeleteHandler(sp)),
-		dispatcher.RegisterCommand(disp, ContributorName, "retained.delete", 1, retainedDeleteHandler(sp)),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.create", 1, tenantsCreateHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.update", 1, tenantsUpdateHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, tenantsDeleteHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.provision", 1, devicesProvisionHandler(sp), secret...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.rotate", 1, devicesRotateHandler(sp), secret...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.revoke", 1, devicesRevokeHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.delete", 1, devicesDeleteHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.roles.set", 1, devicesRolesSetHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "roles.topics.set", 1, rolesTopicsSetHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "clients.kick", 1, clientsKickHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "sessions.delete", 1, sessionsDeleteHandler(sp), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "retained.delete", 1, retainedDeleteHandler(sp), opts...),
 	)
 }

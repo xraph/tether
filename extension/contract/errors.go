@@ -16,6 +16,19 @@ import (
 	"github.com/xraph/tether/tenant"
 )
 
+// requireUser is the admission check of every intent: the principal must
+// carry an authenticated user. The dashboard gives a request no user when its
+// auth is off or the request did not authenticate, and nothing else here
+// checks who is calling, so without this an unauthenticated caller reaches
+// every admin operation.
+func requireUser(_ context.Context, _ dashcontract.Request, p dashcontract.Principal) error {
+	if p.User.Authenticated() {
+		return nil
+	}
+
+	return &dashcontract.Error{Code: dashcontract.CodeUnauthenticated, Message: "authentication required"}
+}
+
 // services returns the live services, or UNAVAILABLE before Tether has
 // started: the dashboard can register the contributor before Start runs.
 func services(sp ServicesProvider) (*api.Services, error) {

@@ -87,6 +87,7 @@ type Extension struct {
 	store               store.Store
 	adminMiddleware     []forge.Middleware
 	insecureAdminRoutes bool
+	insecureDashboard   bool
 	noKeysmithEvents    bool
 	noWardenEvents      bool
 	logger              forge.Logger

@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	dashauth "github.com/xraph/forge/extensions/dashboard/auth"
 	dashcontract "github.com/xraph/forge/extensions/dashboard/contract"
 	"github.com/xraph/forge/extensions/dashboard/contract/dispatcher"
 	"github.com/xraph/forge/extensions/dashboard/contract/loader"
@@ -47,11 +48,27 @@ type harness struct {
 	disp *dispatcher.Dispatcher
 	svc  *api.Services
 	wd   *warden.Engine
+
+	// principal is who the harness dispatches as. By default it is a signed
+	// in admin; the admission tests swap it for an anonymous one.
+	principal dashcontract.Principal
+}
+
+// admin is a principal with an authenticated user.
+func admin() dashcontract.Principal {
+	return dashcontract.PrincipalFor(&dashauth.UserInfo{Subject: "admin-1", Roles: []string{"admin"}})
 }
 
 // newHarness builds the stack. With running false the broker is built and
 // never started, which is what an admin sees while the broker is down.
 func newHarness(t *testing.T, running bool) *harness {
+	t.Helper()
+
+	return newHarnessWith(t, running, Deps{})
+}
+
+// newHarnessWith is newHarness with Deps of its own (Services is filled in).
+func newHarnessWith(t *testing.T, running bool, deps Deps) *harness {
 	t.Helper()
 
 	st := memory.New()
@@ -95,11 +112,12 @@ func newHarness(t *testing.T, running bool) *harness {
 		Limits:  limiter,
 	}
 
-	disp := dispatcher.New(nil)
-	require.NoError(t, Register(disp, dashcontract.NewRegistry(), dashcontract.NewWardenRegistry(),
-		Deps{Services: func() *api.Services { return svc }}))
+	deps.Services = func() *api.Services { return svc }
 
-	return &harness{t: t, disp: disp, svc: svc, wd: wd}
+	disp := dispatcher.New(nil)
+	require.NoError(t, Register(disp, dashcontract.NewRegistry(), dashcontract.NewWardenRegistry(), deps))
+
+	return &harness{t: t, disp: disp, svc: svc, wd: wd, principal: admin()}
 }
 
 // registered returns the manifest's intents that have a handler. It asks the
@@ -153,7 +171,7 @@ func (h *harness) dispatch(kind dashcontract.Kind, intent string, input any) (js
 		req.Payload = raw
 	}
 
-	out, _, err := h.disp.Dispatch(h.t.Context(), req, dashcontract.Principal{})
+	out, _, err := h.disp.Dispatch(h.t.Context(), req, h.principal)
 
 	return out, err
 }
@@ -624,6 +642,7 @@ func TestServicesNotReadyIsUnavailable(t *testing.T) {
 	disp := dispatcher.New(nil)
 	require.NoError(t, Register(disp, dashcontract.NewRegistry(), dashcontract.NewWardenRegistry(),
 		Deps{Services: func() *api.Services { return nil }}))
+	p := admin()
 
 	for _, tc := range []struct {
 		kind   dashcontract.Kind
@@ -638,7 +657,7 @@ func TestServicesNotReadyIsUnavailable(t *testing.T) {
 			Envelope: "v1", Kind: tc.kind, Contributor: ContributorName, Intent: tc.intent, IntentVersion: 1,
 			Params:  map[string]any{"tenantId": "ttnt_01h2xcejqtf2nbrexx3vqjhp41"},
 			Payload: json.RawMessage(`{"tenantId":"ttnt_01h2xcejqtf2nbrexx3vqjhp41","appId":"a","externalId":"b"}`),
-		}, dashcontract.Principal{})
+		}, p)
 		requireCode(t, dashcontract.CodeUnavailable, err)
 	}
 }
@@ -813,4 +832,75 @@ func TestClientsStatsAndKick(t *testing.T) {
 
 	_, err = h.command("clients.kick", map[string]any{"tenantId": a})
 	requireCode(t, dashcontract.CodeBadRequest, err)
+}
+
+// With no authenticated user in the principal (the dashboard's auth is off,
+// or the request did not authenticate) every intent refuses before its
+// handler runs. It runs over the whole manifest so an intent registered
+// without the admission check fails here.
+func TestAnonymousPrincipalIsRefusedByDefault(t *testing.T) {
+	h := newHarness(t, true)
+	tid := h.createTenant("acme")
+
+	m, err := loader.Load(bytes.NewReader(manifestYAML), "tether/contract/manifest.yaml")
+	require.NoError(t, err)
+
+	anonymous := map[string]dashcontract.Principal{
+		"no user":            {},
+		"user without a sub": dashcontract.PrincipalFor(&dashauth.UserInfo{Roles: []string{"admin"}}),
+	}
+
+	for name, p := range anonymous {
+		h.principal = p
+
+		for _, in := range m.Intents {
+			// A valid tenantId: only the admission check can refuse these
+			// with UNAUTHENTICATED.
+			_, derr := h.dispatch(dashcontract.Kind(in.Kind), in.Name, map[string]any{"tenantId": tid})
+			require.Error(t, derr, "%s: %s", name, in.Name)
+			assert.Equal(t, dashcontract.CodeUnauthenticated, code(derr), "%s: %s: %v", name, in.Name, derr)
+		}
+
+		// A refused command did nothing.
+		_, derr := h.dispatch(dashcontract.KindCommand, "tenants.create", map[string]any{"appId": testApp, "externalId": "intruder"})
+		requireCode(t, dashcontract.CodeUnauthenticated, derr)
+
+		_, derr = h.dispatch(dashcontract.KindCommand, "devices.provision", map[string]any{"tenantId": tid, "name": "intruder"})
+		requireCode(t, dashcontract.CodeUnauthenticated, derr)
+	}
+
+	h.principal = admin()
+
+	list := h.mustQuery("tenants.list", map[string]any{})["items"].([]any)
+	require.Len(t, list, 1, "the refused create must not have made a tenant")
+	assert.Equal(t, []any{}, h.mustQuery("devices.list", map[string]any{"tenantId": tid})["items"])
+}
+
+// WithInsecureDashboard maps to Deps.AllowAnonymous: nothing is refused for
+// want of a user, and the handlers behave as they do for a signed-in admin.
+func TestAnonymousPrincipalIsServedWhenAllowed(t *testing.T) {
+	h := newHarnessWith(t, true, Deps{AllowAnonymous: true})
+	h.principal = dashcontract.Principal{}
+
+	tid := h.createTenant("acme")
+
+	list := h.mustQuery("tenants.list", map[string]any{})["items"].([]any)
+	require.Len(t, list, 1)
+
+	creds := h.provision(tid, "d1")
+	assert.NotEmpty(t, creds["password"])
+
+	// The tenantId rule does not depend on who is calling.
+	_, err := h.query("devices.list", map[string]any{})
+	requireCode(t, dashcontract.CodePermissionDenied, err)
+}
+
+// A signed-in principal passes the check, and the check does not look at
+// its roles: role policy is the dashboard's.
+func TestAuthenticatedPrincipalIsServed(t *testing.T) {
+	h := newHarness(t, true)
+	h.principal = dashcontract.PrincipalFor(&dashauth.UserInfo{Subject: "someone"})
+
+	h.createTenant("acme")
+	assert.Len(t, h.mustQuery("tenants.list", map[string]any{})["items"], 1)
 }

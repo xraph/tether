@@ -16,10 +16,10 @@ var _ dashboard.ContractContributorAware = (*Extension)(nil)
 // Services at request time, so they answer UNAVAILABLE until Tether's Start
 // has built them, whichever extension started first.
 //
-// The contributor adds no authentication of its own. The admin REST routes
-// are guarded by WithAdminMiddleware, but the dashboard's intents are guarded
-// by the dashboard: with its auth off (the default) they are open to anyone
-// who can reach it.
+// Every intent refuses a request whose principal has no authenticated user
+// (UNAUTHENTICATED), so a dashboard with its auth off serves nothing here
+// unless you pass WithInsecureDashboard. The contributor stays registered
+// either way, so the plugin still shows its pages and the refusal.
 func (e *Extension) RegisterContractContributor(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry) error {
-	return contract.Register(disp, reg, wreg, contract.Deps{Services: e.Services})
+	return contract.Register(disp, reg, wreg, contract.Deps{Services: e.Services, AllowAnonymous: e.insecureDashboard})
 }
