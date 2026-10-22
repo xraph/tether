@@ -18,7 +18,7 @@ export TETHER_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 That starts MQTT on `:1883` and the HTTP API and dashboard on `:8080`. Everything it stores lands under `./data`: a SQLite file for tenants, devices and keys, and a Badger directory for sessions and retained messages. Stop it with Ctrl-C and it shuts down cleanly.
 
-No token set? It refuses to start and tells you so. On a laptop you can pass `--insecure-admin` instead, which leaves the admin API and the dashboard open to anyone who can reach port 8080. Don't do that on a server.
+No token set? It refuses to start and tells you so. On a laptop you can pass `--insecure-admin` instead, which leaves the admin API and Tether's dashboard pages open to anyone who can reach port 8080. Don't do that on a server. The flag opens the dashboard pages even when a token is set: with both, the REST API still asks for the token, but Tether's dashboard pages answer anonymous requests. `tether --version` prints the version.
 
 Create a tenant. The `app_id` and `external_id` are yours: the pair maps a Tether tenant to whatever your own system calls the customer.
 
@@ -29,16 +29,16 @@ curl -s -X POST localhost:8080/tether/v1/tenants \
   -d '{"app_id":"aapp_demo","external_id":"acme","name":"Acme"}'
 ```
 
-The reply has the tenant's `id`, which looks like `ttnt_01m5...`. Next comes a role. A role carries topic grants, and `%c` and `%u` expand to the client ID and the username when the device connects. Warden's own REST routes are switched off in the binary (they have no auth of their own), so you create the role itself, named `sensor` here, from the warden plugin in the dashboard at `/dashboard`. The dashboard's auth is off by default and Tether's pages refuse a request with no signed-in user, so for a local try start the binary with `--insecure-admin`, or turn on the dashboard's own auth in the `dashboard:` section of the config.
-
-Once the role exists, set its topics over REST:
+The reply has the tenant's `id`, which looks like `ttnt_01m5...`. Next comes a role. A role carries topic grants, and `%c` and `%u` expand to the client ID and the username when the device connects. Tether owns the roles of its tenants, so you create one with the same admin token (warden's own routes are switched off in the binary, and nothing here needs them):
 
 ```bash
-curl -s -X PUT localhost:8080/tether/v1/tenants/$TENANT_ID/roles/sensor/topics \
+curl -s -X POST localhost:8080/tether/v1/tenants/$TENANT_ID/roles \
   -H "Authorization: Bearer $TETHER_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"publish":["sensors/%c/up"],"subscribe":["sensors/%c/#"]}'
+  -d '{"slug":"sensor","publish":["sensors/%c/up"],"subscribe":["sensors/%c/#"]}'
 ```
+
+Only `slug` is required. You can also pass a `name` and a `parent_slug` to inherit another role's grants, list a tenant's roles with `GET .../roles`, replace a role's topics later with `PUT .../roles/sensor/topics`, and remove one with `DELETE .../roles/sensor` once no device holds it.
 
 Then give the tenant a device with that role:
 
@@ -121,7 +121,7 @@ func main() {
 
 `myAdminAuth` is a `forge.Middleware` of yours. Tether adds no admin authentication of its own, and `Start` fails with `ErrAdminAuthRequired` when the admin routes are on and you gave it neither a middleware nor `WithInsecureAdminRoutes()`. If keysmith or warden were built some other way, `Start` fails with `ErrKeysmithNotWired` or `ErrWardenNotWired`. `WithoutKeysmithEvents()` and `WithoutWardenEvents()` turn those checks off, at the price of live connections ignoring key and role changes until they reconnect.
 
-Add `dashboard.NewExtension()` from `github.com/xraph/forge/extensions/dashboard` if you want the Tether pages. Tether publishes twenty dashboard intents (overview, tenants, devices, topic grants, live clients, sessions, retained messages), and it answers all of them `UNAUTHENTICATED` unless the request carries a signed-in user. The dashboard's auth is off by default, so out of the box you see the plugin and its refusal. Turn the dashboard's auth on, or pass `WithInsecureDashboard()` if only people you trust can reach it.
+Add `dashboard.NewExtension()` from `github.com/xraph/forge/extensions/dashboard` if you want the Tether pages. Tether publishes 23 dashboard intents (overview, tenants, devices, roles and their topic grants, live clients, sessions, retained messages), and it answers all of them `UNAUTHENTICATED` unless the request carries a signed-in user. The dashboard's auth is off by default, so out of the box you see the plugin and its refusal. Turn the dashboard's auth on, or pass `WithInsecureDashboard()` if only people you trust can reach it.
 
 Metrics go through the app's `forge.Metrics`: `tether_connections`, `tether_messages_in_total`, `tether_messages_out_total`, `tether_auth_failures_total{reason}` and `tether_acl_denials_total{op}`. Each package has an `llm.txt` with its full surface.
 
@@ -151,6 +151,7 @@ tether:
 | `server.sqlite_path` | `./data/tether.db` | Tenants, devices, keys and roles. The binary only does SQLite |
 | `tether.base_path` | `/tether` | Prefix for every REST route |
 | `tether.disable_routes` | `false` | Mounts no REST routes. The broker still runs |
+| `tether.grove_database` | empty | Name of the grove database to use when the container holds more than one. The binary has only one |
 | `tether.broker.tcp_address` | `:1883` | Plain MQTT. Empty turns it off |
 | `tether.broker.tls` | off | MQTT over TLS: `address`, `cert_file` and `key_file` |
 | `tether.broker.websocket_address` | off | MQTT over WebSocket, subprotocol `mqtt`, any path |
@@ -172,13 +173,12 @@ In your own app the same `tether:` block goes under `extensions.tether` (or a to
 - Revoking a key, changing a role or disabling a tenant reaches connections that are already open.
 - Sessions, subscriptions, in-flight messages and retained messages persist in Badger and survive a restart.
 - Per-tenant connection caps and publish rate limits, a 1 MiB packet limit, and a 1 KiB topic limit.
-- An admin REST API (tenants, devices, roles, live clients, sessions, retained messages, stats), an HTTP publish endpoint for devices, and the dashboard contract.
+- An admin REST API (tenants, devices, roles and their topics, live clients, sessions, retained messages, stats), an HTTP publish endpoint for devices, and the dashboard contract.
 
 ## What it doesn't do yet
 
 - Clustering. There is one node. NATS-backed routing, shared durable sessions, takeover and cells are Phase 2, and the design lives in [`_project_files/TETHER-DESIGN.md`](_project_files/TETHER-DESIGN.md).
 - Metering, entitlements and audit trails (Phase 3), webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication (Phase 4).
-- A way to create warden roles over REST in the binary. Use the dashboard, or build your own app with the engine in code.
 
 ## Development
 

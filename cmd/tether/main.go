@@ -188,10 +188,10 @@ func openDB(path string) (*grove.DB, error) {
 }
 
 // run is the whole program, with its inputs passed in so a test can drive it:
-// the arguments after the program name, the environment, and where usage goes.
-// It returns when the app has shut down on SIGINT or SIGTERM, or when it
+// the arguments after the program name, the environment, and where output goes:
+// stdout for --version, stderr for usage and flag errors. It returns when the app has shut down on SIGINT or SIGTERM, or when it
 // fails.
-func run(args []string, getenv func(string) string, stderr io.Writer) error {
+func run(args []string, getenv func(string) string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("tether", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -204,7 +204,7 @@ func run(args []string, getenv func(string) string, stderr io.Writer) error {
 	}
 
 	if *showVersion {
-		_, err := fmt.Fprintln(stderr, "tether", tether.Version)
+		_, err := fmt.Fprintln(stdout, "tether", tether.Version)
 
 		return err
 	}
@@ -255,7 +255,7 @@ func configSource(path string) []forge.AppOption {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Getenv, os.Stderr); err != nil {
+	if err := run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}

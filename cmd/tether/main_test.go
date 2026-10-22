@@ -19,11 +19,9 @@ import (
 
 	"github.com/xraph/forge"
 	"github.com/xraph/vessel"
-	"github.com/xraph/warden"
-	"github.com/xraph/warden/role"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/extension"
-	"github.com/xraph/tether/scope"
 )
 
 // waitTimeout bounds every wait. Nothing sleeps: tests wait on channels.
@@ -74,13 +72,8 @@ func start(t *testing.T, cfg config, token string, insecure bool) *started {
 		_ = app.Stop(ctx)
 	})
 
-	// Not vessel.Inject: resolving *Extension from the container starts it a
-	// second time.
-	x, err := app.GetExtension(extension.ExtensionName)
+	ext, err := vessel.Inject[*extension.Extension](app.Container())
 	require.NoError(t, err)
-
-	ext, ok := x.(*extension.Extension)
-	require.True(t, ok)
 
 	srv := httptest.NewServer(app.Router())
 	t.Cleanup(srv.Close)
@@ -156,15 +149,13 @@ func TestBinaryBootsAndServes(t *testing.T) {
 		map[string]any{"app_id": testApp, "external_id": testOrg, "name": "Acme"}, http.StatusCreated)
 	tid := tenantRes["id"].(string)
 
-	// Warden's own REST routes are off in the binary, so the role goes in
-	// through the engine the way the dashboard's warden plugin does.
-	wd, err := vessel.Inject[*warden.Engine](s.app.Container())
-	require.NoError(t, err)
-	require.NoError(t, wd.Store().CreateRole(scope.With(t.Context(), testApp, testOrg), &role.Role{
-		TenantID: testOrg, AppID: testApp, Name: "sensor", Slug: "sensor",
-	}))
-	s.do(t, http.MethodPut, "/tether/v1/tenants/"+tid+"/roles/sensor/topics", testToken,
-		map[string]any{"publish": []string{"sensors/%c/up"}, "subscribe": []string{"sensors/%c/#"}}, http.StatusOK)
+	// Warden's REST routes are off in the binary, so the role comes from
+	// Tether's own API, with its topics.
+	s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/roles", testToken,
+		map[string]any{
+			"slug": "sensor", "name": "Sensor",
+			"publish": []string{"sensors/%c/up"}, "subscribe": []string{"sensors/%c/#"},
+		}, http.StatusCreated)
 
 	dev := s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/devices", testToken,
 		map[string]any{"name": "pump", "roles": []string{"sensor"}}, http.StatusCreated)
@@ -270,10 +261,19 @@ func TestInsecureAdminNeedsNoToken(t *testing.T) {
 func TestRunRefusesWithoutToken(t *testing.T) {
 	getenv := func(string) string { return "" }
 
-	err := run([]string{"--config", filepath.Join(t.TempDir(), "absent.yaml")}, getenv, io.Discard)
+	err := run([]string{"--config", filepath.Join(t.TempDir(), "absent.yaml")}, getenv, io.Discard, io.Discard)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "TETHER_ADMIN_TOKEN")
 	assert.Contains(t, err.Error(), "--insecure-admin")
+}
+
+// --version prints to stdout, and starts nothing.
+func TestVersionGoesToStdout(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+
+	require.NoError(t, run([]string{"--version"}, func(string) string { return "" }, &stdout, &stderr))
+	assert.Equal(t, "tether "+tether.Version+"\n", stdout.String())
+	assert.Empty(t, stderr.String())
 }
 
 // An explicit --config that does not exist is an error. The default path

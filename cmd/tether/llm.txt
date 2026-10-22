@@ -17,6 +17,6 @@ It builds a Forge app with a grove SQLite database in the container, keysmith (`
 
 ## For tests
 
-`newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption) (forge.App, closeDB func(), err)` builds without starting. `run(args, getenv, stderr)` is the whole program. Get the extension with `app.GetExtension("tether")`, not `vessel.Inject[*extension.Extension]`, which starts it a second time and fails on duplicate routes.
+`newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption) (forge.App, closeDB func(), err)` builds without starting. `run(args, getenv, stdout, stderr)` is the whole program (`--version` goes to stdout, usage and flag errors to stderr). `vessel.Inject[*extension.Extension](app.Container())` is safe on a started app: the extension's Start is idempotent.
 
-Warden's REST routes are off, so there is no HTTP way to create a role: use the dashboard's warden plugin, or the warden engine in code.
+Warden's REST routes are off, and so is its dashboard role creation for anyone without a warden grant, so roles are made through Tether's own admin API: `POST /tether/v1/tenants/:tenantId/roles` (with `publish` and `subscribe`), `GET` to list, `DELETE .../roles/:slug`, `PUT .../roles/:slug/topics` to replace the grants. The same three operations are dashboard intents (`roles.list`, `roles.create`, `roles.delete`).
