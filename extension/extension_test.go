@@ -417,6 +417,25 @@ func TestStartFailsWhenKeysmithNotWired(t *testing.T) {
 	assert.False(t, ext.DashboardStatus().Configured)
 }
 
+// A host that calls Keysmith (so the plugin is marked wired) but registers
+// a different keysmith extension: the plugin never reaches the engine the app
+// runs, so Start must refuse.
+func TestStartFailsWhenAnotherKeysmithIsRegistered(t *testing.T) {
+	app := newApp(t)
+	ext := extension.New(extension.WithInsecureAdminRoutes(), extension.WithBrokerConfig(loopback()))
+
+	_ = ext.Keysmith(keysmithext.WithDisableRoutes()) // built, never registered.
+
+	err := boot(t, app,
+		keysmithext.New(keysmithext.WithDisableRoutes()),
+		ext.Warden(wardenext.WithDisableRoutes()),
+		ext,
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, extension.ErrKeysmithNotWired)
+	assert.False(t, ext.DashboardStatus().Configured)
+}
+
 func TestStartWithoutKeysmithEvents(t *testing.T) {
 	app := newApp(t)
 	ext := extension.New(extension.WithInsecureAdminRoutes(), extension.WithBrokerConfig(loopback()), extension.WithoutKeysmithEvents())

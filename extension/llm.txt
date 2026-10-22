@@ -12,7 +12,7 @@ Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith
     app.RegisterExtension(t)
 
 - `New(opts ...Option) *Extension`. `ExtensionName = "tether"`, `ExtensionVersion = tether.Version`. `Dependencies()` is `["keysmith", "warden"]`, so Forge registers and starts both first.
-- `(*Extension).Keysmith(opts ...keysmithext.ExtOption) forge.Extension`: `keysmithext.New(append(opts, keysmithext.WithHookExtension(plugin))...)`, then `plugin.MarkWired()`. Keysmith takes plugins only at construction, so this is the only way in.
+- `(*Extension).Keysmith(opts ...keysmithext.ExtOption) forge.Extension`: `keysmithext.New(append(opts, keysmithext.WithHookExtension(plugin))...)`, then `plugin.MarkWired()`, and keeps the `*keysmithext.Extension` it built. Keysmith takes plugins only at construction, so this is the only way in.
 - `(*Extension).Warden(opts ...wardenext.Option) forge.Extension`: `wardenext.New(append(opts, wardenext.WithPlugin(plugin))...)`, then `MarkWired()`.
 - `Broker() *broker.Broker`, `Services() *api.Services`: nil before Start.
 
@@ -26,15 +26,14 @@ Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store
 
 - Register: `BaseExtension.Register`, logger, config, then `vessel.Provide` of `*Extension`. Nothing else: keysmith and warden build their engines in their own Register, which runs first.
 - Start, in order:
-  1. `ErrKeysmithNotWired` unless the keysmith plugin was wired by `Keysmith()` or `WithoutKeysmithEvents` is set.
-  2. `ErrAdminAuthRequired` when routes are on, no `WithAdminMiddleware` and no `WithInsecureAdminRoutes`.
-  3. `*keysmith.Engine` and `*warden.Engine` from the container.
-  4. Warden plugin: if the engine's plugin registry already holds it (built by `Warden()`), nothing; else `eng.Plugins().Register(p)`. A nil registry (warden v1.8.0 makes one only for an engine with a plugin, a decision cache or the audit log, which is on by default) is `ErrWardenNotWired` unless `WithoutWardenEvents`.
-  5. Store: `WithStore`, else the grove DB `GroveDatabase` names (`vessel.InjectNamed`), else the default one (`vessel.Inject`); driver `sqlite` gives `store/sqlite`, `pg` gives `store/postgres`, anything else is an error. Then `Migrate`. Tether never closes the store.
-  6. `service.NewTenants`, `auth.NewKeysmith(ks, tenants, store)`, `perm.NewLoader(wd, perm.WithLogger(...))`, `limits.New()`, `broker.New(cfg.Broker, Deps{..., Metrics})`.
-  7. `events.NewReactor(authn.Evict, broker)` bound to both plugins, before the broker listens.
-  8. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: cfg.Broker.MaxPacketSize}` (0 means api's 1 MiB default). Its error fails Start.
-  9. `broker.Start`.
+  1. `ErrAdminAuthRequired` when routes are on, no `WithAdminMiddleware` and no `WithInsecureAdminRoutes`.
+  2. `*keysmith.Engine` and `*warden.Engine` from the container. The keysmith engine must be the `Engine()` of an extension `Keysmith()` built, or Start returns `ErrKeysmithNotWired` (unless `WithoutKeysmithEvents`). `MarkWired` only says `Keysmith()` was called; a host that calls it and registers a different `keysmithext.New()` fails here, because the plugin never reached the engine the app runs.
+  3. Warden plugin: if the engine's plugin registry already holds it (built by `Warden()`), nothing; else `eng.Plugins().Register(p)`. A nil registry (warden v1.8.0 makes one only for an engine with a plugin, a decision cache or the audit log, which is on by default) is `ErrWardenNotWired` unless `WithoutWardenEvents`.
+  4. Store: `WithStore`, else the grove DB `GroveDatabase` names (`vessel.InjectNamed`), else the default one (`vessel.Inject`); driver `sqlite` gives `store/sqlite`, `pg` gives `store/postgres`, anything else is an error. Then `Migrate`. Tether never closes the store.
+  5. `service.NewTenants`, `auth.NewKeysmith(ks, tenants, store)`, `perm.NewLoader(wd, perm.WithLogger(...))`, `limits.New()`, `broker.New(cfg.Broker, Deps{..., Metrics})`.
+  6. `events.NewReactor(authn.Evict, broker)` bound to both plugins, before the broker listens.
+  7. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: cfg.Broker.MaxPacketSize}` (0 means api's 1 MiB default). Its error fails Start.
+  8. `broker.Start`.
 - Stop: unbinds the plugins, stops the broker (which handles mochi's Close deadlock and the reload retries). Health: broker running and store ping. `DashboardStatus()` (`dashboard.DashboardStatusAware`): `Version` and `Configured` true from a successful Start until Stop. No dashboard contract yet.
 
 Why `Use` and not `forge.WithGroupMiddleware`: api registers on groups nested in the admin group, and forge v1.12.10's `Group` copies a parent's `Use` middleware but not its `WithGroupMiddleware`. With the option the admin routes would mount open. `TestAdminMiddlewareGuardsAdminRoutesOnly` pins it.
@@ -49,4 +48,4 @@ The broker, mochi, perm and the API take `*slog.Logger`; `logger.go` has a `slog
 
 ## Tests
 
-`extension_test.go`: a Forge app with grove SQLite in a temp dir (`vessel.Provide` of `*grove.DB`, which keysmith, warden and tether all pick up), keysmith and warden with routes off, tether with `WithInsecureAdminRoutes` on `127.0.0.1:0`, the router behind httptest, paho 3.1.1 clients. Covers the round trip, revoke over REST disconnecting the client within 2 s, a role narrowed over REST dropping a subscription (warden built by the helper, and plugin registered at Start), the three Start refusals and their opt-outs, admin middleware scope, metrics from the scrape, config from a YAML file, `WithStore`, and Stop.
+`extension_test.go`: a Forge app with grove SQLite in a temp dir (`vessel.Provide` of `*grove.DB`, which keysmith, warden and tether all pick up), keysmith and warden with routes off, tether with `WithInsecureAdminRoutes` on `127.0.0.1:0`, the router behind httptest, paho 3.1.1 clients. Covers the round trip, revoke over REST disconnecting the client within 2 s, a role narrowed over REST dropping a subscription (warden built by the helper, and plugin registered at Start), the three Start refusals and their opt-outs (including a host that calls `Keysmith()` but registers another keysmith), admin middleware scope, metrics from the scrape, config from a YAML file, `WithStore`, and Stop.

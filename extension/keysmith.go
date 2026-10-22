@@ -12,11 +12,19 @@ import (
 // registered, built from opts. Register it with the app instead of calling
 // keysmithext.New yourself: keysmith takes plugins only when its engine is
 // built, and without the plugin a revoked device key would keep its live
-// MQTT connections. Start fails with ErrKeysmithNotWired when the app's
-// keysmith was built some other way, unless WithoutKeysmithEvents is set.
+// MQTT connections. Start fails with ErrKeysmithNotWired when the keysmith
+// engine in the container is not the one an extension built here owns (the
+// app registered keysmith some other way, or never registered this one),
+// unless WithoutKeysmithEvents is set.
 func (e *Extension) Keysmith(opts ...keysmithext.ExtOption) forge.Extension {
 	ext := keysmithext.New(append(slices.Clip(opts), keysmithext.WithHookExtension(e.ksPlugin))...)
 	e.ksPlugin.MarkWired()
+
+	// Start asks these for their engine: only an extension built here, and
+	// registered with the app, puts the plugin on the engine the app runs.
+	e.mu.Lock()
+	e.ksExts = append(e.ksExts, ext)
+	e.mu.Unlock()
 
 	return ext
 }

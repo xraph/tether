@@ -26,6 +26,7 @@ import (
 	dashboard "github.com/xraph/forge/extensions/dashboard"
 	"github.com/xraph/grove"
 	"github.com/xraph/keysmith"
+	keysmithext "github.com/xraph/keysmith/extension"
 	"github.com/xraph/vessel"
 	"github.com/xraph/warden"
 	wardenplugin "github.com/xraph/warden/plugin"
@@ -94,6 +95,9 @@ type Extension struct {
 	// the engines before Tether starts.
 	ksPlugin *events.KeysmithPlugin
 	wdPlugin *events.WardenPlugin
+
+	// ksExts are the keysmith extensions Keysmith built, guarded by mu.
+	ksExts []*keysmithext.Extension
 
 	// Built by Start, read by the accessors.
 	mu       sync.RWMutex
@@ -170,16 +174,13 @@ func (e *Extension) Register(app forge.App) error {
 	return nil
 }
 
-// Start wires and starts Tether. In order: the keysmith plugin and admin
-// auth checks, the keysmith and warden engines from the container, the
-// warden plugin (registered now if Warden did not), the store (migrated),
+// Start wires and starts Tether. In order: the admin auth check, the
+// keysmith engine from the container (which must be the one the extension
+// from Keysmith owns, so the plugin is on it), the warden engine and its
+// plugin (registered now if Warden did not), the store (migrated),
 // the services, the broker with the plugins bound to its reactor, the
 // routes, and finally the broker's listeners.
 func (e *Extension) Start(ctx context.Context) error {
-	if !e.ksPlugin.Wired() && !e.noKeysmithEvents {
-		return ErrKeysmithNotWired
-	}
-
 	if !e.config.DisableRoutes && len(e.adminMiddleware) == 0 && !e.insecureAdminRoutes {
 		return ErrAdminAuthRequired
 	}
@@ -254,14 +255,19 @@ func (e *Extension) Start(ctx context.Context) error {
 	return nil
 }
 
-// engines returns the keysmith and warden engines from the container, with
-// the warden plugin wired to the warden engine.
+// engines returns the keysmith and warden engines from the container. The
+// keysmith engine must carry Tether's plugin (see keysmithWired), and the
+// warden plugin is wired to the warden engine.
 func (e *Extension) engines() (ks *keysmith.Engine, wd *warden.Engine, err error) {
 	c := e.App().Container()
 
 	ks, err = vessel.Inject[*keysmith.Engine](c)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tether: keysmith engine not in the container (register the keysmith extension): %w", err)
+	}
+
+	if !e.noKeysmithEvents && !e.keysmithWired(ks) {
+		return nil, nil, ErrKeysmithNotWired
 	}
 
 	wd, err = vessel.Inject[*warden.Engine](c)
@@ -274,6 +280,18 @@ func (e *Extension) engines() (ks *keysmith.Engine, wd *warden.Engine, err error
 	}
 
 	return ks, wd, nil
+}
+
+// keysmithWired reports whether ks is the engine of a keysmith extension that
+// Keysmith built. The plugin's own Wired flag only says Keysmith was called;
+// a host can call it and register another keysmith, whose engine never sees
+// the plugin. An extension that has not registered has no engine, so it
+// never matches.
+func (e *Extension) keysmithWired(ks *keysmith.Engine) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	return slices.ContainsFunc(e.ksExts, func(x *keysmithext.Extension) bool { return x.Engine() == ks })
 }
 
 // openStore resolves the store and migrates it.
