@@ -1,0 +1,33 @@
+# tether/events
+
+Import: github.com/xraph/tether/events
+
+Turns keysmith key changes and warden role changes into reactions on live MQTT connections. Imports keysmith (key, rotation), warden (role, assignment, id), mochi `packets` and `auth`; it does not import `broker` (a broker satisfies `BrokerControl`).
+
+## Handler
+
+`Handler` is what the plugins report to:
+- `KeyInvalidated(ctx, keyID string, disconnect bool)`: disconnect is true when the key may no longer be used (revoked, suspended, expired, or rotated with no grace window), false for a rotation with a grace window.
+- `RolesChanged(ctx, roleID string)`: a role was updated or deleted, or a permission attached to or detached from it.
+- `SubjectChanged(ctx, subjectKind, subjectID string)`: a role was assigned to or unassigned from a warden subject (`"api_key"` for keysmith keys).
+
+Called synchronously from inside the engine call that made the change (and from keysmith's ValidateKey for `OnKeyExpired`). Implementations must be quick and must not call back into that engine.
+
+## Plugins
+
+- `NewKeysmithPlugin() *KeysmithPlugin`: keysmith `plugin.Plugin` named `"tether"`. Register with `keysmith.WithExtension(p)` (construction only), then `p.MarkWired()`; `p.Wired() bool` reports it. `p.Bind(h Handler)` sets the handler later (nil unbinds); events before Bind are dropped. Hooks: `OnKeyRotated` gives `KeyInvalidated(id, false)`, or `(id, true)` when the rotation record's `GraceTTL <= 0` (the old secret is dead at once and its connections cannot be told apart, so all of the key's connections go; this is an addition to the plan's mapping); `OnKeyRevoked`, `OnKeySuspended`, `OnKeyExpired` give `KeyInvalidated(id, true)`. A nil key is ignored.
+- `NewWardenPlugin(h Handler) *WardenPlugin`: warden `plugin.Plugin` named `"tether"`, with `Bind(h)` like the keysmith one (nil h at construction leaves it unbound). `OnRoleUpdated`, `OnRoleDeleted`, `OnPermissionAttached`, `OnPermissionDetached` give `RolesChanged(roleID)`; `OnRoleAssigned`, `OnRoleUnassigned` give `SubjectChanged(a.SubjectKind, a.SubjectID)`. Warden emits no tenant; role IDs and key IDs are unique across tenants. Register with `warden.WithPlugin(p)` at construction: warden v1.8.0's `Engine.Plugins()` is nil unless the engine was built with a plugin or a decision cache, so runtime `Plugins().Register` can panic.
+- Every hook returns nil and recovers a Handler panic (logged through `slog.Default()`). Keysmith stops dispatching at the first plugin error and would fail the admin call.
+
+## Reactor
+
+`NewReactor(evict func(keyID string), b BrokerControl) Handler`. `BrokerControl` is `DisconnectPrincipal(principalID, packets.Code) int`, `ReloadRole(ctx, roleID)`, `ReloadPrincipal(ctx, principalID)`, all on `*broker.Broker`. `evict` is `(*auth.Keysmith).Evict`, may be nil.
+- `KeyInvalidated(id, true)`: evict, then `DisconnectPrincipal(id, packets.ErrAdministrativeAction)` (0x98). Eviction comes first so a reconnect is validated by keysmith.
+- `KeyInvalidated(id, false)`: evict only. Live connections stay.
+- `RolesChanged(id)`: `ReloadRole`.
+- `SubjectChanged("api_key", id)`: `ReloadPrincipal`. Other kinds are ignored.
+- Empty IDs are ignored.
+
+Wiring (what the extension does, and what `events_test.go` does): build the keysmith plugin and the warden plugin unbound, pass them to the engines at construction, build `auth.NewKeysmith`, `perm.NewLoader` and the broker, then `r := events.NewReactor(authn.Evict, b)` and `Bind(r)` on both plugins.
+
+Known interaction: `service.Devices.SetRoles` unassigns every role, then assigns the new list, and each step emits an event. A live device's reload in between sees no roles, so its subscriptions are pruned even for roles it keeps; the device must subscribe again.

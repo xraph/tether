@@ -619,3 +619,33 @@ func TestKeysmithLookupOutageSurfacesAsBadCredentials(t *testing.T) {
 	require.NotErrorIs(t, err, ErrUnavailable)
 	require.ErrorIs(t, err, keysmith.ErrInvalidKey)
 }
+
+// A key revoked while its validation is in flight: the revoke's Evict runs
+// before the validation stores its result. The late store must not bring the
+// key back for the cache TTL, or a revoked device keeps connecting.
+func TestEvictDuringValidationIsNotUndone(t *testing.T) {
+	e := newEnv(t)
+
+	first := true
+	e.val.fn = func(string) (*keysmith.ValidationResult, error) {
+		if first {
+			first = false
+			// The revoke lands here, after keysmith answered but before
+			// the answer is cached.
+			e.auth.Evict(e.keyID.String())
+		}
+
+		return e.result(), nil
+	}
+
+	_, err := e.auth.Authenticate(t.Context(), e.creds())
+	require.NoError(t, err)
+
+	_, err = e.auth.Authenticate(t.Context(), e.creds())
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), e.val.calls.Load(), "a result validated across an Evict is not cached")
+
+	_, err = e.auth.Authenticate(t.Context(), e.creds())
+	require.NoError(t, err)
+	assert.Equal(t, int32(2), e.val.calls.Load(), "a validation with no Evict in between is cached as before")
+}

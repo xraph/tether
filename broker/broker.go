@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
@@ -60,6 +61,15 @@ type Broker struct {
 
 	countersMu sync.Mutex
 	counters   map[string]*tenantCounters
+
+	// changes counts the key, role and tenant changes announced to the
+	// broker (admin.go). A CONNECT compares it before and after it
+	// registers its state to learn whether a change may have missed it.
+	changes atomic.Uint64
+
+	// storage is mochi's badger hook when DataDir is set. Pruning a session
+	// tells it about the subscriptions and inflight messages it removes.
+	storage *badger.Hook
 
 	mu      sync.Mutex
 	started bool
@@ -170,9 +180,12 @@ func (b *Broker) setup(ctx context.Context, srv *mqtt.Server) error {
 	}
 
 	if b.cfg.DataDir != "" {
-		if err := srv.AddHook(new(badger.Hook), &badger.Options{Path: b.cfg.DataDir}); err != nil {
+		storage := new(badger.Hook)
+		if err := srv.AddHook(storage, &badger.Options{Path: b.cfg.DataDir}); err != nil {
 			return fmt.Errorf("tether/broker: open storage: %w", err)
 		}
+
+		b.storage = storage
 	}
 
 	lc := &net.ListenConfig{}

@@ -72,6 +72,11 @@ type Keysmith struct {
 	entries   map[[sha256.Size]byte]*entry
 	byKey     map[string]map[[sha256.Size]byte]struct{}
 	lastSweep time.Time
+
+	// evictions counts Evict calls. A validation that saw it change while
+	// keysmith was answering does not cache its result, so an Evict for a
+	// revoke can never be undone by a validation that started before it.
+	evictions uint64
 }
 
 // entry is what a successful validation leaves behind. Request-derived checks
@@ -132,10 +137,13 @@ func (k *Keysmith) Authenticate(ctx context.Context, c Credentials) (*Identity, 
 }
 
 // Evict forgets every cached validation for the key ID. Call it when a key is
-// revoked, rotated or suspended, or its device changes.
+// revoked, rotated or suspended, or its device changes. A validation already
+// running when Evict is called does not cache its result.
 func (k *Keysmith) Evict(keyID string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+
+	k.evictions++
 
 	for sum := range k.byKey[keyID] {
 		delete(k.entries, sum)
@@ -166,6 +174,10 @@ func (k *Keysmith) lookup(sum [sha256.Size]byte) (*entry, bool) {
 // validate asks keysmith about the raw key, finds the device and caches the
 // result.
 func (k *Keysmith) validate(ctx context.Context, c Credentials, sum [sha256.Size]byte) (*entry, error) {
+	k.mu.Lock()
+	epoch := k.evictions
+	k.mu.Unlock()
+
 	res, err := k.v.ValidateKey(ctx, string(c.Password))
 	if err != nil {
 		return nil, mapKeysmithError(err)
@@ -216,7 +228,7 @@ func (k *Keysmith) validate(ctx context.Context, c Credentials, sum [sha256.Size
 
 	if ttl > 0 {
 		e.cacheUntil = now.Add(ttl)
-		k.store(sum, e)
+		k.store(sum, e, epoch)
 	}
 
 	return e, nil
@@ -256,10 +268,16 @@ func (k *Keysmith) identity(ctx context.Context, e *entry, c Credentials) (*Iden
 	}, nil
 }
 
-// store adds an entry and, at most once per TTL, sweeps out dead ones.
-func (k *Keysmith) store(sum [sha256.Size]byte, e *entry) {
+// store adds an entry and, at most once per TTL, sweeps out dead ones. It
+// stores nothing when Evict ran since epoch was read: the validation may
+// predate a revoke.
+func (k *Keysmith) store(sum [sha256.Size]byte, e *entry, epoch uint64) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+
+	if k.evictions != epoch {
+		return
+	}
 
 	now := k.now()
 

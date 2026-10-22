@@ -47,6 +47,7 @@ var provided = []byte{
 	mqtt.OnPacketRead,
 	mqtt.OnPacketEncode,
 	mqtt.OnPublish,
+	mqtt.OnWill,
 	mqtt.OnDisconnect,
 }
 
@@ -58,12 +59,52 @@ func (h *hook) Provides(b byte) bool {
 // OnConnectAuthenticate authenticates the client, loads and compiles its
 // grants, checks its will against them and takes a connection slot. On any
 // failure it records the CONNACK reason for OnPacketEncode and returns false.
+//
+// A key, role or tenant change announced while this runs (Broker.changes
+// moved) may have been handled before this connection's state was in the
+// registry, so the reaction never saw it. The connection then authorizes a
+// second time, now visible to every later reaction. Credentials that expire
+// start a timer that disconnects the client at that moment.
 func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	log := h.b.log.With(slog.String("client", cl.ID), slog.String("remote", cl.Net.Remote))
 
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 
+	gen := h.b.changes.Load()
+
+	ident, g, ok := h.authorize(ctx, cl, pk, log)
+	if !ok {
+		return false
+	}
+
+	tenantID := ident.Tenant.ID.String()
+	log = log.With(slog.String("tenant", tenantID))
+
+	if !h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections) {
+		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant connection limit reached", nil)
+	}
+
+	st := newClientState(cl, cl.ID, string(pk.Connect.Username), ident, ident.Tenant, g, h.b.deps.Limits, h.b.countersFor(tenantID))
+	h.b.state.add(st)
+
+	if h.b.changes.Load() != gen && !h.reauthorize(ctx, cl, pk, st, log) {
+		h.b.state.remove(cl)
+		st.releaseSlot()
+
+		return false
+	}
+
+	h.startExpiry(st)
+
+	return true
+}
+
+// authorize authenticates the CONNECT, refuses a tenant that is missing or
+// disabled and credentials that have already expired, loads and compiles the
+// grants and checks the will against them. On failure it records the
+// refusal and returns false.
+func (h *hook) authorize(ctx context.Context, cl *mqtt.Client, pk packets.Packet, log *slog.Logger) (*auth.Identity, *grants, bool) {
 	username := string(pk.Connect.Username)
 
 	ident, err := h.b.deps.Auth.Authenticate(ctx, auth.Credentials{
@@ -73,60 +114,92 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		Remote:   cl.Net.Remote,
 	})
 	if err != nil {
-		return h.refuse(cl, log, connackCode(err), "authentication failed", err)
+		return nil, nil, h.refuse(cl, log, connackCode(err), "authentication failed", err)
 	}
 
 	if ident == nil || ident.Tenant == nil || ident.Tenant.ID.IsNil() {
-		return h.refuse(cl, log, packets.ErrServerUnavailable, "authenticator returned no tenant", nil)
+		return nil, nil, h.refuse(cl, log, packets.ErrServerUnavailable, "authenticator returned no tenant", nil)
 	}
 
-	tenantID := ident.Tenant.ID.String()
-	log = log.With(slog.String("tenant", tenantID))
+	log = log.With(slog.String("tenant", ident.Tenant.ID.String()))
 
 	if !ident.Tenant.Enabled {
-		return h.refuse(cl, log, packets.ErrNotAuthorized, "tenant disabled", nil)
+		return nil, nil, h.refuse(cl, log, packets.ErrNotAuthorized, "tenant disabled", nil)
+	}
+
+	if !ident.ExpiresAt.IsZero() && !time.Now().Before(ident.ExpiresAt) {
+		return nil, nil, h.refuse(cl, log, packets.ErrBadUsernameOrPassword, "credentials expired", nil)
 	}
 
 	rules, roleIDs, err := h.b.deps.Perms.Load(ctx, ident)
 	if err != nil {
-		return h.refuse(cl, log, packets.ErrServerUnavailable, "loading permissions failed", err)
+		return nil, nil, h.refuse(cl, log, packets.ErrServerUnavailable, "loading permissions failed", err)
 	}
 
-	set := acl.Compile(rules, acl.Vars{ClientID: cl.ID, Username: username})
-	if dropped := set.Dropped(); len(dropped) > 0 {
-		log.Warn("tether: grants dropped for this connection", slog.Any("grants", dropped))
-	}
+	g := h.b.compile(rules, roleIDs, cl.ID, username, log)
 
 	// Mochi publishes a will without a publish ACL check, so it is checked
 	// here, the same way OnACLCheck would check a PUBLISH to its topic.
 	if atomic.LoadUint32(&cl.Properties.Will.Flag) == 1 {
 		will := cl.Properties.Will.TopicName
 		if topic.Valid(will, false, h.b.cfg.MaxTopicLength) != nil {
-			return h.refuse(cl, log, packets.ErrTopicNameInvalid, "invalid will topic", nil)
+			return nil, nil, h.refuse(cl, log, packets.ErrTopicNameInvalid, "invalid will topic", nil)
 		}
 
-		if !canPublish(set, will) {
-			return h.refuse(cl, log, packets.ErrNotAuthorized, "will topic not granted", nil)
+		if !canPublish(g.acl, will) {
+			return nil, nil, h.refuse(cl, log, packets.ErrNotAuthorized, "will topic not granted", nil)
 		}
 	}
 
-	if !h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections) {
-		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant connection limit reached", nil)
+	return ident, g, true
+}
+
+// reauthorize runs authorize again for a connection whose state is already
+// in the registry and replaces its identity and grants with the result. It
+// holds reloadMu, so a reload that found the state meanwhile applies after
+// this one and never loses to it.
+func (h *hook) reauthorize(ctx context.Context, cl *mqtt.Client, pk packets.Packet, st *clientState, log *slog.Logger) bool {
+	st.reloadMu.Lock()
+	defer st.reloadMu.Unlock()
+
+	ident, g, ok := h.authorize(ctx, cl, pk, log)
+	if !ok {
+		return false
 	}
 
-	h.b.state.add(&clientState{
-		cl:       cl,
-		tenantID: tenantID,
-		tenant:   ident.Tenant,
-		ident:    ident,
-		acl:      set,
-		roleIDs:  roleIDs,
-		rawID:    cl.ID,
-		limiter:  h.b.deps.Limits,
-		counters: h.b.countersFor(tenantID),
-	})
+	if ident.Tenant.ID.String() != st.tenantID {
+		return h.refuse(cl, log, packets.ErrNotAuthorized, "tenant changed during connect", nil)
+	}
+
+	st.ident.Store(ident)
+	st.tenant.Store(ident.Tenant)
+	st.grants.Store(g)
 
 	return true
+}
+
+// startExpiry starts the timer that disconnects the client when its
+// credentials expire (reason 0xA0, maximum connect time). The timer is
+// stopped when the connection's state is dropped and when another
+// connection takes its session over.
+func (h *hook) startExpiry(st *clientState) {
+	exp := st.ident.Load().ExpiresAt
+	if exp.IsZero() {
+		return
+	}
+
+	st.setExpiry(time.AfterFunc(time.Until(exp), func() { h.expire(st) }))
+}
+
+// expire disconnects a connection whose credentials expired, unless it is
+// already gone.
+func (h *hook) expire(st *clientState) {
+	if h.b.state.get(st.cl) != st || st.cl.Closed() {
+		return
+	}
+
+	h.b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+	disconnect(h.server, h.b.log, st.cl, packets.ErrMaxConnectTime)
 }
 
 // acquireSlot takes a tenant connection slot. When the tenant is at its limit
@@ -292,11 +365,26 @@ func (h *hook) reject(cl *mqtt.Client, pk packets.Packet, code packets.Code) (pa
 // client receives and counts it as a message out for the receiver's tenant,
 // and gives a refused CONNECT the CONNACK reason OnConnectAuthenticate chose
 // (mochi always sends bad username or password).
+//
+// The success CONNACK of a connection that inherited a session is the one
+// point between mochi's session takeover and its resend of the session's
+// inflight messages, so that is where the inherited session is pruned to the
+// connection's grants (pruneSession): a grant revoked while the device was
+// offline loses its subscription and its queued messages.
 func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 	switch pk.FixedHeader.Type {
 	case packets.Connack:
 		code, ok := h.b.state.takeRefusal(cl)
 		if !ok {
+			// Mochi has just handed this connection the session it
+			// inherited and will resend the session's inflight messages
+			// right after this CONNACK.
+			if pk.SessionPresent {
+				if st := h.b.state.get(cl); st != nil {
+					h.b.pruneSession(h.server, st)
+				}
+			}
+
 			return pk
 		}
 
@@ -379,7 +467,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrRejectPacket
 	}
 
-	if !h.b.deps.Limits.AllowMessage(st.tenantID, st.tenant.Limits) {
+	if !h.b.deps.Limits.AllowMessage(st.tenantID, st.tenant.Load().Limits) {
 		h.b.log.Debug("tether: publish over the tenant's rate limit", slog.String("client", cl.ID), slog.String("tenant", st.tenantID))
 
 		if cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos == 1 {
@@ -429,28 +517,63 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 			return false
 		}
 
-		_, ok = h.relative(tenantID, name, true)
+		_, ok = h.b.relative(tenantID, name, true)
 
 		return ok
 	}
 
-	rel, ok := h.relative(st.tenantID, name, !write)
+	if write {
+		rel, ok := h.b.relative(st.tenantID, name, false)
+		if !ok {
+			// Another tenant's name, or mochi's own global $SYS/...
+			return false
+		}
+
+		return canPublish(st.acl(), rel)
+	}
+
+	return h.b.canRead(st.tenantID, st.acl(), name)
+}
+
+// canRead is the read check of OnACLCheck for a live connection of tenantID
+// with grants set: name (a namespaced filter, or the topic of a delivery)
+// must be in the tenant's namespace and either be the tenant's own $SYS
+// (namespaced "$SYS/<tenant>/...", readable by every client of the tenant,
+// grants or not) or be allowed by the grants. Pruning a session uses the
+// same check, so a subscription survives a reload exactly when a new
+// SUBSCRIBE for it would pass.
+func (b *Broker) canRead(tenantID string, set *acl.Set, name string) bool {
+	rel, ok := b.relative(tenantID, name, true)
 	if !ok {
 		// Another tenant's name, or mochi's own global $SYS/...
 		return false
 	}
 
-	if write {
-		return canPublish(st.acl, rel)
-	}
-
-	// The tenant's own $SYS/... (namespaced "$SYS/<tenant>/...") is readable
-	// by every client of the tenant, grants or not.
 	if isSys(rel) {
 		return true
 	}
 
-	return st.acl.CanSubscribe(rel)
+	return set.CanSubscribe(rel)
+}
+
+// OnWill checks a will against the client's current grants as mochi is about
+// to publish it. The grants may have lost the will's topic since CONNECT
+// (Broker.ReloadRole, ReloadPrincipal), and a will skips the publish ACL
+// check. A will that no longer passes, or a client with no state, gets a
+// will on withheldTopic with nothing in it, which no tenant's filter
+// matches and no ACL check lets through: mochi ignores an error from this
+// hook and cannot be told to drop the will.
+func (h *hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
+	st := h.b.state.get(cl)
+	if st != nil {
+		if rel, ok := topic.Strip(st.tenantID, will.TopicName); ok && canPublish(st.acl(), rel) {
+			return will, nil
+		}
+	}
+
+	h.b.log.Info("tether: will withheld, its topic is no longer granted", slog.String("client", cl.ID))
+
+	return mqtt.Will{Flag: will.Flag, TopicName: withheldTopic}, nil
 }
 
 // isSys reports whether a tenant-relative name or filter is under "$SYS",
@@ -462,7 +585,7 @@ func isSys(rel string) bool {
 // relative turns a namespaced name or filter back into the tenant-relative
 // form the grants use: it strips the tenant, then for a filter the
 // "$share/<group>/" prefix, and validates what is left.
-func (h *hook) relative(tenantID, name string, isFilter bool) (string, bool) {
+func (b *Broker) relative(tenantID, name string, isFilter bool) (string, bool) {
 	rel, ok := topic.Strip(tenantID, name)
 	if !ok {
 		return "", false
@@ -472,7 +595,7 @@ func (h *hook) relative(tenantID, name string, isFilter bool) (string, bool) {
 		rel = withoutShare(rel)
 	}
 
-	if topic.Valid(rel, isFilter, h.b.cfg.MaxTopicLength) != nil {
+	if topic.Valid(rel, isFilter, b.cfg.MaxTopicLength) != nil {
 		return "", false
 	}
 

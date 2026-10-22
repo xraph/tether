@@ -1,8 +1,11 @@
 package broker
 
 import (
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -16,18 +19,90 @@ import (
 
 // clientState is what the broker knows about one live connection. It is
 // created in OnConnectAuthenticate and dropped in OnDisconnect.
+//
+// The fields that change while the connection is open (the identity, the
+// tenant snapshot and the grants) are atomic pointers to values that are
+// never modified, so the hot path reads them without a lock. reloadMu
+// serialises the writers that load grants (a reload, or a CONNECT that has to
+// authorize again), so an older load can never overwrite a newer one.
 type clientState struct {
 	cl       *mqtt.Client
 	tenantID string
-	tenant   *tenant.Tenant
-	ident    *auth.Identity
-	acl      *acl.Set
-	roleIDs  []string
 	rawID    string
+	username string
+
+	ident  atomic.Pointer[auth.Identity]
+	tenant atomic.Pointer[tenant.Tenant]
+	grants atomic.Pointer[grants]
+
+	reloadMu sync.Mutex
+
+	// expiry disconnects the client when its credentials expire. Nil when
+	// they do not, or once stopped.
+	expiry atomic.Pointer[time.Timer]
 
 	limiter  *limits.Limiter
 	counters *tenantCounters
 	release  sync.Once
+}
+
+// grants is one compiled set of topic grants and the roles it came from.
+type grants struct {
+	acl     *acl.Set
+	roleIDs []string
+}
+
+// newClientState returns the state of a connection authorized as ident in
+// tn with the compiled grants g.
+func newClientState(cl *mqtt.Client, rawID, username string, ident *auth.Identity, tn *tenant.Tenant, g *grants,
+	limiter *limits.Limiter, counters *tenantCounters,
+) *clientState {
+	st := &clientState{
+		cl:       cl,
+		tenantID: tn.ID.String(),
+		rawID:    rawID,
+		username: username,
+		limiter:  limiter,
+		counters: counters,
+	}
+	st.ident.Store(ident)
+	st.tenant.Store(tn)
+	st.grants.Store(g)
+
+	return st
+}
+
+// acl returns the connection's current grants.
+func (st *clientState) acl() *acl.Set {
+	return st.grants.Load().acl
+}
+
+// identity returns the connection's identity with its current tenant
+// snapshot, as a copy the caller may hand to a PermLoader.
+func (st *clientState) identity() *auth.Identity {
+	ident := *st.ident.Load()
+	ident.Tenant = st.tenant.Load()
+
+	return &ident
+}
+
+// hasRole reports whether roleID is one of the roles the current grants
+// came from.
+func (st *clientState) hasRole(roleID string) bool {
+	return slices.Contains(st.grants.Load().roleIDs, roleID)
+}
+
+// setExpiry installs the timer that ends the connection when its
+// credentials expire, stopping any previous one.
+func (st *clientState) setExpiry(t *time.Timer) {
+	if old := st.expiry.Swap(t); old != nil {
+		old.Stop()
+	}
+}
+
+// stopExpiry stops the expiry timer, if any. Safe to call more than once.
+func (st *clientState) stopExpiry() {
+	st.setExpiry(nil)
 }
 
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
@@ -88,6 +163,9 @@ func (r *registry) get(cl *mqtt.Client) *clientState {
 // owner whose connection is already closed but was never disconnected through
 // OnDisconnect (mochi skips the hook when writing the CONNACK fails) is
 // dropped and its slot released here.
+//
+// A previous owner is being taken over (or is long gone), so its expiry
+// timer is stopped: it must never fire on the session's new connection.
 func (r *registry) bind(st *clientState) {
 	r.mu.Lock()
 
@@ -101,13 +179,36 @@ func (r *registry) bind(st *clientState) {
 
 	r.mu.Unlock()
 
+	if prev != nil && prev != st {
+		prev.stopExpiry()
+	}
+
 	if stale {
 		prev.releaseSlot()
 	}
 }
 
-// remove drops the state of cl and returns it, or nil when there is none
-// (mochi also calls OnDisconnect for sessions it restores from storage).
+// match returns the state of every connection for which keep is true. keep
+// runs under the registry's read lock, so it must not call back into the
+// registry or block.
+func (r *registry) match(keep func(*clientState) bool) []*clientState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var out []*clientState
+
+	for _, st := range r.byClient {
+		if keep(st) {
+			out = append(out, st)
+		}
+	}
+
+	return out
+}
+
+// remove drops the state of cl, stops its expiry timer and returns it, or nil
+// when there is none (mochi also calls OnDisconnect for sessions it restores
+// from storage).
 func (r *registry) remove(cl *mqtt.Client) *clientState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -122,6 +223,8 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 	if r.byID[cl.ID] == st {
 		delete(r.byID, cl.ID)
 	}
+
+	st.stopExpiry()
 
 	return st
 }
@@ -156,6 +259,7 @@ func (r *registry) sweepClosed(tenantID string) int {
 	r.mu.Unlock()
 
 	for _, st := range swept {
+		st.stopExpiry()
 		st.releaseSlot()
 	}
 

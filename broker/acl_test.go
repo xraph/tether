@@ -330,15 +330,9 @@ func netClient(t *testing.T, srv *mqtt.Server, nsID string, version byte) (*mqtt
 
 // bindState gives cl live connection state in tn with rules.
 func bindState(h *hook, cl *mqtt.Client, tn *tenant.Tenant, rawID string, rules acl.Rules) {
-	h.b.state.add(&clientState{
-		cl:       cl,
-		tenantID: tn.ID.String(),
-		tenant:   tn,
-		acl:      acl.Compile(rules, acl.Vars{ClientID: rawID}),
-		rawID:    rawID,
-		limiter:  h.b.deps.Limits,
-		counters: h.b.countersFor(tn.ID.String()),
-	})
+	h.b.state.add(newClientState(cl, rawID, "", ident(tn, rawID), tn,
+		&grants{acl: acl.Compile(rules, acl.Vars{ClientID: rawID})},
+		h.b.deps.Limits, h.b.countersFor(tn.ID.String())))
 }
 
 // Controller ruling R8: a closed client without state is an offline session.
