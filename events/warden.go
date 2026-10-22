@@ -29,7 +29,8 @@ import (
 // only logs plugin errors, but a failing hook would still be noise in its
 // metrics.
 type WardenPlugin struct {
-	h atomic.Pointer[handlerRef]
+	h     atomic.Pointer[handlerRef]
+	wired atomic.Bool
 }
 
 // NewWardenPlugin returns a plugin that reports to h. A nil h leaves it
@@ -52,6 +53,15 @@ func (p *WardenPlugin) Bind(h Handler) {
 
 	p.h.Store(&handlerRef{h: h})
 }
+
+// MarkWired records that the plugin was registered with a warden engine,
+// at construction (warden.WithPlugin) or through Engine.Plugins().Register.
+// As with KeysmithPlugin, code that receives the plugin later checks Wired
+// instead of trusting that it was.
+func (p *WardenPlugin) MarkWired() { p.wired.Store(true) }
+
+// Wired reports whether MarkWired was called.
+func (p *WardenPlugin) Wired() bool { return p.wired.Load() }
 
 // Name implements warden's plugin.Plugin.
 func (p *WardenPlugin) Name() string { return pluginName }

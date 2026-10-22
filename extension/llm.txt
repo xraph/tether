@@ -1,0 +1,52 @@
+# tether/extension
+
+Import: github.com/xraph/tether/extension
+
+Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith and warden plugins (`events/`) that make live connections react to key and role changes. Forge v1.12.10, keysmith v1.8.0, warden v1.8.0.
+
+## Use
+
+    t := extension.New(extension.WithAdminMiddleware(adminAuth))
+    app.RegisterExtension(t.Keysmith())   // keysmithext.New + the tether plugin
+    app.RegisterExtension(t.Warden())     // wardenext.New + the tether plugin
+    app.RegisterExtension(t)
+
+- `New(opts ...Option) *Extension`. `ExtensionName = "tether"`, `ExtensionVersion = tether.Version`. `Dependencies()` is `["keysmith", "warden"]`, so Forge registers and starts both first.
+- `(*Extension).Keysmith(opts ...keysmithext.ExtOption) forge.Extension`: `keysmithext.New(append(opts, keysmithext.WithHookExtension(plugin))...)`, then `plugin.MarkWired()`. Keysmith takes plugins only at construction, so this is the only way in.
+- `(*Extension).Warden(opts ...wardenext.Option) forge.Extension`: `wardenext.New(append(opts, wardenext.WithPlugin(plugin))...)`, then `MarkWired()`.
+- `Broker() *broker.Broker`, `Services() *api.Services`: nil before Start.
+
+## Config
+
+`Config{BasePath string; DisableRoutes bool; GroveDatabase string; Broker broker.Config; RequireConfig bool}`, yaml/json snake_case (`base_path`, `disable_routes`, `grove_database`, `broker`), `RequireConfig` is `yaml:"-"`. `DefaultConfig()`: `BasePath "/tether"` (`DefaultBasePath`), `Broker: broker.DefaultConfig()` (TCP `:1883`). Register loads it with `LoadConfig("tether", &cfg, e.config, DefaultConfig(), e.config.RequireConfig)` (`extensions.tether`, then `tether`); an option beats the file when it differs from DefaultConfig.
+
+Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store)`, `WithGroveDatabase(name)`, `WithAdminMiddleware(...forge.Middleware)`, `WithInsecureAdminRoutes()`, `WithoutKeysmithEvents()`, `WithoutWardenEvents()`, `WithLogger(forge.Logger)` (default: the app's logger).
+
+## Lifecycle
+
+- Register: `BaseExtension.Register`, logger, config, then `vessel.Provide` of `*Extension`. Nothing else: keysmith and warden build their engines in their own Register, which runs first.
+- Start, in order:
+  1. `ErrKeysmithNotWired` unless the keysmith plugin was wired by `Keysmith()` or `WithoutKeysmithEvents` is set.
+  2. `ErrAdminAuthRequired` when routes are on, no `WithAdminMiddleware` and no `WithInsecureAdminRoutes`.
+  3. `*keysmith.Engine` and `*warden.Engine` from the container.
+  4. Warden plugin: if the engine's plugin registry already holds it (built by `Warden()`), nothing; else `eng.Plugins().Register(p)`. A nil registry (warden v1.8.0 makes one only for an engine with a plugin, a decision cache or the audit log, which is on by default) is `ErrWardenNotWired` unless `WithoutWardenEvents`.
+  5. Store: `WithStore`, else the grove DB `GroveDatabase` names (`vessel.InjectNamed`), else the default one (`vessel.Inject`); driver `sqlite` gives `store/sqlite`, `pg` gives `store/postgres`, anything else is an error. Then `Migrate`. Tether never closes the store.
+  6. `service.NewTenants`, `auth.NewKeysmith(ks, tenants, store)`, `perm.NewLoader(wd, perm.WithLogger(...))`, `limits.New()`, `broker.New(cfg.Broker, Deps{..., Metrics})`.
+  7. `events.NewReactor(authn.Evict, broker)` bound to both plugins, before the broker listens.
+  8. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: cfg.Broker.MaxPacketSize}` (0 means api's 1 MiB default). Its error fails Start.
+  9. `broker.Start`.
+- Stop: unbinds the plugins, stops the broker (which handles mochi's Close deadlock and the reload retries). Health: broker running and store ping. `DashboardStatus()` (`dashboard.DashboardStatusAware`): `Version` and `Configured` true from a successful Start until Stop. No dashboard contract yet.
+
+Why `Use` and not `forge.WithGroupMiddleware`: api registers on groups nested in the admin group, and forge v1.12.10's `Group` copies a parent's `Use` middleware but not its `WithGroupMiddleware`. With the option the admin routes would mount open. `TestAdminMiddlewareGuardsAdminRoutesOnly` pins it.
+
+## Metrics
+
+Through the app's `forge.Metrics` (scraped as `forge_<name>`), no tenant label: `tether_connections` (gauge), `tether_messages_in_total`, `tether_messages_out_total`, `tether_auth_failures_total{reason}` (`broker.AuthReason*`: bad_credentials, not_authorized, unavailable, rate_limited, connection_limit, invalid_will, other), `tether_acl_denials_total{op}` (publish, subscribe). Names are the `Metric*` constants. The broker reports them through `broker.Metrics`.
+
+## Logging
+
+The broker, mochi, perm and the API take `*slog.Logger`; `logger.go` has a `slog.Handler` over the forge logger (levels map to Debug/Info/Warn/Error, groups become dotted keys).
+
+## Tests
+
+`extension_test.go`: a Forge app with grove SQLite in a temp dir (`vessel.Provide` of `*grove.DB`, which keysmith, warden and tether all pick up), keysmith and warden with routes off, tether with `WithInsecureAdminRoutes` on `127.0.0.1:0`, the router behind httptest, paho 3.1.1 clients. Covers the round trip, revoke over REST disconnecting the client within 2 s, a role narrowed over REST dropping a subscription (warden built by the helper, and plugin registered at Start), the three Start refusals and their opt-outs, admin middleware scope, metrics from the scrape, config from a YAML file, `WithStore`, and Stop.

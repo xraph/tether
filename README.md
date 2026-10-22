@@ -4,4 +4,4 @@ Tether is a multi-tenant MQTT broker for Go. You import it as a library, and the
 
 Module path: `github.com/xraph/tether`. MIT licensed.
 
-Status: in development. Nothing here is ready to run yet.
+Status: in development. You can run the broker in a Forge app through the extension now, but nothing has been released yet.

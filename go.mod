@@ -16,6 +16,7 @@ require (
 	github.com/xraph/grove/drivers/pgdriver v1.9.0
 	github.com/xraph/grove/drivers/sqlitedriver v1.9.0
 	github.com/xraph/keysmith v1.8.0
+	github.com/xraph/vessel v1.0.4
 	github.com/xraph/warden v1.8.0
 	go.jetify.com/typeid/v2 v2.0.0-alpha.3
 	golang.org/x/time v0.15.0
@@ -112,9 +113,14 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/uptrace/bunrouter v1.0.23 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
+	github.com/xdg-go/scram v1.2.0 // indirect
+	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/xraph/confy v1.1.0 // indirect
 	github.com/xraph/go-utils v1.4.1 // indirect
-	github.com/xraph/vessel v1.0.4 // indirect
+	github.com/xraph/grove/drivers/mongodriver v1.8.0 // indirect
+	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.9.1 // indirect
 	go.opencensus.io v0.22.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect

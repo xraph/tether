@@ -138,6 +138,14 @@ func TestKeysmithPluginWired(t *testing.T) {
 	assert.True(t, p.Wired())
 }
 
+func TestWardenPluginWired(t *testing.T) {
+	p := events.NewWardenPlugin(nil)
+	assert.False(t, p.Wired())
+
+	p.MarkWired()
+	assert.True(t, p.Wired())
+}
+
 // Keysmith stops dispatching at the first plugin error and does not recover
 // panics, so the plugin must swallow both.
 func TestKeysmithPluginNeverFails(t *testing.T) {
