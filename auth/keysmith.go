@@ -321,11 +321,13 @@ func (k *Keysmith) removeLocked(sum [sha256.Size]byte, e *entry) {
 }
 
 // mapKeysmithError turns a ValidateKey failure into an auth error. Only the
-// failures that say something about the credentials are bad credentials;
-// anything else is an outage.
+// failures that say something about the credentials are bad credentials. A
+// key over its rate or its usage quota is rate limited (CONNACK 0x9F), so a
+// device backs off rather than retrying into an outage code. Anything else
+// is an outage.
 func mapKeysmithError(err error) error {
 	switch {
-	case errors.Is(err, keysmith.ErrRateLimited):
+	case errors.Is(err, keysmith.ErrRateLimited), errors.Is(err, keysmith.ErrQuotaExceeded):
 		return fmt.Errorf("%w: %w", ErrRateLimited, err)
 	case errors.Is(err, keysmith.ErrInvalidKey),
 		errors.Is(err, keysmith.ErrKeyInactive),

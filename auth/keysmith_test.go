@@ -341,6 +341,7 @@ func TestKeysmithErrorsMapToReasons(t *testing.T) {
 		{"suspended", keysmith.ErrKeySuspended, ErrBadCredentials},
 		{"wrapped inactive", errors.Join(errors.New("ctx"), keysmith.ErrKeyInactive), ErrBadCredentials},
 		{"rate limited", keysmith.ErrRateLimited, ErrRateLimited},
+		{"quota exceeded", keysmith.ErrQuotaExceeded, ErrRateLimited},
 		{"other", errors.New("db down"), ErrUnavailable},
 		{"cancelled", context.Canceled, ErrUnavailable},
 	}

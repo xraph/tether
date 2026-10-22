@@ -15,7 +15,7 @@ Turns MQTT CONNECT credentials into a tenant-scoped identity. The broker calls `
 
 Order of decisions:
 1. Empty username or password: `ErrBadCredentials`.
-2. `ValidateKey` (cache by SHA-256 of the password first). `ErrInvalidKey`, `ErrKeyInactive`, `ErrKeyExpired`, `ErrKeyRevoked`, `ErrKeySuspended` give `ErrBadCredentials`; keysmith `ErrRateLimited` gives `ErrRateLimited`; any other validator error (and a nil result) gives `ErrUnavailable`.
+2. `ValidateKey` (cache by SHA-256 of the password first). `ErrInvalidKey`, `ErrKeyInactive`, `ErrKeyExpired`, `ErrKeyRevoked`, `ErrKeySuspended` give `ErrBadCredentials`; keysmith `ErrRateLimited` and `ErrQuotaExceeded` give `ErrRateLimited` (0x9F, so the device backs off); any other validator error (and a nil result) gives `ErrUnavailable`.
 3. `res.Key.ID.String()` must equal the username, else `ErrBadCredentials` (the raw key does not carry its ID).
 4. `GetDeviceByKey`: not found gives `ErrNotAuthorized` (a keysmith key with no Tether device), other errors `ErrUnavailable`.
 5. Tenant from `res.Key.AppID` and `res.Key.TenantID` through `TenantResolver`: not found, disabled, or not the device's tenant gives `ErrNotAuthorized`; other errors `ErrUnavailable`.
