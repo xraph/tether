@@ -9,9 +9,12 @@ import (
 	"github.com/xraph/tether/tenant"
 )
 
-func tenantsListHandler(sp ServicesProvider) handlerFunc[PageInput, TenantList] {
-	return func(ctx context.Context, in PageInput, _ dashcontract.Principal) (TenantList, error) {
-		s, err := services(sp)
+// tenantsListHandler is tenants.list: every tenant for an operator, and the
+// caller's own tenant alone for a tenant user (paged the same way, so an
+// offset past it is an empty page).
+func tenantsListHandler(g *gate) handlerFunc[PageInput, TenantList] {
+	return func(ctx context.Context, in PageInput, p dashcontract.Principal) (TenantList, error) {
+		s, err := services(g.sp)
 		if err != nil {
 			return TenantList{}, err
 		}
@@ -19,6 +22,20 @@ func tenantsListHandler(sp ServicesProvider) handlerFunc[PageInput, TenantList] 
 		limit, offset, err := page(in.Limit, in.Offset)
 		if err != nil {
 			return TenantList{}, err
+		}
+
+		if !g.operator {
+			own, ownErr := g.own(ctx, s, p)
+			if ownErr != nil {
+				return TenantList{}, ownErr
+			}
+
+			items := []Tenant{}
+			if offset == 0 {
+				items = append(items, fromTenant(own))
+			}
+
+			return TenantList{Items: items, Limit: limit, Offset: offset}, nil
 		}
 
 		ts, err := s.Tenants.List(ctx, tenant.ListFilter{Limit: limit, Offset: offset})

@@ -7,13 +7,13 @@ It builds a Forge app with a grove SQLite database in the container, keysmith (`
 ## Flags and environment
 
 - `--config <path>`: YAML config. Default `./tether.yaml` when it exists, else the defaults. A named file that is missing is an error.
-- `--insecure-admin`: allow an empty token. The admin API mounts with no auth and the dashboard intents are served to anonymous requests (`WithInsecureDashboard`).
+- `--insecure-admin`: allow an empty token. The admin API mounts with no auth and the dashboard intents are served to anonymous requests (`WithInsecureDashboard`), as operators. It is the only way the binary makes operators by default: with the dashboard's auth on, a signed-in user is confined to their own tenant unless the config sets `tether.dashboard_operators: true`.
 - `--version`.
 - `TETHER_ADMIN_TOKEN`: bearer token for the admin API, compared as SHA-256 digests with `crypto/subtle.ConstantTimeCompare`. A missing or wrong one is 401 with `WWW-Authenticate: Bearer`. Empty without `--insecure-admin` fails startup. The device endpoint `POST /tether/v1/publish` is not behind it (it uses HTTP Basic with the device key).
 
 ## Config
 
-`tether.example.yaml` lists every key with its default. `server.http_address` (`:8080`), `server.sqlite_path` (`./data/tether.db`), and a `tether:` section that is `extension.Config` (`base_path`, `disable_routes`, `grove_database`, `broker.*`, with `broker.data_dir` defaulting to `./data/sessions`). The binary decodes the file over `defaultConfig()` itself and hands the result to the extension with `WithConfig`, then points Forge's own config loader at the same file (for the `dashboard:` section). Environment config sources are off. Data directories are created.
+`tether.example.yaml` lists every key with its default. `server.http_address` (`:8080`), `server.sqlite_path` (`./data/tether.db`), and a `tether:` section that is `extension.Config` (`base_path`, `disable_routes`, `grove_database`, `dashboard_operators`, `broker.*`, with `broker.data_dir` defaulting to `./data/sessions`). The binary decodes the file over `defaultConfig()` itself and hands the result to the extension with `WithConfig`, then points Forge's own config loader at the same file (for the `dashboard:` section). Environment config sources are off. Data directories are created.
 
 ## For tests
 

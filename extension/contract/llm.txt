@@ -6,18 +6,28 @@ Tether's admin operations as a Forge dashboard contract contributor. The React p
 
 ## Wiring
 
-`Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry, deps Deps) error` loads the embedded `manifest.yaml`, runs `loader.Validate`, calls `reg.Register`, then registers one typed handler per intent. `Deps{Services ServicesProvider; AllowAnonymous bool}` where `ServicesProvider func() *api.Services` is called on every request (nil means Tether has not started). The extension implements `dashboard.ContractContributorAware` and passes `(*Extension).Services`. `ContributorName = "tether"`.
+`Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry, deps Deps) error` loads the embedded `manifest.yaml`, runs `loader.Validate`, calls `reg.Register`, then registers one typed handler per intent. `Deps{Services ServicesProvider; AllowAnonymous bool; Operators bool}` where `ServicesProvider func() *api.Services` is called on every request (nil means Tether has not started). The extension implements `dashboard.ContractContributorAware` and passes `(*Extension).Services`. `ContributorName = "tether"`.
 
-Contributor `tether`, capabilities `tether.read`, `tether.write`, app block `displayName Tether`, `slug tether`, `icon radio-tower`. 23 intents, all version 1: 9 queries (capability read) and 14 commands (capability write, each with `invalidates`).
+Contributor `tether`, capabilities `tether.read`, `tether.write`, app block `displayName Tether`, `slug tether`, `icon radio-tower`. 24 intents, all version 1: 10 queries (capability read) and 14 commands (capability write, each with `invalidates`).
 
-No intent declares `requires`, so role policy is the dashboard's. Every intent does have an admission check (R18): it is registered with `dispatcher.BeforeDispatch(requireUser)`, which answers `UNAUTHENTICATED` (message "authentication required") before the handler runs unless the principal has an authenticated user (`p.User.Authenticated()`). A dashboard with `enable_auth` off, the default, sends principals with no user, so it is refused. `Deps.AllowAnonymous` (the extension's `WithInsecureDashboard()`) skips the check. The contributor is registered either way, so the plugin sees its intents and the refusal, not a missing app. The plugin should treat `UNAUTHENTICATED` as "sign in or enable dashboard auth".
+No intent declares `requires`. Every intent has an admission check: it is registered with `dispatcher.BeforeDispatch(requireUser)`, which answers `UNAUTHENTICATED` (message "authentication required") before the handler runs unless the principal has an authenticated user (`p.User.Authenticated()`). A dashboard with `enable_auth` off, the default, sends principals with no user, so it is refused. `Deps.AllowAnonymous` (the extension's `WithInsecureDashboard()`) skips the check. The contributor is registered either way, so the plugin sees its intents and the refusal, not a missing app. The plugin should treat `UNAUTHENTICATED` as "sign in or enable dashboard auth".
+
+## Tenant scope
+
+After admission, every caller is either an operator or a tenant user (`caller.go`).
+
+- Operator: `Deps.Operators` (the extension's `WithDashboardOperators()` or `dashboard_operators: true`), or `Deps.AllowAnonymous`, which implies it. An operator may name any tenant, manage tenants (`tenants.create`, `tenants.update`, `tenants.delete`) and read the node total (`overview.stats` with no `tenantId`).
+- Tenant user: everyone else. Their tenant is resolved the way keysmith's contract resolves its own: a `tenant_id` claim on the principal (app from an `app_id` claim, else from the forge Scope), else the org and app of the forge Scope on the request context (the host's auth middleware sets it from the session; authsome sets `forge.NewOrgScope(app, org)`). The `(app, org)` pair maps to a Tether tenant through `Tenants.ResolveTenant`. A claim that is present but unusable refuses and never falls back to the Scope.
+- `scoped(g, h)` wraps every tenant-scoped handler and rewrites the input's `tenantId` before the handler runs: a tenant user's omitted `tenantId` becomes their tenant, another tenant is `PERMISSION_DENIED`. An operator's `tenantId` passes as sent, and an omitted one becomes their own tenant when the session has one, else `PERMISSION_DENIED`.
+- A tenant user with no resolvable tenant (no claim, no org in the Scope, an org with no Tether tenant) is `PERMISSION_DENIED` on every intent, `session.info` included.
+- A tenant user's `tenants.list` holds their own tenant alone (an offset past it is an empty page); `tenants.create`, `tenants.update` and `tenants.delete` are `PERMISSION_DENIED` (`operatorOnly`), since limits are the operators' to set.
 
 ## Rules every intent follows
 
 - A request whose principal has no authenticated user is `UNAUTHENTICATED`, whatever the intent (see above). This is checked first, before `tenantId` or the broker.
 - A query takes its input as `params`, a command as `payload`. Both decode into the same input struct. JSON names are camelCase.
-- `tenantId` is the tenant's ID string (`ttnt_...`). Contract principals carry no tenant claims, so there is nothing to scope to without it: a missing or empty `tenantId` is `PERMISSION_DENIED`, never "all tenants". A malformed one is `BAD_REQUEST`; an unknown one is `NOT_FOUND`. A device, role, client or retained topic of another tenant is `NOT_FOUND`.
-- The one exception is `overview.stats`: no `tenantId` is the node total (sums, never rows). `tenants.list` and `tenants.create` take none; `tenants.get`, `tenants.update` and `tenants.delete` name their tenant with `tenantId`.
+- `tenantId` is the tenant's ID string (`ttnt_...`), scoped as above. With no tenant to fall back on it is `PERMISSION_DENIED`, never "all tenants". A malformed one is `BAD_REQUEST`; an unknown one (operators only) is `NOT_FOUND`. A device, role, client or retained topic of another tenant is `NOT_FOUND`.
+- `overview.stats` with no `tenantId` is the node total (sums, never rows) for an operator, and the caller's tenant for a tenant user. `session.info`, `tenants.list` and `tenants.create` take none; `tenants.get`, `tenants.update` and `tenants.delete` name their tenant with `tenantId`.
 - Intents that call the broker (`overview.stats`, `clients.list`, `clients.kick`, `sessions.delete`, `retained.list`, `retained.delete`) are `UNAVAILABLE` while the broker is not running. So is every intent before Tether's Start.
 - Optional update fields are pointers: `tenants.update` changes only the fields it names (`name: ""` sets an empty name). `roles.topics.set` and `devices.roles.set` replace whole lists, so the list is required (`[]` clears; absent is `BAD_REQUEST`).
 - Errors are `*contract.Error`: `tether.ErrInvalidInput` and `warden.ErrRoleNotFound` are `BAD_REQUEST` (with the reason), `ErrNotFound` and `keysmith.ErrKeyNotFound` `NOT_FOUND`, `ErrConflict` and a rotate of a revoked key `CONFLICT`, `ErrTenantDisabled` and `ErrNotAuthorized` `PERMISSION_DENIED`, broker down `UNAVAILABLE` (retryable), anything else `INTERNAL` with the text "internal error" (the cause goes to `Services.Logger`).
@@ -36,6 +46,7 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
     Stats       {scope: "node"|"tenant", tenantId?, tenants?, connected, sessions, subscriptions,
                  retained, messagesIn, messagesOut}
     TopicRules  {roleSlug, publish: string[], subscribe: string[]}                     (filters use %c and %u)
+    SessionInfo {operator: boolean, tenantId?}
     Role        {slug, name, parentSlug?, publish: string[], subscribe: string[]}
 
 `Device` never has a password. `Credentials` is the only shape that does.
@@ -44,8 +55,9 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
 
 | Intent | Input | Output |
 |---|---|---|
-| `overview.stats` | `{tenantId?}` | `Stats`. With `tenantId`: `scope "tenant"`, that tenant's counters on this node, no `tenants`. Without: `scope "node"`, `tenants` is the tenant count, every other count is the sum over all tenants. |
-| `tenants.list` | `{limit?, offset?}` | `{items: Tenant[], limit, offset}` |
+| `session.info` | `{}` | `SessionInfo`: `operator`, and `tenantId` when the session maps to a tenant. A tenant user without one is `PERMISSION_DENIED`. The plugin reads it on load to pick its pages. |
+| `overview.stats` | `{tenantId?}` | `Stats`. With `tenantId` (or a tenant user without one): `scope "tenant"`, that tenant's counters on this node, no `tenants`. An operator without one: `scope "node"`, `tenants` is the tenant count, every other count is the sum over all tenants. |
+| `tenants.list` | `{limit?, offset?}` | `{items: Tenant[], limit, offset}`. A tenant user sees only their own. |
 | `tenants.get` | `{tenantId}` | `Tenant` |
 | `devices.list` | `{tenantId, limit?, offset?}` | `{items: Device[], limit, offset}` |
 | `devices.get` | `{tenantId, deviceId}` | `Device` |
@@ -77,4 +89,4 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
 
 ## Tests
 
-`contract_test.go` registers the contract on a real dispatcher over a real stack (memory store, keysmith and warden engines, a broker on a loopback port, paho clients) and dispatches envelopes as a signed-in admin, so it checks the JSON the plugin receives: the lifecycle of tenants, the single appearance of the password, tenant scope on every device, role and client intent, the `PERMISSION_DENIED` rule over the whole manifest, broker-down answers, the node and tenant stats, and the admission check (every intent refuses an anonymous principal and a user with no subject; `AllowAnonymous` and a signed-in principal pass). `manifest_test.go` loads and validates the manifest (23 intents, every command invalidates real queries, every intent has a handler). `extension/dashboard_contract_test.go` boots Forge with the real dashboard and reads `/capabilities`, and its real POST endpoint with auth off (UNAUTHENTICATED by default, served with `WithInsecureDashboard`), because `Registry.Register` rejects manifests that `loader.Validate` accepts and the dashboard only logs it.
+`contract_test.go` registers the contract on a real dispatcher over a real stack (memory store, keysmith and warden engines, a broker on a loopback port, paho clients) and dispatches envelopes as a signed-in admin, so it checks the JSON the plugin receives: the lifecycle of tenants, the single appearance of the password, tenant scope on every device, role and client intent, the `PERMISSION_DENIED` rule over the whole manifest, broker-down answers, the node and tenant stats, and the admission check (every intent refuses an anonymous principal and a user with no subject; `AllowAnonymous` and a signed-in principal pass). The harness runs in operator mode unless a test says otherwise. `scope_test.go` covers tenant scope over the whole manifest: a tenant user reaches nothing of another tenant through any of the 24 intents, an operator is served the same requests, a tenant-less principal (no Scope, app-only Scope, unknown org, other app) is refused everything, a tenant user works in their own tenant with `tenantId` left out, a `tenant_id` claim wins over the Scope and a broken one refuses, and `AllowAnonymous` is an operator. `manifest_test.go` loads and validates the manifest (24 intents, every command invalidates real queries, every intent has a handler). `extension/dashboard_contract_test.go` boots Forge with the real dashboard and reads `/capabilities`, and its real POST endpoint with auth off (UNAUTHENTICATED by default, served with `WithInsecureDashboard`; a signed-in user is PERMISSION_DENIED without a tenant and served with `WithDashboardOperators` or `dashboard_operators: true`), because `Registry.Register` rejects manifests that `loader.Validate` accepts and the dashboard only logs it.

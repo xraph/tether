@@ -34,6 +34,13 @@ tether:
   # Empty uses the default database. The binary has only one.
   grove_database: ""
 
+  # Who may do what on Tether's dashboard pages. With false, a signed-in
+  # dashboard user sees only the tenant their session names (the org their
+  # identity provider puts on the session) and can't create, change or
+  # delete tenants. Set it to true and every signed-in user is an operator,
+  # with every tenant in reach. --insecure-admin makes everyone an operator.
+  dashboard_operators: false
+
   broker:
     # The plain MQTT listener. Empty turns it off.
     tcp_address: ":1883"
@@ -77,5 +84,6 @@ tether:
 
 # The dashboard has its own section (dashboard:), and its auth is off by
 # default. While it is off, Tether's dashboard pages refuse every request
-# unless the binary runs with --insecure-admin. See the Forge dashboard
-# extension for its keys.
+# unless the binary runs with --insecure-admin. Once you turn it on, set
+# tether.dashboard_operators to true if your dashboard users run the whole
+# node. See the Forge dashboard extension for its keys.

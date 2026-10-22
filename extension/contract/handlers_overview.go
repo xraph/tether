@@ -15,13 +15,13 @@ const (
 	scopeTenant = "tenant"
 )
 
-// overviewStatsHandler is overview.stats: one tenant's counters on this node
-// with a tenantId, or the node total without one. It is the one tenant
-// optional intent, and the only place an absent tenantId means every tenant:
-// it returns sums, never rows.
-func overviewStatsHandler(sp ServicesProvider) handlerFunc[StatsInput, Stats] {
-	return func(ctx context.Context, in StatsInput, _ dashcontract.Principal) (Stats, error) {
-		s, err := services(sp)
+// overviewStatsHandler is overview.stats: one tenant's counters on this node,
+// or for an operator who names no tenant the node total. That is the only
+// place an absent tenantId means every tenant, and it returns sums, never
+// rows. A tenant user who names no tenant gets their own.
+func overviewStatsHandler(g *gate) handlerFunc[StatsInput, Stats] {
+	return func(ctx context.Context, in StatsInput, p dashcontract.Principal) (Stats, error) {
+		s, err := services(g.sp)
 		if err != nil {
 			return Stats{}, err
 		}
@@ -30,11 +30,16 @@ func overviewStatsHandler(sp ServicesProvider) handlerFunc[StatsInput, Stats] {
 			return Stats{}, errBrokerDown()
 		}
 
-		if in.TenantID != "" {
-			return tenantStats(ctx, s, in.TenantID)
+		if g.operator && in.TenantID == "" {
+			return nodeStats(ctx, s)
 		}
 
-		return nodeStats(ctx, s)
+		raw, err := g.tenantFor(ctx, s, p, in.TenantID)
+		if err != nil {
+			return Stats{}, err
+		}
+
+		return tenantStats(ctx, s, raw)
 	}
 }
 

@@ -18,7 +18,7 @@ export TETHER_ADMIN_TOKEN="$(openssl rand -hex 32)"
 
 That starts MQTT on `:1883` and the HTTP API and dashboard on `:8080`. Everything it stores lands under `./data`: a SQLite file for tenants, devices and keys, and a Badger directory for sessions and retained messages. Stop it with Ctrl-C and it shuts down cleanly.
 
-No token set? It refuses to start and tells you so. On a laptop you can pass `--insecure-admin` instead, which leaves the admin API and Tether's dashboard pages open to anyone who can reach port 8080. Don't do that on a server. The flag opens the dashboard pages even when a token is set: with both, the REST API still asks for the token, but Tether's dashboard pages answer anonymous requests. `tether --version` prints the version.
+No token set? It refuses to start and tells you so. On a laptop you can pass `--insecure-admin` instead, which leaves the admin API and Tether's dashboard pages open to anyone who can reach port 8080, with every tenant in reach. Don't do that on a server. The flag opens the dashboard pages even when a token is set: with both, the REST API still asks for the token, but Tether's dashboard pages answer anonymous requests as an operator. `tether --version` prints the version.
 
 Create a tenant. The `app_id` and `external_id` are yours: the pair maps a Tether tenant to whatever your own system calls the customer.
 
@@ -121,7 +121,9 @@ func main() {
 
 `myAdminAuth` is a `forge.Middleware` of yours. Tether adds no admin authentication of its own, and `Start` fails with `ErrAdminAuthRequired` when the admin routes are on and you gave it neither a middleware nor `WithInsecureAdminRoutes()`. If keysmith or warden were built some other way, `Start` fails with `ErrKeysmithNotWired` or `ErrWardenNotWired`. `WithoutKeysmithEvents()` and `WithoutWardenEvents()` turn those checks off, at the price of live connections ignoring key and role changes until they reconnect.
 
-Add `dashboard.NewExtension()` from `github.com/xraph/forge/extensions/dashboard` if you want the Tether pages. Tether publishes 23 dashboard intents (overview, tenants, devices, roles and their topic grants, live clients, sessions, retained messages), and it answers all of them `UNAUTHENTICATED` unless the request carries a signed-in user. The dashboard's auth is off by default, so out of the box you see the plugin and its refusal. Turn the dashboard's auth on, or pass `WithInsecureDashboard()` if only people you trust can reach it.
+Add `dashboard.NewExtension()` from `github.com/xraph/forge/extensions/dashboard` if you want the Tether pages. Tether publishes 24 dashboard intents (session info, overview, tenants, devices, roles and their topic grants, live clients, sessions, retained messages), and it answers all of them `UNAUTHENTICATED` unless the request carries a signed-in user. The dashboard's auth is off by default, so out of the box you see the plugin and its refusal. Turn the dashboard's auth on, or pass `WithInsecureDashboard()` if only people you trust can reach it.
+
+A signed-in user only sees their own tenant. Tether takes it from the session the way keysmith does: a `tenant_id` claim if your auth provider sets one, otherwise the org of the forge scope your auth middleware puts on the request (authsome does this for you). That `(app, org)` pair has to match a tenant's `app_id` and `external_id`. Ask for another tenant and you get `PERMISSION_DENIED`, and a user whose session names no tenant is refused outright. If the people on your dashboard run the whole node, pass `WithDashboardOperators()` (or set `dashboard_operators: true`) and every signed-in user becomes an operator: any tenant, plus creating, changing and deleting tenants. `WithInsecureDashboard()` implies it, since an anonymous caller has no tenant to be held to.
 
 Metrics go through the app's `forge.Metrics`: `tether_connections`, `tether_messages_in_total`, `tether_messages_out_total`, `tether_auth_failures_total{reason}` and `tether_acl_denials_total{op}`. Each package has an `llm.txt` with its full surface.
 
@@ -177,6 +179,7 @@ tether:
 | `tether.base_path` | `/tether` | Prefix for every REST route |
 | `tether.disable_routes` | `false` | Mounts no REST routes. The broker still runs |
 | `tether.grove_database` | empty | Name of the grove database to use when the container holds more than one. The binary has only one |
+| `tether.dashboard_operators` | `false` | Makes every signed-in dashboard user an operator, with every tenant in reach. Off, a user sees only their own tenant |
 | `tether.broker.tcp_address` | `:1883` | Plain MQTT. Empty turns it off |
 | `tether.broker.tls` | off | MQTT over TLS: `address`, `cert_file` and `key_file` |
 | `tether.broker.websocket_address` | off | MQTT over WebSocket, subprotocol `mqtt`, any path |

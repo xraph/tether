@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/xraph/forge"
 	dashauth "github.com/xraph/forge/extensions/dashboard/auth"
 	dashcontract "github.com/xraph/forge/extensions/dashboard/contract"
 	"github.com/xraph/forge/extensions/dashboard/contract/dispatcher"
@@ -52,6 +53,10 @@ type harness struct {
 	// principal is who the harness dispatches as. By default it is a signed
 	// in admin; the admission tests swap it for an anonymous one.
 	principal dashcontract.Principal
+
+	// scope, when set, is the forge Scope on the request context: what a
+	// host's auth middleware puts there for a signed-in session.
+	scope *forge.Scope
 }
 
 // admin is a principal with an authenticated user.
@@ -59,12 +64,13 @@ func admin() dashcontract.Principal {
 	return dashcontract.PrincipalFor(&dashauth.UserInfo{Subject: "admin-1", Roles: []string{"admin"}})
 }
 
-// newHarness builds the stack. With running false the broker is built and
-// never started, which is what an admin sees while the broker is down.
+// newHarness builds the stack in operator mode. With running false the
+// broker is built and never started, which is what an admin sees while the
+// broker is down.
 func newHarness(t *testing.T, running bool) *harness {
 	t.Helper()
 
-	return newHarnessWith(t, running, Deps{})
+	return newHarnessWith(t, running, Deps{Operators: true})
 }
 
 // newHarnessWith is newHarness with Deps of its own (Services is filled in).
@@ -171,7 +177,12 @@ func (h *harness) dispatch(kind dashcontract.Kind, intent string, input any) (js
 		req.Payload = raw
 	}
 
-	out, _, err := h.disp.Dispatch(h.t.Context(), req, h.principal)
+	ctx := h.t.Context()
+	if h.scope != nil {
+		ctx = forge.WithScope(ctx, *h.scope)
+	}
+
+	out, _, err := h.disp.Dispatch(ctx, req, h.principal)
 
 	return out, err
 }
@@ -395,10 +406,10 @@ func TestTenantsListPaging(t *testing.T) {
 	assert.Equal(t, []any{}, none["items"])
 }
 
-// Contract principals carry no tenant claims, so a tenant-scoped intent with
-// no tenantId has nothing to scope to. It must refuse, not widen to every
-// tenant. This runs over the whole manifest, so a new intent added without
-// the check fails here.
+// An operator whose session names no tenant of its own has nothing to fall
+// back on, so a tenant-scoped intent with no tenantId must refuse, not widen
+// to every tenant. This runs over the whole manifest, so a new intent added
+// without the check fails here.
 func TestTenantScopedIntentsRefuseWithoutTenantID(t *testing.T) {
 	h := newHarness(t, true)
 	h.createTenant("acme") // there is a tenant a careless default could pick.
@@ -406,7 +417,7 @@ func TestTenantScopedIntentsRefuseWithoutTenantID(t *testing.T) {
 	m, err := loader.Load(bytes.NewReader(manifestYAML), "tether/contract/manifest.yaml")
 	require.NoError(t, err)
 
-	open := map[string]bool{"overview.stats": true, "tenants.list": true, "tenants.create": true}
+	open := map[string]bool{"session.info": true, "overview.stats": true, "tenants.list": true, "tenants.create": true}
 	denied := 0
 
 	for _, in := range m.Intents {
@@ -715,7 +726,7 @@ func TestBrokerIntentsAreUnavailableWhileStopped(t *testing.T) {
 func TestServicesNotReadyIsUnavailable(t *testing.T) {
 	disp := dispatcher.New(nil)
 	require.NoError(t, Register(disp, dashcontract.NewRegistry(), dashcontract.NewWardenRegistry(),
-		Deps{Services: func() *api.Services { return nil }}))
+		Deps{Services: func() *api.Services { return nil }, Operators: true}))
 	p := admin()
 
 	for _, tc := range []struct {

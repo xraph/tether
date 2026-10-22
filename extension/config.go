@@ -34,6 +34,12 @@ type Config struct {
 	// See auth.JWTConfig for the fields.
 	JWT auth.JWTConfig `json:"jwt" yaml:"jwt"`
 
+	// DashboardOperators makes every signed-in dashboard user an operator:
+	// they may act on any tenant and create, change and delete tenants.
+	// Without it a dashboard user is confined to the tenant their session
+	// names. WithDashboardOperators sets the same thing.
+	DashboardOperators bool `json:"dashboard_operators" yaml:"dashboard_operators"`
+
 	// RequireConfig makes Register fail when the app's config has no
 	// tether section.
 	RequireConfig bool `json:"-" yaml:"-"`

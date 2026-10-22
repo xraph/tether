@@ -20,6 +20,14 @@ var _ dashboard.ContractContributorAware = (*Extension)(nil)
 // (UNAUTHENTICATED), so a dashboard with its auth off serves nothing here
 // unless you pass WithInsecureDashboard. The contributor stays registered
 // either way, so the plugin still shows its pages and the refusal.
+//
+// A signed-in user is confined to their own tenant unless the extension runs
+// with WithDashboardOperators (or dashboard_operators: true), which makes
+// every signed-in user an operator. WithInsecureDashboard implies it.
 func (e *Extension) RegisterContractContributor(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry) error {
-	return contract.Register(disp, reg, wreg, contract.Deps{Services: e.Services, AllowAnonymous: e.insecureDashboard})
+	return contract.Register(disp, reg, wreg, contract.Deps{
+		Services:       e.Services,
+		AllowAnonymous: e.insecureDashboard,
+		Operators:      e.config.DashboardOperators,
+	})
 }

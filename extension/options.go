@@ -93,6 +93,19 @@ func WithLogger(l forge.Logger) Option {
 // what you get when the dashboard's own auth is off, the same refusal the
 // REST admin API gives without WithAdminMiddleware. Use it only when the
 // dashboard is reachable by trusted callers alone.
+//
+// It implies WithDashboardOperators: an anonymous caller has no session to
+// take a tenant from, so it is served as an operator.
 func WithInsecureDashboard() Option {
 	return func(e *Extension) { e.insecureDashboard = true }
+}
+
+// WithDashboardOperators makes every signed-in dashboard user an operator,
+// who may act on any tenant and create, change and delete tenants. Without
+// it a dashboard user is confined to the one tenant their session names (a
+// tenant_id claim, or the org of the forge Scope the host's auth middleware
+// sets), mapped to a Tether tenant; a user with no such tenant is refused.
+// The config key dashboard_operators: true does the same.
+func WithDashboardOperators() Option {
+	return func(e *Extension) { e.config.DashboardOperators = true }
 }

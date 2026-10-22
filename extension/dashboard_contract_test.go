@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/xraph/forge"
 	dashboard "github.com/xraph/forge/extensions/dashboard"
 	dashauth "github.com/xraph/forge/extensions/dashboard/auth"
 	dashcontract "github.com/xraph/forge/extensions/dashboard/contract"
@@ -100,7 +103,7 @@ func TestDashboardDiscoveryPublishesTetherContract(t *testing.T) {
 	// Every declared intent has to survive registration, not just the
 	// contributor name: a partial manifest still produces an entry.
 	assert.ElementsMatch(t, []string{
-		"overview.stats", "tenants.list", "tenants.get", "devices.list",
+		"session.info", "overview.stats", "tenants.list", "tenants.get", "devices.list",
 		"devices.get", "roles.list", "roles.topics.get", "clients.list", "retained.list",
 		"tenants.create", "tenants.update", "tenants.delete",
 		"devices.provision", "devices.rotate", "devices.revoke",
@@ -199,9 +202,29 @@ func TestContractContributorRefusesAnonymousUnlessInsecure(t *testing.T) {
 			assert.Equal(t, dashcontract.CodeUnauthenticated, ce.Code)
 		}
 
-		// The refused create made nothing.
+		// A signed-in user is no operator by default, and the host gave this
+		// one no tenant, so it is refused too.
+		for _, err := range []error{
+			call(t, disp, signedIn, dashcontract.KindQuery, "tenants.list", ``),
+			call(t, disp, signedIn, dashcontract.KindCommand, "tenants.create", create),
+		} {
+			var ce *dashcontract.Error
+
+			require.ErrorAs(t, err, &ce)
+			assert.Equal(t, dashcontract.CodePermissionDenied, ce.Code)
+		}
+	})
+
+	t.Run("dashboard operators", func(t *testing.T) {
+		disp := start(t, extension.WithDashboardOperators())
+
+		var ce *dashcontract.Error
+
+		require.ErrorAs(t, call(t, disp, dashcontract.Principal{}, dashcontract.KindQuery, "tenants.list", ``), &ce)
+		assert.Equal(t, dashcontract.CodeUnauthenticated, ce.Code, "operator mode still wants a signed-in user")
+
 		require.NoError(t, call(t, disp, signedIn, dashcontract.KindQuery, "tenants.list", ``))
-		require.NoError(t, call(t, disp, signedIn, dashcontract.KindCommand, "tenants.create", create), "the external ID is still free")
+		require.NoError(t, call(t, disp, signedIn, dashcontract.KindCommand, "tenants.create", create))
 	})
 
 	t.Run("insecure dashboard", func(t *testing.T) {
@@ -210,6 +233,28 @@ func TestContractContributorRefusesAnonymousUnlessInsecure(t *testing.T) {
 		require.NoError(t, call(t, disp, dashcontract.Principal{}, dashcontract.KindQuery, "tenants.list", ``))
 		require.NoError(t, call(t, disp, dashcontract.Principal{}, dashcontract.KindCommand, "tenants.create", create))
 	})
+}
+
+// dashboard_operators: true in the config file does what
+// WithDashboardOperators does.
+func TestDashboardOperatorsFromConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "extensions:\n  tether:\n    dashboard_operators: true\n    broker:\n      tcp_address: 127.0.0.1:0\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0o600))
+
+	app := newAppWith(t, forge.WithConfigSearchPaths(dir), forge.WithEnableAppScopedConfig(false))
+	ext := extension.New(extension.WithInsecureAdminRoutes())
+	require.NoError(t, boot(t, app, ext.Keysmith(keysmithext.WithDisableRoutes()), ext.Warden(wardenext.WithDisableRoutes()), ext))
+
+	disp := dispatcher.New(nil)
+	require.NoError(t, ext.RegisterContractContributor(disp, dashcontract.NewRegistry(), dashcontract.NewWardenRegistry()))
+
+	out, _, err := disp.Dispatch(t.Context(), dashcontract.Request{
+		Envelope: "v1", Kind: dashcontract.KindQuery, Contributor: "tether", Intent: "session.info", IntentVersion: 1,
+		Params: map[string]any{},
+	}, dashcontract.PrincipalFor(&dashauth.UserInfo{Subject: "admin-1"}))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"operator":true}`, string(out))
 }
 
 // The same refusal over the dashboard's real HTTP endpoint with its auth off

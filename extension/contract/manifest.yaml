@@ -10,15 +10,20 @@ contributor:
     slug: tether
     icon: radio-tower
 
-# Every intent but overview.stats and the tenants.* ones takes a tenantId, and
-# refuses with PERMISSION_DENIED without one: a contract principal carries no
-# tenant claims, so there is nothing to scope to and "all tenants" is never
-# the answer. overview.stats without a tenantId is the node total.
+# Every intent is scoped to the caller's tenant: the tenant the host's
+# session names (a tenant_id claim, or the org of the forge Scope its auth
+# middleware sets), mapped to a Tether tenant. A tenantId naming another
+# tenant is PERMISSION_DENIED, an omitted one is the caller's own, and a
+# caller with no tenant is refused. Operators (WithDashboardOperators, or
+# WithInsecureDashboard) may name any tenant and manage tenants; for them
+# overview.stats without a tenantId is the node total. session.info says
+# which of the two the caller is.
 #
 # Intents that call the broker (overview.stats, clients.*, sessions.*,
 # retained.*) answer UNAVAILABLE while the broker is not running.
 intents:
   # Reads
+  - { name: session.info,      kind: query, version: 1, capability: read }
   - { name: overview.stats,    kind: query, version: 1, capability: read }
   - { name: tenants.list,      kind: query, version: 1, capability: read }
   - { name: tenants.get,       kind: query, version: 1, capability: read }

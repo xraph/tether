@@ -5,9 +5,15 @@
 // The extension registers it from RegisterContractContributor. Every intent
 // is admitted only for a principal with an authenticated user (set
 // Deps.AllowAnonymous to turn that off), because the dashboard's auth is off
-// unless the host enables it. Who may do what beyond that is the dashboard's
-// policy. Its principals carry no tenant claims, so every tenant-scoped
-// intent takes the tenant as an explicit tenantId and refuses without one.
+// unless the host enables it.
+//
+// A signed-in user is then confined to their own tenant: the one their
+// session names, through a tenant_id claim or the org of the forge Scope the
+// host's auth middleware sets, mapped to a Tether tenant. Naming another
+// tenant is PERMISSION_DENIED, leaving tenantId out means their own, and a
+// user with no tenant is refused. Deps.Operators lifts that: an operator may
+// act on any tenant and manage tenants themselves. session.info tells the
+// plugin which of the two the caller is.
 package contract
 
 import (
@@ -49,6 +55,12 @@ type Deps struct {
 	// principal has no user when the dashboard's auth is off, and also when
 	// it is on but the request did not authenticate.
 	AllowAnonymous bool
+
+	// Operators makes every caller an operator, who may name any tenant and
+	// create, change and delete tenants. Without it a caller is confined to
+	// their own tenant (see the package doc). AllowAnonymous implies it: an
+	// anonymous caller has no session to take a tenant from.
+	Operators bool
 }
 
 // handlerFunc is the shape of a typed intent handler.
@@ -74,7 +86,7 @@ func Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashc
 		return fmt.Errorf("tether/contract: register manifest: %w", err)
 	}
 
-	sp := deps.Services
+	g := newGate(deps)
 
 	var opts []dispatcher.RegisterOption
 	if !deps.AllowAnonymous {
@@ -82,33 +94,35 @@ func Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashc
 	}
 
 	secret := append(slices.Clone(opts), dispatcher.SecretResponse())
+	sp := deps.Services
 
 	return errors.Join(
 		// Reads.
-		dispatcher.RegisterQuery(disp, ContributorName, "overview.stats", 1, overviewStatsHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "tenants.list", 1, tenantsListHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "tenants.get", 1, tenantsGetHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "devices.list", 1, devicesListHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "devices.get", 1, devicesGetHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "roles.list", 1, rolesListHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "roles.topics.get", 1, rolesTopicsGetHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "clients.list", 1, clientsListHandler(sp), opts...),
-		dispatcher.RegisterQuery(disp, ContributorName, "retained.list", 1, retainedListHandler(sp), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "session.info", 1, sessionInfoHandler(g), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "overview.stats", 1, overviewStatsHandler(g), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "tenants.list", 1, tenantsListHandler(g), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "tenants.get", 1, scoped(g, tenantsGetHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "devices.list", 1, scoped(g, devicesListHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "devices.get", 1, scoped(g, devicesGetHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "roles.list", 1, scoped(g, rolesListHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "roles.topics.get", 1, scoped(g, rolesTopicsGetHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "clients.list", 1, scoped(g, clientsListHandler(sp)), opts...),
+		dispatcher.RegisterQuery(disp, ContributorName, "retained.list", 1, scoped(g, retainedListHandler(sp)), opts...),
 
-		// Commands.
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.create", 1, tenantsCreateHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.update", 1, tenantsUpdateHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, tenantsDeleteHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.provision", 1, devicesProvisionHandler(sp), secret...),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.rotate", 1, devicesRotateHandler(sp), secret...),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.revoke", 1, devicesRevokeHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.delete", 1, devicesDeleteHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "devices.roles.set", 1, devicesRolesSetHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "roles.create", 1, rolesCreateHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "roles.delete", 1, rolesDeleteHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "roles.topics.set", 1, rolesTopicsSetHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "clients.kick", 1, clientsKickHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "sessions.delete", 1, sessionsDeleteHandler(sp), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "retained.delete", 1, retainedDeleteHandler(sp), opts...),
+		// Commands. Tenants are the operators' to create, change and delete.
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.create", 1, operatorOnly(g, tenantsCreateHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.update", 1, operatorOnly(g, scoped(g, tenantsUpdateHandler(sp))), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, operatorOnly(g, scoped(g, tenantsDeleteHandler(sp))), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.provision", 1, scoped(g, devicesProvisionHandler(sp)), secret...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.rotate", 1, scoped(g, devicesRotateHandler(sp)), secret...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.revoke", 1, scoped(g, devicesRevokeHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.delete", 1, scoped(g, devicesDeleteHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "devices.roles.set", 1, scoped(g, devicesRolesSetHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "roles.create", 1, scoped(g, rolesCreateHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "roles.delete", 1, scoped(g, rolesDeleteHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "roles.topics.set", 1, scoped(g, rolesTopicsSetHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "clients.kick", 1, scoped(g, clientsKickHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "sessions.delete", 1, scoped(g, sessionsDeleteHandler(sp)), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "retained.delete", 1, scoped(g, retainedDeleteHandler(sp)), opts...),
 	)
 }

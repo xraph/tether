@@ -129,10 +129,9 @@ func errBrokerDown() *dashcontract.Error {
 	return unavailable("the broker is not running")
 }
 
-// tenantID parses the tenantId an intent names. An empty one is
-// PERMISSION_DENIED: contract principals carry no tenant claims, so with no
-// tenantId there is no tenant the caller may act on, and the answer is never
-// "every tenant". A malformed one is BAD_REQUEST.
+// tenantID parses the tenantId an intent names, after scoped has replaced it
+// with the tenant the caller may act on. An empty one is PERMISSION_DENIED,
+// never "every tenant". A malformed one is BAD_REQUEST.
 func tenantID(raw string) (id.TenantID, error) {
 	if raw == "" {
 		return id.TenantID{}, &dashcontract.Error{
