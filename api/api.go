@@ -27,8 +27,9 @@ const (
 	// MaxPageSize caps the limit a list request may ask for.
 	MaxPageSize = 500
 
-	// MaxPublishPayload is the largest decoded payload POST /v1/publish takes,
-	// the broker's default MaxPacketSize. A larger one is 413.
+	// MaxPublishPayload is the largest decoded payload POST /v1/publish takes
+	// when Services.MaxPublishPayload is zero: the broker's default
+	// MaxPacketSize. A larger one is 413.
 	MaxPublishPayload = 1 << 20
 )
 
@@ -48,6 +49,11 @@ type Services struct {
 	// Logger receives the internal errors the API hides from clients. Nil
 	// discards them.
 	Logger *slog.Logger
+
+	// MaxPublishPayload is the largest decoded payload POST /v1/publish
+	// takes, in bytes. Zero (or less) means the MaxPublishPayload constant.
+	// Set it to the broker's MaxPacketSize so HTTP and MQTT agree.
+	MaxPublishPayload int
 }
 
 // API holds the services the handlers share.
@@ -57,8 +63,11 @@ type API struct {
 
 // Register mounts the admin routes on admin and POST /v1/publish on public,
 // all relative to those routers' base path. It does not authenticate the
-// admin group: wrap admin in your own auth middleware first. The publish
-// route authenticates itself with HTTP Basic (key ID and raw key).
+// admin group: add your own auth middleware to admin with admin.Use first.
+// Do not use forge.WithGroupMiddleware for it: the routes go on groups
+// nested in admin, and forge v1.12.10's Group drops a parent's
+// WithGroupMiddleware, so they would be mounted open. The publish route
+// authenticates itself with HTTP Basic (key ID and raw key).
 //
 // It returns an error when a required service is missing or a route cannot
 // be registered; routes registered before the failure stay mounted.
@@ -69,6 +78,10 @@ func Register(admin, public forge.Router, s Services) error {
 
 	if s.Logger == nil {
 		s.Logger = slog.New(slog.DiscardHandler)
+	}
+
+	if s.MaxPublishPayload <= 0 {
+		s.MaxPublishPayload = MaxPublishPayload
 	}
 
 	a := &API{Services: s}

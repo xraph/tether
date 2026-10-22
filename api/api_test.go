@@ -54,6 +54,14 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 
+	return newEnvWith(t, nil)
+}
+
+// newEnvWith is newEnv with a hook that adjusts the services before the API
+// is mounted.
+func newEnvWith(t *testing.T, adjust func(*api.Services)) *env {
+	t.Helper()
+
 	st := memory.New()
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -86,7 +94,7 @@ func newEnv(t *testing.T) *env {
 	app := forge.New(forge.WithAppLogger(forge.NewNoopLogger()), forge.WithEnableConfigAutoDiscovery(false))
 	router := app.Router()
 
-	require.NoError(t, api.Register(router.Group("/tether"), router.Group("/tether"), api.Services{
+	services := api.Services{
 		Tenants: tenants,
 		Devices: devices,
 		Roles:   perm.NewRoles(wd),
@@ -94,7 +102,12 @@ func newEnv(t *testing.T) *env {
 		Auth:    authn,
 		Perms:   loader,
 		Limits:  limiter,
-	}))
+	}
+	if adjust != nil {
+		adjust(&services)
+	}
+
+	require.NoError(t, api.Register(router.Group("/tether"), router.Group("/tether"), services))
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
@@ -1014,6 +1027,33 @@ func TestPublishIdempotencyDoesNotSkipAuthentication(t *testing.T) {
 	// Someone who knows the username and the key but not the password gets no
 	// replay of the stored response.
 	expect(t, e.publish(d.username, "tdk_live_wrong", body, "Idempotency-Key", "k-1"), http.StatusUnauthorized)
+}
+
+// Services.MaxPublishPayload replaces the 1 MiB default, so the HTTP cap can
+// follow the broker's MaxPacketSize.
+func TestPublishPayloadCapFromServices(t *testing.T) {
+	e := newEnvWith(t, func(s *api.Services) { s.MaxPublishPayload = 16 })
+	d, _, _ := publisher(t, e, nil)
+
+	at := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 16))
+	over := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, 17))
+
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/x", "payload": at}), http.StatusOK)
+	r := expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/x", "payload": over}), http.StatusRequestEntityTooLarge)
+	assert.Contains(t, string(r.body), "16 bytes")
+
+	// A body far over the smaller cap is refused before it is decoded.
+	far := []byte(`{"topic":"up/open/x","payload":"` + strings.Repeat("A", 64<<10) + `"}`)
+	expect(t, e.publish(d.username, d.password, far), http.StatusRequestEntityTooLarge)
+}
+
+// A larger cap lets a payload over the 1 MiB default through.
+func TestPublishPayloadCapAboveDefault(t *testing.T) {
+	e := newEnvWith(t, func(s *api.Services) { s.MaxPublishPayload = 2 << 20 })
+	d, _, _ := publisher(t, e, nil)
+
+	payload := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'z'}, api.MaxPublishPayload+1))
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/big", "payload": payload}), http.StatusOK)
 }
 
 func TestPublishBodyOverTheIdempotencyDefault(t *testing.T) {

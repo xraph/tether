@@ -17,12 +17,14 @@ import (
 	"github.com/xraph/tether/topic"
 )
 
-const (
-	// publishBodyLimit is the largest request body POST /v1/publish reads: a
-	// payload of MaxPublishPayload bytes in base64, plus room for the topic
-	// and the JSON around it.
-	publishBodyLimit = (MaxPublishPayload+2)/3*4 + 4096
+// publishBodyLimit is the largest request body POST /v1/publish reads: a
+// payload of maxPayload bytes in base64, plus room for the topic and the
+// JSON around it.
+func publishBodyLimit(maxPayload int) int64 {
+	return int64((maxPayload+2)/3*4 + 4096)
+}
 
+const (
 	// ctxIdentity is the context key the publish authentication leaves the
 	// device's identity under.
 	ctxIdentity = "tether.identity"
@@ -55,7 +57,7 @@ func (a *API) registerPublish(r forge.Router) error {
 		forge.WithTags("publish"),
 		forge.WithSummary("Publish a message as a device over HTTP"),
 		forge.WithMiddleware(a.publishAuth),
-		forge.WithIdempotency(middleware.IdempotencyMaxBody(publishBodyLimit)),
+		forge.WithIdempotency(middleware.IdempotencyMaxBody(publishBodyLimit(a.MaxPublishPayload))),
 	)
 }
 
@@ -134,7 +136,7 @@ func (a *API) publish(c forge.Context) error {
 		return mapError(auth.ErrUnavailable)
 	}
 
-	req, payload, err := readPublish(c)
+	req, payload, err := readPublish(c, a.MaxPublishPayload)
 	if err != nil {
 		return err
 	}
@@ -190,18 +192,18 @@ func (a *API) loadFailed(err error) error {
 }
 
 // readPublish reads and checks the request body. A body over the limit, or a
-// payload over MaxPublishPayload once decoded, is 413; anything else wrong
+// payload over maxPayload bytes once decoded, is 413; anything else wrong
 // with it is 400.
-func readPublish(c forge.Context) (*publishRequest, []byte, error) {
+func readPublish(c forge.Context, maxPayload int) (*publishRequest, []byte, error) {
 	r := c.Request()
-	r.Body = http.MaxBytesReader(c.Response(), r.Body, publishBodyLimit)
+	r.Body = http.MaxBytesReader(c.Response(), r.Body, publishBodyLimit(maxPayload))
 
 	var req publishRequest
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
-			return nil, nil, errPayloadTooLarge()
+			return nil, nil, errPayloadTooLarge(maxPayload)
 		}
 
 		return nil, nil, mapError(fmt.Errorf("%w: the body must be a JSON object with topic, payload, qos and retain", tether.ErrInvalidInput))
@@ -211,10 +213,10 @@ func readPublish(c forge.Context) (*publishRequest, []byte, error) {
 		return nil, nil, mapError(fmt.Errorf("%w: qos must be 0 or 1", tether.ErrInvalidInput))
 	}
 
-	if base64.StdEncoding.DecodedLen(len(req.Payload)) > MaxPublishPayload+2 {
+	if base64.StdEncoding.DecodedLen(len(req.Payload)) > maxPayload+2 {
 		// DecodedLen overshoots by at most two bytes of padding; the exact
 		// check follows the decode.
-		return nil, nil, errPayloadTooLarge()
+		return nil, nil, errPayloadTooLarge(maxPayload)
 	}
 
 	payload, err := base64.StdEncoding.DecodeString(req.Payload)
@@ -222,14 +224,14 @@ func readPublish(c forge.Context) (*publishRequest, []byte, error) {
 		return nil, nil, mapError(fmt.Errorf("%w: payload is not valid base64", tether.ErrInvalidInput))
 	}
 
-	if len(payload) > MaxPublishPayload {
-		return nil, nil, errPayloadTooLarge()
+	if len(payload) > maxPayload {
+		return nil, nil, errPayloadTooLarge(maxPayload)
 	}
 
 	return &req, payload, nil
 }
 
-func errPayloadTooLarge() error {
+func errPayloadTooLarge(maxPayload int) error {
 	return forge.NewHTTPError(http.StatusRequestEntityTooLarge,
-		fmt.Sprintf("the payload may be at most %d bytes", MaxPublishPayload))
+		fmt.Sprintf("the payload may be at most %d bytes", maxPayload))
 }
