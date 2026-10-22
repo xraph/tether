@@ -56,10 +56,14 @@ type clientState struct {
 
 	// connectedAt is when the connection authenticated. sessionExpiry is
 	// how long, in seconds, mochi keeps the session after the connection
-	// ends, as the CONNECT asked for it and capped by the broker. Both are
-	// set before the state is registered and never change.
-	connectedAt   time.Time
-	sessionExpiry uint32
+	// ends, as the CONNECT asked for it and capped by expiryCap, the lower
+	// of the broker's cap and the tenant's. expiryShortened records that a
+	// 5.0 CONNECT asked for more than the cap, so the CONNACK has to say so.
+	// All are set before the state is registered and never change.
+	connectedAt     time.Time
+	sessionExpiry   uint32
+	expiryCap       uint32
+	expiryShortened bool
 
 	// ended is closed when mochi has run every hook's OnDisconnect for the
 	// connection, storage included (lastHook), or when the connection was

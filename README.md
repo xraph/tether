@@ -191,7 +191,7 @@ tether:
 
 Environment variables are not a config source here. The one exception is `TETHER_ADMIN_TOKEN`, which is read from the environment and never from the file, so the secret stays out of anything you commit. The `dashboard:` section is the Forge dashboard's own, and it's read from the same file.
 
-Per-tenant limits go in the tenant itself, under `limits`: `max_connections`, `messages_per_second`, `burst` and `max_session_expiry`. Zero means unlimited, or the broker default for the session expiry, and the session expiry is a duration in nanoseconds in the JSON. The message rate is per tenant per node.
+Per-tenant limits go in the tenant itself, under `limits`: `max_connections`, `messages_per_second`, `burst` and `max_session_expiry`. Zero means unlimited, or the broker default for the session expiry, and the session expiry is a duration in nanoseconds in the JSON. The message rate is per tenant per node. A tenant's `max_session_expiry` can only lower the broker's cap: a 5.0 client that asks for more is told the shorter value in its CONNACK, and a 3.1.1 persistent session simply gets the cap as its expiry.
 
 In your own app the same `tether:` block goes under `extensions.tether` (or a top-level `tether`) in the Forge config, and the options `WithConfig` and `WithBrokerConfig` layer over it. The grove database can be PostgreSQL there: the extension looks at the driver name and picks the SQLite or PostgreSQL store.
 

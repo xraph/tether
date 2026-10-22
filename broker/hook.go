@@ -15,6 +15,7 @@ import (
 
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/tenant"
 	"github.com/xraph/tether/topic"
 )
 
@@ -86,7 +87,9 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 	st := newClientState(cl, cl.ID, string(pk.Connect.Username), ident, ident.Tenant, g, h.b.deps.Limits, h.b.countersFor(tenantID))
 	st.metrics = h.b.deps.Metrics
-	st.sessionExpiry = sessionExpiry(cl, h.b.cfg.sessionExpirySeconds())
+	st.expiryCap = h.b.expiryCap(ident.Tenant.Limits)
+	st.sessionExpiry = sessionExpiry(cl, st.expiryCap)
+	st.expiryShortened = cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval > st.expiryCap
 
 	if !h.b.state.addUnlessDeleting(st, namespacedID(tenantID, cl.ID)) {
 		st.releaseSlot()
@@ -314,7 +317,31 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 
 	cl.Properties.Props.TopicAliasMaximum = 0
 
+	h.capSessionExpiry(cl, st)
+
 	h.b.state.bind(st)
+}
+
+// capSessionExpiry holds the session to the connection's expiry cap, the
+// lower of the broker's and the tenant's. Mochi caps a 5.0 session at the
+// broker's cap alone, so a longer request is lowered here, before mochi
+// builds the CONNACK; OnPacketEncode then tells the client. A 3.1.1
+// persistent session gets the cap as its expiry (mochi would keep it for the
+// broker's cap), and Broker.expireSessions ends it when that runs out: mochi
+// only reads the expiry property of 5.0 sessions.
+func (h *hook) capSessionExpiry(cl *mqtt.Client, st *clientState) {
+	props := &cl.Properties.Props
+
+	switch {
+	case cl.Properties.ProtocolVersion == 5:
+		if props.SessionExpiryInterval > st.expiryCap {
+			props.SessionExpiryInterval = st.expiryCap
+			props.SessionExpiryIntervalFlag = true
+		}
+	case !cl.Properties.Clean:
+		props.SessionExpiryInterval = st.expiryCap
+		props.SessionExpiryIntervalFlag = true
+	}
 }
 
 // OnPacketRead namespaces every inbound topic. A PUBLISH with an empty topic
@@ -328,7 +355,7 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 	}
 
 	switch pk.FixedHeader.Type {
-	case packets.Publish, packets.Subscribe, packets.Unsubscribe:
+	case packets.Publish, packets.Subscribe, packets.Unsubscribe, packets.Disconnect:
 	default:
 		return pk, nil
 	}
@@ -336,6 +363,16 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 	st := h.b.state.get(cl)
 	if st == nil {
 		return pk, packets.ErrRejectPacket
+	}
+
+	if pk.FixedHeader.Type == packets.Disconnect {
+		// A 5.0 client may change its session expiry on the way out. Mochi
+		// takes the new value as is, so it is held to the cap here.
+		if pk.Properties.SessionExpiryIntervalFlag && pk.Properties.SessionExpiryInterval > st.expiryCap {
+			pk.Properties.SessionExpiryInterval = st.expiryCap
+		}
+
+		return pk, nil
 	}
 
 	if pk.FixedHeader.Type == packets.Publish {
@@ -401,10 +438,21 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			// Mochi has just handed this connection the session it
 			// inherited and will resend the session's inflight messages
 			// right after this CONNACK.
+			st := h.b.state.get(cl)
+			if st == nil {
+				return pk
+			}
+
 			if pk.SessionPresent {
-				if st := h.b.state.get(cl); st != nil {
-					h.b.pruneSession(h.server, st)
-				}
+				h.b.pruneSession(h.server, st)
+			}
+
+			// capSessionExpiry lowered a 5.0 request below the broker's cap,
+			// where mochi says nothing: the client must learn the expiry it
+			// actually got.
+			if st.expiryShortened {
+				pk.Properties.SessionExpiryInterval = st.sessionExpiry
+				pk.Properties.SessionExpiryIntervalFlag = true
 			}
 
 			return pk
@@ -531,22 +579,38 @@ func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
 	}
 }
 
-// sessionExpiry is how long, in seconds, mochi keeps cl's session after its
-// connection ends: for 5.0 the interval the CONNECT asked for, capped at
-// maxExpiry as mochi caps it in the CONNACK, and for 3.1.1 none for a clean
-// session and maxExpiry otherwise (mochi expires those after its maximum).
+// sessionExpiry is how long, in seconds, cl's session is kept after its
+// connection ends: for 5.0 the interval the client asked for, capped at
+// maxExpiry, and for 3.1.1 none for a clean session and otherwise the
+// expiry capSessionExpiry gave it, or maxExpiry for a session it never saw.
 // Read it only from the client's own goroutine or once the client is closed:
 // mochi changes these properties while the connection is open.
 func sessionExpiry(cl *mqtt.Client, maxExpiry uint32) uint32 {
-	if cl.Properties.ProtocolVersion == 5 {
-		return min(cl.Properties.Props.SessionExpiryInterval, maxExpiry)
-	}
+	props := cl.Properties.Props
 
-	if cl.Properties.Clean {
+	switch {
+	case cl.Properties.ProtocolVersion == 5:
+		return min(props.SessionExpiryInterval, maxExpiry)
+	case cl.Properties.Clean:
 		return 0
+	case props.SessionExpiryIntervalFlag:
+		return min(props.SessionExpiryInterval, maxExpiry)
+	default:
+		return maxExpiry
+	}
+}
+
+// expiryCap is the longest session, in seconds, a connection of a tenant
+// with limits l may keep: the broker's cap, or the tenant's when it is set
+// and lower.
+func (b *Broker) expiryCap(l tenant.Limits) uint32 {
+	capped := b.cfg.sessionExpirySeconds()
+
+	if l.MaxSessionExpiry > 0 {
+		capped = min(capped, durationSeconds(l.MaxSessionExpiry))
 	}
 
-	return maxExpiry
+	return capped
 }
 
 // OnACLCheck decides PUBLISH (write) and SUBSCRIBE or delivery (read) access

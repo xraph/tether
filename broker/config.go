@@ -100,12 +100,21 @@ func (c Config) withDefaults() (Config, error) {
 // sessionExpirySeconds is MaxSessionExpiry in whole seconds, clamped to what
 // MQTT can carry.
 func (c Config) sessionExpirySeconds() uint32 {
-	s := c.MaxSessionExpiry / time.Second
-	if s > math.MaxUint32 {
+	return durationSeconds(c.MaxSessionExpiry)
+}
+
+// durationSeconds is d in whole seconds, clamped to what MQTT can carry.
+func durationSeconds(d time.Duration) uint32 {
+	s := d / time.Second
+
+	switch {
+	case s < 0:
+		return 0
+	case s > math.MaxUint32:
 		return math.MaxUint32
 	}
 
-	return uint32(s) //nolint:gosec // bounded by the check above
+	return uint32(s)
 }
 
 func invalid(msg string) error {

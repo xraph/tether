@@ -29,8 +29,11 @@ type Limits struct {
 	// and at least one.
 	Burst int `json:"burst,omitempty"`
 
-	// MaxSessionExpiry caps the session expiry a client may request. Zero
-	// means the broker default.
+	// MaxSessionExpiry caps the session expiry a client may request, in
+	// whole seconds, and only lowers the broker's own cap. A 5.0 client
+	// that asks for more is told the capped value in its CONNACK; a 3.1.1
+	// persistent session gets the cap as its expiry. Zero means the
+	// broker's cap. A change reaches connections made after it.
 	MaxSessionExpiry time.Duration `json:"max_session_expiry,omitempty"`
 }
 

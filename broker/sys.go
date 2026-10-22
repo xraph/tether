@@ -183,13 +183,17 @@ var sysTopics = []struct {
 	{"$SYS/retained/count", func(s *Stats) string { return strconv.Itoa(s.Retained) }},
 }
 
-// runSys publishes the tenants' $SYS stats every interval until stop closes,
-// then closes done.
+// runSys publishes the tenants' $SYS stats every interval, and every second
+// ends the 3.1.1 sessions whose expiry ran out (expireSessions), until stop
+// closes. Then it closes done.
 func (b *Broker) runSys(srv *mqtt.Server, interval time.Duration, stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
+
+	sweep := time.NewTicker(sessionSweepInterval * time.Second)
+	defer sweep.Stop()
 
 	for {
 		select {
@@ -197,6 +201,8 @@ func (b *Broker) runSys(srv *mqtt.Server, interval time.Duration, stop <-chan st
 			return
 		case <-tick.C:
 			b.publishSys(srv)
+		case now := <-sweep.C:
+			b.expireSessions(srv, now.Unix())
 		}
 	}
 }
