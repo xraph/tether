@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eclipse/paho.golang/paho"
+	"github.com/mochi-mqtt/server/v2/listeners"
 	mochipackets "github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,6 +31,7 @@ type mutablePerms struct {
 	rules   map[string]acl.Rules
 	roles   map[string][]string
 	errs    map[string]error
+	failN   map[string]int
 	loads   map[string]int
 	gate    map[string]chan struct{}
 	started chan string
@@ -37,6 +42,7 @@ func newMutablePerms(rules map[string]acl.Rules) *mutablePerms {
 		rules:   rules,
 		roles:   map[string][]string{},
 		errs:    map[string]error{},
+		failN:   map[string]int{},
 		loads:   map[string]int{},
 		gate:    map[string]chan struct{}{},
 		started: make(chan string, 16),
@@ -60,6 +66,14 @@ func (m *mutablePerms) Load(_ context.Context, ident *auth.Identity) (acl.Rules,
 	m.loads[ident.Username]++
 
 	if err := m.errs[ident.Username]; err != nil {
+		if m.failN[ident.Username] > 0 {
+			m.failN[ident.Username]--
+
+			if m.failN[ident.Username] == 0 {
+				delete(m.errs, ident.Username)
+			}
+		}
+
 		return acl.Rules{}, nil, err
 	}
 
@@ -83,6 +97,15 @@ func (m *mutablePerms) fail(user string, err error) {
 	defer m.mu.Unlock()
 
 	m.errs[user] = err
+}
+
+// failTimes makes the next n Loads for user fail with err.
+func (m *mutablePerms) failTimes(user string, n int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.errs[user] = err
+	m.failN[user] = n
 }
 
 func (m *mutablePerms) setRoles(user string, roles ...string) {
@@ -306,21 +329,21 @@ func TestReloadRefusedPrincipalIsDisconnected(t *testing.T) {
 func TestReloadOutageKeepsGrants(t *testing.T) {
 	ta := newTenant(tenant.Limits{})
 	perms := newMutablePerms(map[string]acl.Rules{
-		"dev": {Subscribe: []string{"x"}},
-		"pub": {Publish: []string{"x"}},
+		"sensor": {Subscribe: []string{"x"}},
+		"pub":    {Publish: []string{"x"}},
 	})
-	b := startBrokerDeps(t, auth.NewStatic(map[string]*auth.Identity{"dev": ident(ta, "dev"), "pub": ident(ta, "pub")}), perms)
+	b := startBrokerDeps(t, auth.NewStatic(map[string]*auth.Identity{"sensor": ident(ta, "sensor"), "pub": ident(ta, "pub")}), perms)
 	addr := b.Addr().String()
 
-	c, _, err := connect5(t, addr, "dev-1", "dev", true)
+	c, _, err := connect5(t, addr, "sensor-1", "sensor", true)
 	require.NoError(t, err)
 	require.Equal(t, []byte{1}, subscribe5(t, c, "x"))
 
 	p, _, err := connect5(t, addr, "pub-1", "pub", true)
 	require.NoError(t, err)
 
-	perms.fail("dev", errors.New("warden is down"))
-	b.ReloadPrincipal(t.Context(), "akey_dev")
+	perms.fail("sensor", errors.New("warden is down"))
+	b.ReloadPrincipal(t.Context(), "akey_sensor")
 
 	require.Equal(t, byte(0), publish5(t, p, "x", "still"))
 	assert.Equal(t, message{Topic: "x", Payload: "still"}, recv(t, c.msgs))
@@ -719,4 +742,226 @@ func TestConnectRacingRevocationIsRefused(t *testing.T) {
 	assert.Equal(t, byte(0x86), r.ca.ReasonCode)
 	assert.False(t, b.state.hasID(topic.Namespace(ta.ID.String(), "dev-1")))
 	assert.Equal(t, Stats{}, b.Stats(ta.ID.String()))
+}
+
+// stallListener accepts real connections whose writes block, once stall is
+// set, until the connection is closed: a client that has stopped reading
+// and whose socket buffer is full.
+type stallListener struct {
+	net.Listener
+
+	stall *atomic.Bool
+}
+
+func (l *stallListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	return &stallConn{Conn: c, stall: l.stall, closed: make(chan struct{})}, nil
+}
+
+type stallConn struct {
+	net.Conn
+
+	stall  *atomic.Bool
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *stallConn) Write(p []byte) (int, error) {
+	if c.stall.Load() {
+		<-c.closed
+
+		return 0, net.ErrClosed
+	}
+
+	return c.Conn.Write(p)
+}
+
+func (c *stallConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+
+	return c.Conn.Close()
+}
+
+// Fix round 1, item 1: a revoked client that stops reading must not hold up
+// its own disconnect, the admin call behind it, or the principal's other
+// connections.
+func TestDisconnectPrincipalDoesNotWaitForAStalledClient(t *testing.T) {
+	ta := newTenant(tenant.Limits{})
+	b := startBrokerDeps(t, auth.NewStatic(map[string]*auth.Identity{"x": ident(ta, "x")}), newMutablePerms(nil))
+
+	raw, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	stall := &atomic.Bool{}
+	require.NoError(t, b.server.AddListener(listeners.NewNet("stall", &stallListener{Listener: raw, stall: stall})))
+	b.server.Listeners.Serve("stall", b.server.EstablishConnection)
+
+	stuck := rawConnect5(t, raw.Addr().String(), "stuck", "x")
+	other, _, err := connect5(t, b.Addr().String(), "other", "x", true)
+	require.NoError(t, err)
+
+	stall.Store(true)
+
+	done := make(chan int, 1)
+	start := time.Now()
+
+	go func() { done <- b.DisconnectPrincipal("akey_x", mochipackets.ErrAdministrativeAction) }()
+
+	select {
+	case n := <-done:
+		assert.Equal(t, 2, n)
+		assert.Less(t, time.Since(start), disconnectWait+time.Second, "bounded by disconnectWait")
+	case <-time.After(waitTimeout):
+		t.Fatal("DisconnectPrincipal is stuck behind a client that does not read")
+	}
+
+	assert.Equal(t, byte(0x98), disconnectedWith(t, other))
+	requireClosed(t, stuck)
+	waitStateDropped(t, b, topic.Namespace(ta.ID.String(), "stuck"))
+}
+
+// fastRetry shortens the reload retry backoff (ruling R14) for a test.
+func fastRetry(b *Broker, base, maxDelay, window time.Duration) {
+	b.retryBase, b.retryMax, b.retryWindow = base, maxDelay, window
+}
+
+// waitPendingRetries waits until n reload retries are pending.
+func waitPendingRetries(t *testing.T, b *Broker, n int64) {
+	t.Helper()
+
+	deadline := time.After(waitTimeout)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+
+	for b.pendingRetries.Load() != n {
+		select {
+		case <-deadline:
+			t.Fatalf("pending retries: got %d, want %d", b.pendingRetries.Load(), n)
+		case <-tick.C:
+		}
+	}
+}
+
+// waitSubscriptions waits until the session nsID holds exactly want.
+func waitSubscriptions(t *testing.T, b *Broker, nsID string, want ...string) {
+	t.Helper()
+
+	deadline := time.After(waitTimeout)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+
+	slices.Sort(want)
+
+	for {
+		got := subscriptions(t, b, nsID)
+		slices.Sort(got)
+
+		if slices.Equal(got, want) {
+			return
+		}
+
+		select {
+		case <-deadline:
+			t.Fatalf("subscriptions: got %v, want %v", got, want)
+		case <-tick.C:
+		}
+	}
+}
+
+// retryEnv is a broker with one connected client "dev" subscribed to cmd/#
+// and ok.
+func retryEnv(t *testing.T) (*Broker, *mutablePerms, *client5, func(string) string) {
+	t.Helper()
+
+	ta := newTenant(tenant.Limits{})
+	perms := newMutablePerms(map[string]acl.Rules{"dev": {Subscribe: []string{"cmd/#", "ok"}}})
+	b := startBrokerDeps(t, auth.NewStatic(map[string]*auth.Identity{"dev": ident(ta, "dev")}), perms)
+
+	c, _, err := connect5(t, b.Addr().String(), "dev-1", "dev", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1, 1}, subscribe5(t, c, "cmd/#", "ok"))
+
+	return b, perms, c, func(s string) string { return topic.Namespace(ta.ID.String(), s) }
+}
+
+// Ruling R14: a reload that fails on an outage is retried, so the change it
+// carried is not lost.
+func TestReloadRetriesAfterOutage(t *testing.T) {
+	b, perms, c, ns := retryEnv(t)
+	fastRetry(b, 10*time.Millisecond, 40*time.Millisecond, time.Minute)
+
+	perms.set("dev", acl.Rules{Subscribe: []string{"ok"}})
+	perms.failTimes("dev", 2, errors.New("warden is down"))
+
+	b.ReloadPrincipal(t.Context(), "akey_dev")
+	assert.Len(t, subscriptions(t, b, ns("dev-1")), 2, "the first load failed, the old grants stay for now")
+
+	waitSubscriptions(t, b, ns("dev-1"), ns("ok"))
+	waitPendingRetries(t, b, 0)
+	assert.Equal(t, 4, perms.loadCount("dev"), "CONNECT, the failed reload, one failed retry, one that worked")
+	requireConnected(t, c)
+}
+
+func TestReloadRetryGivesUpWithServerUnavailable(t *testing.T) {
+	b, perms, c, _ := retryEnv(t)
+	fastRetry(b, 10*time.Millisecond, 20*time.Millisecond, 100*time.Millisecond)
+
+	perms.fail("dev", errors.New("warden is down"))
+
+	start := time.Now()
+	b.ReloadPrincipal(t.Context(), "akey_dev")
+
+	assert.Equal(t, byte(0x88), disconnectedWith(t, c), "server unavailable, so it authorizes again on reconnect")
+	assert.GreaterOrEqual(t, time.Since(start), 100*time.Millisecond, "not before the window ran out")
+	waitPendingRetries(t, b, 0)
+}
+
+func TestReloadRetrySupersededBySuccessfulReload(t *testing.T) {
+	b, perms, c, ns := retryEnv(t)
+	fastRetry(b, time.Hour, time.Hour, 2*time.Hour)
+
+	perms.failTimes("dev", 1, errors.New("warden is down"))
+	b.ReloadPrincipal(t.Context(), "akey_dev")
+	waitPendingRetries(t, b, 1)
+
+	perms.set("dev", acl.Rules{Subscribe: []string{"ok"}})
+	b.ReloadRole(t.Context(), "role_dev")
+
+	waitPendingRetries(t, b, 0)
+	assert.Equal(t, []string{ns("ok")}, subscriptions(t, b, ns("dev-1")))
+	requireConnected(t, c)
+}
+
+func TestReloadRetryStopsWhenClientLeaves(t *testing.T) {
+	b, perms, c, ns := retryEnv(t)
+	fastRetry(b, time.Hour, time.Hour, 2*time.Hour)
+
+	perms.fail("dev", errors.New("warden is down"))
+	b.ReloadPrincipal(t.Context(), "akey_dev")
+	waitPendingRetries(t, b, 1)
+
+	require.NoError(t, c.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitStateDropped(t, b, ns("dev-1"))
+	waitPendingRetries(t, b, 0)
+}
+
+func TestStopDuringPendingReloadRetry(t *testing.T) {
+	b, perms, _, _ := retryEnv(t)
+	fastRetry(b, time.Hour, time.Hour, 2*time.Hour)
+
+	perms.fail("dev", errors.New("warden is down"))
+	b.ReloadPrincipal(t.Context(), "akey_dev")
+	waitPendingRetries(t, b, 1)
+
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	defer cancel()
+
+	start := time.Now()
+	require.NoError(t, b.Stop(ctx))
+	assert.Less(t, time.Since(start), 2*time.Second)
+	assert.Equal(t, int64(0), b.pendingRetries.Load(), "Stop waited for the retry to end")
 }

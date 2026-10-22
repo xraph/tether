@@ -67,6 +67,20 @@ type Broker struct {
 	// registers its state to learn whether a change may have missed it.
 	changes atomic.Uint64
 
+	// Reload retries (controller ruling R14). A reload that fails on an
+	// outage is retried after retryBase, doubling up to retryMax, for at
+	// most retryWindow; then the client is disconnected with 0x88. Tests
+	// shorten them.
+	retryBase, retryMax, retryWindow time.Duration
+
+	// retryMu guards retryClosed. Stop sets it and closes retryQuit, which
+	// ends every retry loop, and waits for them on retries.
+	retryMu        sync.Mutex
+	retryClosed    bool
+	retryQuit      chan struct{}
+	retries        sync.WaitGroup
+	pendingRetries atomic.Int64
+
 	// storage is mochi's badger hook when DataDir is set. Pruning a session
 	// tells it about the subscriptions and inflight messages it removes.
 	storage *badger.Hook
@@ -116,6 +130,10 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		state:       newRegistry(),
 		sysInterval: defaultSysInterval,
 		counters:    make(map[string]*tenantCounters),
+		retryBase:   defaultRetryBase,
+		retryMax:    defaultRetryMax,
+		retryWindow: defaultRetryWindow,
+		retryQuit:   make(chan struct{}),
 	}, nil
 }
 
@@ -271,6 +289,9 @@ func (b *Broker) Stop(ctx context.Context) error {
 		close(sysStop)
 		<-sysDone
 
+		// Pending reload retries end before the clients go.
+		b.stopRetries()
+
 		done <- shutdown(srv, ids)
 	}()
 
@@ -300,25 +321,61 @@ func shutdown(srv *mqtt.Server, listenerIDs []string) error {
 		srv.Listeners.Close(id, func(string) {})
 	}
 
+	// In parallel: each disconnect may wait up to disconnectWait for a
+	// client that does not read.
+	var wg sync.WaitGroup
+
 	for _, cl := range srv.Clients.GetAll() {
 		if !cl.Net.Inline && !cl.Closed() {
-			disconnect(srv, nil, cl, packets.ErrServerShuttingDown)
+			wg.Go(func() { disconnect(srv, nil, cl, packets.ErrServerShuttingDown) })
 		}
 	}
 
+	wg.Wait()
 	srv.Listeners.ClientsWg.Wait()
 
 	return srv.Close()
 }
 
-// disconnect sends cl a DISCONNECT with code and closes it. Mochi returns the
-// code itself as the error for every code from 0x80 up, so only a different
-// error, a failed write, is logged (when log is not nil).
+// disconnectWait bounds how long disconnect waits for the DISCONNECT packet
+// to be written before it closes the connection anyway.
+const disconnectWait = time.Second
+
+// disconnect sends cl a DISCONNECT with code and closes it, and returns
+// within about disconnectWait whatever the client does.
+//
+// Mochi's DisconnectClient writes the DISCONNECT before it stops the client,
+// and a write has no deadline of its own: a client that stops reading until
+// its socket buffer fills parks the write (and mochi's outbound writer, which
+// holds the client's lock) for as long as it keeps sending, since every
+// packet it sends extends its keepalive deadline. A revoked client could
+// then hold up its own disconnect and the admin call that ordered it. So the
+// write runs in its own goroutine, and after disconnectWait the client is
+// stopped regardless: Stop closes the connection, which fails the stuck
+// write and lets that goroutine finish.
+//
+// Mochi returns the code itself as the error for every code from 0x80 up,
+// so only a different error, a failed write, is logged (when log is not nil).
 func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, code packets.Code) {
-	err := srv.DisconnectClient(cl, code)
-	if err != nil && !errors.Is(err, code) && log != nil {
-		log.Debug("tether: disconnect write failed", slog.String("client", cl.ID), slog.Any("error", err))
+	done := make(chan error, 1)
+
+	go func() { done <- srv.DisconnectClient(cl, code) }()
+
+	timer := time.NewTimer(disconnectWait)
+	defer timer.Stop()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, code) && log != nil {
+			log.Debug("tether: disconnect write failed", slog.String("client", cl.ID), slog.Any("error", err))
+		}
+	case <-timer.C:
+		if log != nil {
+			log.Info("tether: client did not take its DISCONNECT, closing the connection", slog.String("client", cl.ID))
+		}
 	}
+
+	cl.Stop(code)
 }
 
 // Addr returns the TCP listener's address, or nil when there is none or the

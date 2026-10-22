@@ -41,6 +41,11 @@ type clientState struct {
 	// they do not, or once stopped.
 	expiry atomic.Pointer[time.Timer]
 
+	// retryStop, under retryMu, is closed to end this connection's pending
+	// reload retry (Broker.retryReload). Nil when none is pending.
+	retryMu   sync.Mutex
+	retryStop chan struct{}
+
 	limiter  *limits.Limiter
 	counters *tenantCounters
 	release  sync.Once
@@ -103,6 +108,35 @@ func (st *clientState) setExpiry(t *time.Timer) {
 // stopExpiry stops the expiry timer, if any. Safe to call more than once.
 func (st *clientState) stopExpiry() {
 	st.setExpiry(nil)
+}
+
+// stopRetry ends a pending reload retry, if any. Safe to call more than once.
+func (st *clientState) stopRetry() {
+	st.retryMu.Lock()
+	defer st.retryMu.Unlock()
+
+	if st.retryStop != nil {
+		close(st.retryStop)
+		st.retryStop = nil
+	}
+}
+
+// clearRetry forgets stop as the pending retry, if it still is: the retry
+// loop that owns it has ended.
+func (st *clientState) clearRetry(stop chan struct{}) {
+	st.retryMu.Lock()
+	defer st.retryMu.Unlock()
+
+	if st.retryStop == stop {
+		st.retryStop = nil
+	}
+}
+
+// stopTimers ends the expiry timer and any pending reload retry, for a
+// connection whose state is being dropped.
+func (st *clientState) stopTimers() {
+	st.stopExpiry()
+	st.stopRetry()
 }
 
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
@@ -180,7 +214,7 @@ func (r *registry) bind(st *clientState) {
 	r.mu.Unlock()
 
 	if prev != nil && prev != st {
-		prev.stopExpiry()
+		prev.stopTimers()
 	}
 
 	if stale {
@@ -224,7 +258,7 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 		delete(r.byID, cl.ID)
 	}
 
-	st.stopExpiry()
+	st.stopTimers()
 
 	return st
 }
@@ -259,7 +293,7 @@ func (r *registry) sweepClosed(tenantID string) int {
 	r.mu.Unlock()
 
 	for _, st := range swept {
-		st.stopExpiry()
+		st.stopTimers()
 		st.releaseSlot()
 	}
 

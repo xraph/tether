@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync/atomic"
+	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -155,15 +156,47 @@ func (b *Broker) reloadMatching(ctx context.Context, keep func(*clientState) boo
 	}
 }
 
+// Reload retry defaults (controller ruling R14).
+const (
+	defaultRetryBase   = time.Second
+	defaultRetryMax    = 30 * time.Second
+	defaultRetryWindow = 2 * time.Minute
+)
+
+// reloadOutcome is what one reload attempt did.
+type reloadOutcome int
+
+const (
+	reloadDone        reloadOutcome = iota // new grants are in
+	reloadGone                             // the connection is closed, or was disconnected as refused
+	reloadUnavailable                      // Load failed on an outage; the old grants stay
+)
+
 // reload loads and swaps in fresh grants for one connection and prunes its
 // subscriptions to them. reloadMu is held across the load, so two reloads of
 // one connection apply in the order they loaded.
+//
+// A load that fails on an outage starts a retry loop for the connection
+// (retryReload) unless one is pending already; any other outcome ends a
+// pending one, since the grants it would load are in now (or the connection
+// is gone).
 func (b *Broker) reload(ctx context.Context, srv *mqtt.Server, st *clientState) {
 	st.reloadMu.Lock()
 	defer st.reloadMu.Unlock()
 
-	if st.cl.Closed() {
+	if b.reloadLocked(ctx, srv, st) == reloadUnavailable {
+		b.startRetry(srv, st)
+
 		return
+	}
+
+	st.stopRetry()
+}
+
+// reloadLocked is one reload attempt. The caller holds st.reloadMu.
+func (b *Broker) reloadLocked(ctx context.Context, srv *mqtt.Server, st *clientState) reloadOutcome {
+	if st.cl.Closed() {
+		return reloadGone
 	}
 
 	log := b.log.With(slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
@@ -174,18 +207,137 @@ func (b *Broker) reload(ctx context.Context, srv *mqtt.Server, st *clientState) 
 			log.Info("tether: principal no longer authorized, disconnecting", slog.Any("error", err))
 			disconnect(srv, b.log, st.cl, packets.ErrNotAuthorized)
 
-			return
+			return reloadGone
 		}
 
-		log.Warn("tether: reloading permissions failed, keeping the previous grants", slog.Any("error", err))
+		log.Warn("tether: reloading permissions failed, keeping the previous grants for now", slog.Any("error", err))
 
-		return
+		return reloadUnavailable
 	}
 
 	g := b.compile(rules, roleIDs, st.rawID, st.username, log)
 	st.grants.Store(g)
 
 	b.pruneSubscriptions(srv, st, g.acl)
+
+	return reloadDone
+}
+
+// startRetry starts a reload retry loop for st unless one is pending or the
+// broker is stopping.
+func (b *Broker) startRetry(srv *mqtt.Server, st *clientState) {
+	st.retryMu.Lock()
+	defer st.retryMu.Unlock()
+
+	if st.retryStop != nil {
+		return
+	}
+
+	b.retryMu.Lock()
+	defer b.retryMu.Unlock()
+
+	if b.retryClosed {
+		return
+	}
+
+	stop := make(chan struct{})
+	st.retryStop = stop
+
+	b.retries.Add(1)
+	b.pendingRetries.Add(1)
+
+	go b.retryReload(srv, st, stop)
+}
+
+// retryReload retries a reload that failed on an outage (controller ruling
+// R14): after retryBase, then doubling up to retryMax, until it succeeds or
+// retryWindow has passed since the first failure. If it is still failing
+// then, the connection is disconnected with 0x88 server unavailable, so it
+// authorizes again when it reconnects instead of keeping grants that may
+// have been revoked.
+//
+// It ends early when stop is closed (a later reload succeeded, or the
+// connection's state was dropped) or the broker stops.
+func (b *Broker) retryReload(srv *mqtt.Server, st *clientState, stop chan struct{}) {
+	defer b.retries.Done()
+	defer b.pendingRetries.Add(-1)
+	defer st.clearRetry(stop)
+
+	// Load gets a context that ends when the broker stops.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-b.retryQuit:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	deadline := time.Now().Add(b.retryWindow)
+	delay := b.retryBase
+
+	for {
+		timer := time.NewTimer(min(delay, max(time.Until(deadline), 0)))
+
+		select {
+		case <-timer.C:
+		case <-stop:
+			timer.Stop()
+
+			return
+		case <-b.retryQuit:
+			timer.Stop()
+
+			return
+		}
+
+		if b.attemptRetry(ctx, srv, st, stop) != reloadUnavailable {
+			return
+		}
+
+		if !time.Now().Before(deadline) {
+			b.log.Warn("tether: permissions still unavailable, disconnecting so the client authorizes again",
+				slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+			disconnect(srv, b.log, st.cl, packets.ErrServerUnavailable)
+
+			return
+		}
+
+		delay = min(delay*2, b.retryMax)
+	}
+}
+
+// attemptRetry runs one retry under reloadMu, unless stop was closed while
+// it waited for the lock.
+func (b *Broker) attemptRetry(ctx context.Context, srv *mqtt.Server, st *clientState, stop chan struct{}) reloadOutcome {
+	st.reloadMu.Lock()
+	defer st.reloadMu.Unlock()
+
+	select {
+	case <-stop:
+		return reloadGone
+	default:
+	}
+
+	attemptCtx, cancel := context.WithTimeout(ctx, connectTimeout)
+	defer cancel()
+
+	return b.reloadLocked(attemptCtx, srv, st)
+}
+
+// stopRetries ends every reload retry loop and waits for them. No new one
+// starts afterwards.
+func (b *Broker) stopRetries() {
+	b.retryMu.Lock()
+	if !b.retryClosed {
+		b.retryClosed = true
+		close(b.retryQuit)
+	}
+	b.retryMu.Unlock()
+
+	b.retries.Wait()
 }
 
 // principalRefused reports whether a PermLoader error means the principal
