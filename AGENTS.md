@@ -25,7 +25,7 @@ TETHER_TEST_POSTGRES="postgres://postgres:tether@127.0.0.1:$(docker port tether-
 docker stop tether-test-pg
 ```
 
-The Makefile wraps the same things: `make test`, `make test-race`, `make vet`, `make lint`, `make fmt`, `make check` and `make coverage`. There's no `cmd/` directory, so there is nothing to build into a binary.
+The Makefile wraps the same things: `make test`, `make test-race`, `make vet`, `make lint`, `make fmt`, `make check` and `make coverage`. `go build -o tether ./cmd/tether` builds the standalone server (see `cmd/tether/llm.txt`); the binary is gitignored.
 
 CI is `.github/workflows/ci.yml`. It calls the shared `xraph/workflows` `go-ci.yml@v1` with Go 1.26 on ubuntu, and adds a goimports format check on top.
 
