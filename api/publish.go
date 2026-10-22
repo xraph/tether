@@ -61,8 +61,8 @@ func (a *API) registerPublish(r forge.Router) error {
 
 // publishAuth authenticates the request with HTTP Basic (the device's key ID
 // and raw key) through the same authenticator MQTT CONNECTs use. There is no
-// client ID, so a device pinned to one is refused (the authenticator checks
-// the pin).
+// client ID to check a pin against, so the check is skipped and the device's
+// pin (if any) is read from the identity.
 func (a *API) publishAuth(next forge.Handler) forge.Handler {
 	return func(c forge.Context) error {
 		if !a.Broker.Running() {
@@ -80,6 +80,10 @@ func (a *API) publishAuth(next forge.Handler) forge.Handler {
 			Username: user,
 			Password: []byte(pass),
 			Remote:   r.RemoteAddr,
+
+			// There is no client ID over HTTP. The pin comes back in
+			// ident.ClientID and stands in for it in the grants.
+			SkipClientIDPin: true,
 		})
 		if err != nil {
 			return a.unauthorized(c, err)
@@ -119,8 +123,9 @@ func (a *API) unauthorized(c forge.Context, err error) error {
 // publish runs the checks a device's MQTT PUBLISH goes through, in order:
 // grants, then the tenant's message rate, then the broker.
 //
-// The grants are compiled with the username only. An HTTP publish has no
-// client ID, so a grant that uses "%c" cannot match and is dropped.
+// The grants expand "%u" to the username and "%c" to the device's pinned
+// client ID. An unpinned device has no client ID over HTTP, so a grant that
+// uses "%c" is dropped for it.
 func (a *API) publish(c forge.Context) error {
 	ident, ok := c.Get(ctxIdentity).(*auth.Identity)
 	if !ok {
@@ -143,7 +148,7 @@ func (a *API) publish(c forge.Context) error {
 		return mapError(err)
 	}
 
-	set := acl.Compile(rules, acl.Vars{Username: ident.Username})
+	set := acl.Compile(rules, acl.Vars{ClientID: ident.ClientID, Username: ident.Username})
 	if !set.CanPublish(req.Topic) {
 		return mapError(fmt.Errorf("%w: publishing to this topic is not granted", tether.ErrNotAuthorized))
 	}

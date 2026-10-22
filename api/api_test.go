@@ -934,11 +934,6 @@ func TestPublishAuthentication(t *testing.T) {
 		assert.JSONEq(t, string(a.body), string(b.body))
 	})
 
-	t.Run("a device pinned to a client ID has none over HTTP", func(t *testing.T) {
-		pinned := e.provision(tid, "pinned", map[string]any{"client_id": "pin-1"})
-		expect(t, e.publish(pinned.username, pinned.password, body), http.StatusForbidden)
-	})
-
 	t.Run("disabled tenant", func(t *testing.T) {
 		expect(t, e.do(http.MethodPatch, tenantPath(tid), map[string]any{"enabled": false}), http.StatusOK)
 		expect(t, e.publish(d.username, d.password, body), http.StatusForbidden)
@@ -1030,4 +1025,47 @@ func TestPublishBodyOverTheIdempotencyDefault(t *testing.T) {
 	payload := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'y'}, 900<<10))
 
 	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/big", "payload": payload}, "Idempotency-Key", "big-1"), http.StatusOK)
+}
+
+// Controller ruling R16. A device pinned to a client ID publishes over HTTP
+// with that ID as %c, so "devices/%c/up" is its own topic and no one else's.
+// An unpinned device has no client ID, so a %c grant stays unusable for it.
+func TestPublishPinnedDeviceUsesItsClientIDGrant(t *testing.T) {
+	e := newEnv(t)
+	tid := e.createTenant("aorg_1", nil)
+
+	pinned := e.provision(tid, "pinned", map[string]any{"client_id": "pump-7"})
+	e.grant(tid, "aorg_1", pinned, "own", []string{"devices/%c/up"}, nil)
+
+	sub := e.provision(tid, "sub", nil)
+	e.grant(tid, "aorg_1", sub, "listen", nil, []string{"devices/#"})
+
+	listener := e.connect(sub, "listener")
+	listener.subscribe(t, "devices/#")
+
+	expect(t, e.publish(pinned.username, pinned.password, map[string]any{
+		"topic": "devices/pump-7/up", "payload": b64("mine"),
+	}), http.StatusOK)
+	assert.Equal(t, msg{Topic: "devices/pump-7/up", Payload: "mine"}, listener.next(t))
+
+	for _, topic := range []string{"devices/pump-8/up", "devices/%c/up", "devices/pump-7/down"} {
+		expect(t, e.publish(pinned.username, pinned.password, map[string]any{"topic": topic, "payload": ""}), http.StatusForbidden)
+	}
+
+	// The pin still holds on MQTT: another client ID is refused at CONNECT.
+	_, err := e.tryConnect(pinned.username, pinned.password, "pump-8")
+	require.Error(t, err)
+
+	// An unpinned device with the same kind of grant publishes nowhere
+	// through it: it has no client ID to expand.
+	free := e.provision(tid, "free", nil)
+	e.grant(tid, "aorg_1", free, "own2", []string{"devices/%c/up"}, nil)
+
+	for _, topic := range []string{"devices/pump-7/up", "devices//up", "devices/%c/up"} {
+		expect(t, e.publish(free.username, free.password, map[string]any{"topic": topic, "payload": ""}), http.StatusForbidden)
+	}
+
+	// Only the HTTP path skips the pin: this device still connects as pump-7.
+	c := e.connect(pinned, "pump-7")
+	c.requireAlive(t)
 }

@@ -57,6 +57,13 @@ type Credentials struct {
 
 	// Remote is the peer's network address, for logs.
 	Remote string
+
+	// SkipClientIDPin makes the authenticator ignore the device's client ID
+	// pin. Set it only in a non-MQTT caller that has no client ID to offer
+	// (the HTTP publish endpoint), and read the pin from Identity.ClientID.
+	// The broker never sets it, so a CONNECT is always checked against the
+	// pin.
+	SkipClientIDPin bool
 }
 
 // Identity is an authenticated principal and the tenant it belongs to.
@@ -75,6 +82,10 @@ type Identity struct {
 
 	// DeviceID is the Tether device the principal maps to, when there is one.
 	DeviceID string
+
+	// ClientID is the client ID the device is pinned to, empty when it is
+	// not pinned. It is the device's setting, not the ID a client sent.
+	ClientID string
 
 	// ExpiresAt is when the credentials stop being valid. The zero time means
 	// they do not expire. The broker disconnects the client at that time.

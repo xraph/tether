@@ -254,7 +254,7 @@ func (k *Keysmith) identity(ctx context.Context, e *entry, c Credentials) (*Iden
 		return nil, fmt.Errorf("%w: device belongs to another tenant", ErrNotAuthorized)
 	}
 
-	if e.pinnedClientID != "" && e.pinnedClientID != c.ClientID {
+	if !c.SkipClientIDPin && e.pinnedClientID != "" && e.pinnedClientID != c.ClientID {
 		return nil, fmt.Errorf("%w: device is pinned to another client ID", ErrNotAuthorized)
 	}
 
@@ -264,6 +264,7 @@ func (k *Keysmith) identity(ctx context.Context, e *entry, c Credentials) (*Iden
 		PrincipalID:   e.keyID,
 		Username:      c.Username,
 		DeviceID:      e.deviceID,
+		ClientID:      e.pinnedClientID,
 		ExpiresAt:     e.expiresAt,
 	}, nil
 }

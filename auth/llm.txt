@@ -4,8 +4,8 @@ Import: github.com/xraph/tether/auth
 
 Turns MQTT CONNECT credentials into a tenant-scoped identity. The broker calls `Authenticator.Authenticate` from mochi's OnConnectAuthenticate hook and maps the error to a CONNACK reason code with `errors.Is`.
 
-- `Credentials{ClientID, Username string; Password []byte; Remote string}`.
-- `Identity{Tenant *tenant.Tenant; PrincipalKind, PrincipalID, Username, DeviceID string; ExpiresAt time.Time}`. `PrincipalKind` is `auth.PrincipalKindAPIKey` ("api_key") and `PrincipalID` the key ID for keysmith. Zero `ExpiresAt` means no expiry; the broker disconnects the client at that time. Callers get a copy.
+- `Credentials{ClientID, Username string; Password []byte; Remote string; SkipClientIDPin bool}`. `SkipClientIDPin` is for non-MQTT callers that have no client ID (the HTTP publish endpoint); the broker never sets it.
+- `Identity{Tenant *tenant.Tenant; PrincipalKind, PrincipalID, Username, DeviceID, ClientID string; ExpiresAt time.Time}`. `ClientID` is the device's pinned client ID (empty when unpinned), not the one a client sent. `PrincipalKind` is `auth.PrincipalKindAPIKey` ("api_key") and `PrincipalID` the key ID for keysmith. Zero `ExpiresAt` means no expiry; the broker disconnects the client at that time. Callers get a copy.
 - `Authenticator`: `Authenticate(ctx, Credentials) (*Identity, error)`.
 - Errors (every failure wraps exactly one): `ErrBadCredentials` (CONNACK 0x86), `ErrNotAuthorized` (0x87), `ErrUnavailable` (0x88), `ErrRateLimited` (0x9F). `ErrUnavailable` comes only from: a device or tenant lookup failing with anything but not-found, a validator error that is not a recognised keysmith credential error, and a validator result with no key. It does NOT cover a keysmith lookup-store outage (see Known limitation).
 
@@ -19,7 +19,7 @@ Order of decisions:
 3. `res.Key.ID.String()` must equal the username, else `ErrBadCredentials` (the raw key does not carry its ID).
 4. `GetDeviceByKey`: not found gives `ErrNotAuthorized` (a keysmith key with no Tether device), other errors `ErrUnavailable`.
 5. Tenant from `res.Key.AppID` and `res.Key.TenantID` through `TenantResolver`: not found, disabled, or not the device's tenant gives `ErrNotAuthorized`; other errors `ErrUnavailable`.
-6. Device `ClientID` pin: a set pin that differs from `Credentials.ClientID` gives `ErrNotAuthorized`.
+6. Device `ClientID` pin: a set pin that differs from `Credentials.ClientID` gives `ErrNotAuthorized`, unless `Credentials.SkipClientIDPin` is set (R16: then the check is skipped, on a cache hit too, and `Identity.ClientID` carries the pin so the caller can expand `%c` with it). Every other check still runs.
 
 Known limitation: keysmith v1.8.0 `ValidateKey` returns `ErrInvalidKey` for any failure of its key lookup (`GetByHash`), a database outage included, and does the same for a cancelled context. Tether cannot tell that from a wrong key, so while keysmith's store is down every uncached device is refused with `ErrBadCredentials` (CONNACK 0x86), not `ErrUnavailable` (0x88). Cached devices keep connecting until their entry expires. `TestKeysmithLookupOutageSurfacesAsBadCredentials` pins this against the real engine and should flip to `ErrUnavailable` when keysmith distinguishes outages.
 

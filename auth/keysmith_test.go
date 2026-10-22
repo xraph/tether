@@ -225,6 +225,74 @@ func TestClientIDPin(t *testing.T) {
 	assert.EqualValues(t, 1, e.val.calls.Load(), "a refused pin still caches the key, later calls never reach keysmith")
 }
 
+// Controller ruling R16. A caller with no MQTT client ID (the HTTP publish
+// endpoint) sets SkipClientIDPin and gets the device's pin back in the
+// identity. The MQTT path never sets it.
+func TestSkipClientIDPin(t *testing.T) {
+	e := newEnv(t)
+
+	e.device.ClientID = "pump-1"
+	require.NoError(t, e.st.UpdateDevice(t.Context(), e.device))
+
+	http := Credentials{Username: e.keyID.String(), Password: []byte(rawKey), SkipClientIDPin: true}
+
+	// Cold cache, then warm: the skip applies on a cache hit too.
+	for range 2 {
+		ident, err := e.auth.Authenticate(t.Context(), http)
+		require.NoError(t, err)
+		assert.Equal(t, "pump-1", ident.ClientID, "the identity carries the pin")
+	}
+
+	// The MQTT path is unchanged: no flag, the pin is enforced, on the warm
+	// cache entry the HTTP calls left behind as well.
+	mqtt := e.creds()
+	mqtt.ClientID = "pump-2"
+	_, err := e.auth.Authenticate(t.Context(), mqtt)
+	require.ErrorIs(t, err, ErrNotAuthorized)
+
+	mqtt.ClientID = ""
+	_, err = e.auth.Authenticate(t.Context(), mqtt)
+	require.ErrorIs(t, err, ErrNotAuthorized)
+
+	mqtt.ClientID = "pump-1"
+	ident, err := e.auth.Authenticate(t.Context(), mqtt)
+	require.NoError(t, err)
+	assert.Equal(t, "pump-1", ident.ClientID)
+}
+
+func TestSkipClientIDPinKeepsEveryOtherCheck(t *testing.T) {
+	e := newEnv(t)
+
+	c := Credentials{Username: "akey_other", Password: []byte(rawKey), SkipClientIDPin: true}
+	_, err := e.auth.Authenticate(t.Context(), c)
+	require.ErrorIs(t, err, ErrBadCredentials)
+
+	c = Credentials{Username: e.keyID.String(), Password: []byte("tdk_live_nope"), SkipClientIDPin: true}
+	_, err = e.auth.Authenticate(t.Context(), c)
+	require.ErrorIs(t, err, ErrBadCredentials)
+
+	disabled := false
+	_, err = e.tenants.Update(t.Context(), e.tenant.ID, service.UpdateTenantInput{Enabled: &disabled})
+	require.NoError(t, err)
+
+	c = Credentials{Username: e.keyID.String(), Password: []byte(rawKey), SkipClientIDPin: true}
+	_, err = e.auth.Authenticate(t.Context(), c)
+	require.ErrorIs(t, err, ErrNotAuthorized)
+}
+
+func TestIdentityClientIDIsEmptyForUnpinnedDevice(t *testing.T) {
+	e := newEnv(t)
+
+	ident, err := e.auth.Authenticate(t.Context(), Credentials{Username: e.keyID.String(), Password: []byte(rawKey), SkipClientIDPin: true})
+	require.NoError(t, err)
+	assert.Empty(t, ident.ClientID)
+
+	// An MQTT client ID is not the device's pin.
+	ident, err = e.auth.Authenticate(t.Context(), e.creds())
+	require.NoError(t, err)
+	assert.Empty(t, ident.ClientID)
+}
+
 func TestUnpinnedDeviceAcceptsAnyClientID(t *testing.T) {
 	e := newEnv(t)
 
