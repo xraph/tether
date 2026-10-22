@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/service
 
-Tenant management over a `store.Store`.
+Tenant and device management.
 
 `NewTenants(s store.Store) *Tenants`:
 - `Create(ctx, CreateTenantInput{AppID, ExternalID, Name string; Limits tenant.Limits})`: new tenants are enabled. Empty AppID or ExternalID wraps `tether.ErrInvalidInput`; an ExternalID already used by another tenant, under this app or any other, wraps `tether.ErrConflict` (keysmith and warden isolate by tenant ID alone, so two tenants must never share one). The check scans every tenant and a mutex serialises `Create` within a process; it is not atomic across nodes sharing a store. `Update` cannot change ExternalID, so it needs no check.
@@ -10,3 +10,18 @@ Tenant management over a `store.Store`.
 - `Update(ctx, id.TenantID, UpdateTenantInput{Name *string; Enabled *bool; Limits *tenant.Limits})`: nil fields are untouched; evicts the resolve cache.
 - `Delete(ctx, id.TenantID)`: wraps `tether.ErrConflict` while the tenant has devices (the store does not cascade); evicts the resolve cache.
 - `ResolveTenant(ctx, appID, externalID)`: cached 30 s per process, copy returned, misses not cached, disabled tenants returned as is (the caller checks `Enabled`). With several broker nodes on one store, a change made through one node reaches the others within 30 s. Satisfies `auth.TenantResolver`.
+
+## Devices
+
+`NewDevices(s device.Store, t *Tenants, k KeyManager, r RoleAssigner) *Devices`.
+- `KeyManager` is satisfied by `*keysmith.Engine` (`CreateKey`, `RotateKey`, `RevokeKey`). `RoleAssigner` is satisfied by warden's `keysmithbridge.Bridge` (`AssignRoleToAPIKey`, `UnassignRoleFromAPIKey`); its tenant argument is the Tether tenant's `ExternalID`.
+- Every keysmith and warden call runs under `scope.With(ctx, tenant.AppID, tenant.ExternalID)`, whatever scope the caller's context carries. Devices only get keys this service created in the tenant's own scope; there is no way to attach an existing key.
+- `Provision(ctx, tenantID, ProvisionInput{Name, ClientID string; Roles []string; ExpiresAt *time.Time}) (*Credentials, error)`: key prefix `tdk`, environment `live`, metadata `tether_device_id`; then each role is assigned; then the record is stored. `Name` is required, `ClientID` (if set) must be one topic level (no `/`, `+`, `#`, NUL) because it becomes `%c` in grants, role slugs must be non-empty (repeats are dropped); all wrap `tether.ErrInvalidInput`. After `CreateKey` the key's `AppID` and `TenantID` must equal the tenant's, else the key is revoked and Provision fails. A failed role assignment or store write unassigns the roles and revokes the key, on a context that survives the caller's cancellation (10 s cap); a rollback failure is joined onto the returned error.
+- `Credentials{Device *device.Device; Username, Password string}`: Username is the key ID. Password is returned only by `Provision` and `Rotate` and is never stored.
+- `Rotate(ctx, tenantID, deviceID, grace)`: reason `rotation.ReasonManual`; the username stays; the old password works for `grace`. Zero grace passes no option, so keysmith's default applies (policy grace, else 24 h); negative wraps `ErrInvalidInput`. A revoked device cannot be rotated.
+- `Revoke(ctx, tenantID, deviceID, reason)`: revokes the key and keeps the record. Idempotent: an already revoked or missing key is success.
+- `Delete(ctx, tenantID, deviceID)`: revoke (same tolerance), unassign every role, delete the record. On a failed step the record stays, so a second call finishes.
+- `SetRoles(ctx, tenantID, deviceID, roles)`: unassign all, assign each, store the slugs on `device.Roles`. On failure the previous roles are put back.
+- `Get(ctx, tenantID, deviceID)`, `List(ctx, device.ListFilter)`: tenant scoped; another tenant's device wraps `tether.ErrNotFound`, as does every other method.
+- The service does not know the auth layer. After `Revoke`, `Delete`, or `Rotate` with a short grace, call `(*auth.Keysmith).Evict(device.KeyID)` or the 60 s validation cache keeps the old key working.
+- `Provision` on a disabled tenant is allowed; the broker refuses its devices at connect.
