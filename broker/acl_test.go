@@ -207,8 +207,9 @@ func TestSubscribeDeniedOutsideGrant(t *testing.T) {
 }
 
 func TestRateLimitQuotaExceeded(t *testing.T) {
-	ta := newTenant(tenant.Limits{MessagesPerSecond: 1, Burst: 1})
-	tb := newTenant(tenant.Limits{MessagesPerSecond: 1, Burst: 1})
+	// One token, and none refills during the test, even on a slow runner.
+	ta := newTenant(tenant.Limits{MessagesPerSecond: 0.01, Burst: 1})
+	tb := newTenant(tenant.Limits{MessagesPerSecond: 0.01, Burst: 1})
 	b := startBroker(t,
 		map[string]*auth.Identity{"a": ident(ta, "a"), "a-sub": ident(ta, "a-sub"), "b": ident(tb, "b")},
 		map[string]acl.Rules{

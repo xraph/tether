@@ -89,13 +89,46 @@ func TestAllowMessageUnlimited(t *testing.T) {
 	}
 }
 
-func TestAllowMessageRecreatedWhenLimitsChange(t *testing.T) {
+// A change of limits updates the tenant's bucket in place: the tokens carry
+// over, so a spent budget stays spent.
+func TestAllowMessageLimitsUpdatedInPlace(t *testing.T) {
 	l := New()
 
-	tight := tenant.Limits{MessagesPerSecond: 1, Burst: 1}
+	tight := tenant.Limits{MessagesPerSecond: 0.01, Burst: 1}
 	assert.True(t, l.AllowMessage("a", tight))
 	assert.False(t, l.AllowMessage("a", tight))
 
-	loose := tenant.Limits{MessagesPerSecond: 1, Burst: 5}
-	assert.True(t, l.AllowMessage("a", loose), "new limits get a fresh bucket")
+	loose := tenant.Limits{MessagesPerSecond: 0.01, Burst: 5}
+	assert.False(t, l.AllowMessage("a", loose), "a larger burst is no fresh bucket")
+
+	// A lower burst clamps what is left.
+	l2 := New()
+	assert.True(t, l2.AllowMessage("b", tenant.Limits{MessagesPerSecond: 0.01, Burst: 5}))
+	assert.True(t, l2.AllowMessage("b", tenant.Limits{MessagesPerSecond: 0.01, Burst: 1}))
+	assert.False(t, l2.AllowMessage("b", tenant.Limits{MessagesPerSecond: 0.01, Burst: 1}), "clamped to the new burst")
+}
+
+// Connections of one tenant can carry different limits snapshots (taken at
+// their CONNECT, before and after the tenant was updated). Alternating them
+// must not refill the bucket: the allowance stays bounded by the more
+// permissive snapshot.
+func TestAllowMessageAlternatingSnapshotsStayBounded(t *testing.T) {
+	strict := tenant.Limits{MessagesPerSecond: 1, Burst: 1}
+	permissive := tenant.Limits{MessagesPerSecond: 10, Burst: 10}
+
+	for _, order := range [][2]tenant.Limits{{strict, permissive}, {permissive, strict}} {
+		l := New()
+		allowed := 0
+
+		for i := range 1000 {
+			if l.AllowMessage("a", order[i%2]) {
+				allowed++
+			}
+		}
+
+		// The permissive burst, plus one token of slack for what the
+		// permissive rate refills while the loop runs.
+		assert.GreaterOrEqual(t, allowed, 1)
+		assert.LessOrEqual(t, allowed, permissive.Burst+1, "alternating snapshots refilled the bucket")
+	}
 }

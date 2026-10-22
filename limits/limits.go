@@ -36,8 +36,14 @@ func New() *Limiter {
 
 // AllowMessage reports whether tenantID may send one more message under l. A
 // MessagesPerSecond of zero or less means no limit. Burst defaults to the rate
-// rounded up, and at least one. The tenant's bucket is rebuilt, full, when the
-// rate or burst changes.
+// rounded up, and at least one.
+//
+// Each tenant has one bucket. When l differs from the limits the bucket last
+// saw, the bucket is updated in place (rate.Limiter SetLimit and SetBurst):
+// its tokens carry over and are clamped to the new burst. Callers may pass
+// different snapshots of a tenant's limits (the broker passes each
+// connection's, taken at CONNECT), and alternating them must not hand out a
+// fresh, full bucket each time.
 func (lt *Limiter) AllowMessage(tenantID string, l tenant.Limits) bool {
 	if l.MessagesPerSecond <= 0 {
 		return true
@@ -51,9 +57,15 @@ func (lt *Limiter) AllowMessage(tenantID string, l tenant.Limits) bool {
 	lt.mu.Lock()
 
 	b := lt.rates[tenantID]
-	if b == nil || b.rps != l.MessagesPerSecond || b.burst != burst {
+
+	switch {
+	case b == nil:
 		b = &bucket{lim: rate.NewLimiter(rate.Limit(l.MessagesPerSecond), burst), rps: l.MessagesPerSecond, burst: burst}
 		lt.rates[tenantID] = b
+	case b.rps != l.MessagesPerSecond || b.burst != burst:
+		b.lim.SetLimit(rate.Limit(l.MessagesPerSecond))
+		b.lim.SetBurst(burst)
+		b.rps, b.burst = l.MessagesPerSecond, burst
 	}
 
 	lt.mu.Unlock()
