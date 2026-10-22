@@ -70,6 +70,11 @@ tether:
     # one is refused with reason code 0x90.
     max_topic_length: 1024
 
+    # How many QoS 1 and 2 messages the broker keeps in flight for one
+    # client, the queue of an offline session included. Past it, messages for
+    # that client are dropped.
+    max_inflight: 1024
+
   # Lets users and service accounts connect with an authsome JWT as the MQTT
   # password (username = the token's sub), next to device keys. Off while
   # this block is absent. The tokens need an org_id claim, which authsome does

@@ -283,7 +283,7 @@ func TestTenantsLifecycle(t *testing.T) {
 
 	created := h.mustCommand("tenants.create", map[string]any{
 		"appId": testApp, "externalId": "acme", "name": "Acme",
-		"limits": map[string]any{"maxConnections": 5, "messagesPerSecond": 2.5, "burst": 3, "maxSessionExpirySeconds": 3600},
+		"limits": map[string]any{"maxConnections": 5, "messagesPerSecond": 2.5, "burst": 3, "maxSessionExpirySeconds": 3600, "maxSessions": 7},
 	})
 
 	tid := created["id"].(string)
@@ -296,6 +296,7 @@ func TestTenantsLifecycle(t *testing.T) {
 	assert.NotEmpty(t, created["updatedAt"])
 	assert.Equal(t, map[string]any{
 		"maxConnections": float64(5), "messagesPerSecond": 2.5, "burst": float64(3), "maxSessionExpirySeconds": float64(3600),
+		"maxSessions": float64(7),
 	}, created["limits"])
 
 	// The wire is camelCase only.
@@ -340,9 +341,13 @@ func TestTenantsLifecycle(t *testing.T) {
 	assert.Equal(t, true, upd["enabled"])
 	assert.Equal(t, map[string]any{
 		"maxConnections": float64(9), "messagesPerSecond": float64(0), "burst": float64(0), "maxSessionExpirySeconds": float64(0),
+		"maxSessions": float64(0),
 	}, upd["limits"])
 
 	_, err = h.command("tenants.update", map[string]any{"tenantId": tid, "limits": map[string]any{"maxConnections": -1}})
+	requireCode(t, dashcontract.CodeBadRequest, err)
+
+	_, err = h.command("tenants.update", map[string]any{"tenantId": tid, "limits": map[string]any{"maxSessions": -1}})
 	requireCode(t, dashcontract.CodeBadRequest, err)
 
 	// A tenant with a device cannot be deleted, and nothing changes.

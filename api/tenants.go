@@ -195,7 +195,7 @@ func page(req *pageRequest) (limit, offset int, err error) {
 // "unlimited".
 func validateLimits(l tenant.Limits) error {
 	switch {
-	case l.MaxConnections < 0, l.MessagesPerSecond < 0, l.Burst < 0, l.MaxSessionExpiry < 0:
+	case l.MaxConnections < 0, l.MessagesPerSecond < 0, l.Burst < 0, l.MaxSessionExpiry < 0, l.MaxSessions < 0:
 		return fmt.Errorf("%w: limits must not be negative", tether.ErrInvalidInput)
 	}
 

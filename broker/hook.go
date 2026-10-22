@@ -81,6 +81,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	tenantID := ident.Tenant.ID.String()
 	log = log.With(slog.String("tenant", tenantID))
 
+	if !h.sessionRoom(tenantID, cl.ID, ident.Tenant.Limits.MaxSessions) {
+		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant session limit reached", nil)
+	}
+
 	if !h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections) {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant connection limit reached", nil)
 	}
@@ -209,6 +213,37 @@ func (h *hook) expire(st *clientState) {
 
 	h.b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
 	disconnect(h.server, h.b.log, st.cl, packets.ErrMaxConnectTime)
+}
+
+// sessionRoom reports whether a CONNECT for rawID may hold a session of
+// tenantID under its MaxSessions limit (zero is unlimited). A client ID that
+// already has a session, open or kept offline, is coming back to it and
+// always may. Otherwise the tenant's sessions on this node, open connections
+// plus kept offline sessions, must be under the limit.
+//
+// It walks mochi's clients, so it costs O(clients on the node) per CONNECT,
+// and only for tenants that set the limit. Two CONNECTs racing for the last
+// session can both pass: the count is read, not reserved.
+func (h *hook) sessionRoom(tenantID, rawID string, limit int) bool {
+	if limit <= 0 {
+		return true
+	}
+
+	nsID := namespacedID(tenantID, rawID)
+	if _, ok := h.server.Clients.Get(nsID); ok {
+		return true
+	}
+
+	prefix := tenantID + "/"
+	n := 0
+
+	for id, cl := range h.server.Clients.GetAll() {
+		if !cl.Net.Inline && strings.HasPrefix(id, prefix) {
+			n++
+		}
+	}
+
+	return n < limit
 }
 
 // acquireSlot takes a tenant connection slot. When the tenant is at its limit

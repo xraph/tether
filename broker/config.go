@@ -14,6 +14,7 @@ const (
 	DefaultMaxSessionExpiry = 7 * 24 * time.Hour
 	DefaultMaxPacketSize    = 1 << 20
 	DefaultMaxTopicLength   = 1024
+	DefaultMaxInflight      = 1024
 )
 
 // TLSConfig is an MQTT over TLS listener.
@@ -55,17 +56,24 @@ type Config struct {
 	// in bytes, before the tenant prefix is added. Zero means
 	// DefaultMaxTopicLength.
 	MaxTopicLength int `yaml:"max_topic_length" json:"max_topic_length"`
+
+	// MaxInflight is how many QoS 1 and 2 messages the broker keeps in
+	// flight for one client, outbound queue of an offline session included.
+	// Past it, further messages for that client are dropped. Zero means
+	// DefaultMaxInflight (1024; mochi's own default is 8192).
+	MaxInflight uint16 `yaml:"max_inflight" json:"max_inflight"`
 }
 
 // DefaultConfig returns a config with a TCP listener on :1883, a 7 day
-// session expiry cap, a 1 MiB packet limit, a 1 KiB topic limit and no
-// persistence.
+// session expiry cap, a 1 MiB packet limit, a 1 KiB topic limit, 1024
+// in-flight messages per client and no persistence.
 func DefaultConfig() Config {
 	return Config{
 		TCPAddress:       DefaultTCPAddress,
 		MaxSessionExpiry: DefaultMaxSessionExpiry,
 		MaxPacketSize:    DefaultMaxPacketSize,
 		MaxTopicLength:   DefaultMaxTopicLength,
+		MaxInflight:      DefaultMaxInflight,
 	}
 }
 
@@ -81,6 +89,10 @@ func (c Config) withDefaults() (Config, error) {
 
 	if c.MaxTopicLength == 0 {
 		c.MaxTopicLength = DefaultMaxTopicLength
+	}
+
+	if c.MaxInflight == 0 {
+		c.MaxInflight = DefaultMaxInflight
 	}
 
 	switch {

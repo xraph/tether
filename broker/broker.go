@@ -173,6 +173,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	caps.TopicAliasMaximum = 0
 	caps.MaximumSessionExpiryInterval = b.cfg.sessionExpirySeconds()
 	caps.MaximumPacketSize = b.cfg.MaxPacketSize
+	caps.MaximumInflight = b.cfg.MaxInflight
 
 	srv := mqtt.New(&mqtt.Options{
 		InlineClient: true,

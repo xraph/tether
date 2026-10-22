@@ -83,6 +83,7 @@ func newTenant() *tenant.Tenant {
 			MessagesPerSecond: 12.5,
 			Burst:             25,
 			MaxSessionExpiry:  2 * time.Hour,
+			MaxSessions:       12,
 		},
 	}
 }

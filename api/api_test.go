@@ -354,10 +354,11 @@ func TestTenantsCRUD(t *testing.T) {
 
 	r := expect(t, e.do(http.MethodPost, "/tether/v1/tenants", map[string]any{
 		"app_id": testApp, "external_id": "aorg_1", "name": "Acme",
-		"limits": map[string]any{"max_connections": 5, "messages_per_second": 2.5},
+		"limits": map[string]any{"max_connections": 5, "messages_per_second": 2.5, "max_sessions": 7},
 	}), http.StatusCreated)
 
 	created := r.json()
+	assert.InDelta(t, 7, created["limits"].(map[string]any)["max_sessions"], 0)
 	tenantID := created["id"].(string)
 	assert.True(t, strings.HasPrefix(tenantID, "ttnt_"))
 	assert.Equal(t, true, created["enabled"])
@@ -409,6 +410,7 @@ func TestTenantsRejectBadInput(t *testing.T) {
 		{"missing external id", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp}, http.StatusBadRequest},
 		{"duplicate external id", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": "aapp_2", "external_id": "aorg_1"}, http.StatusConflict},
 		{"negative limit", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp, "external_id": "n", "limits": map[string]any{"burst": -1}}, http.StatusBadRequest},
+		{"negative session limit", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp, "external_id": "n", "limits": map[string]any{"max_sessions": -1}}, http.StatusBadRequest},
 		{"not json", http.MethodPost, "/tether/v1/tenants", []byte("{nope"), http.StatusBadRequest},
 		{"malformed id", http.MethodGet, "/tether/v1/tenants/not-an-id", nil, http.StatusBadRequest},
 		{"device id as tenant id", http.MethodGet, "/tether/v1/tenants/" + id.NewDeviceID().String(), nil, http.StatusBadRequest},

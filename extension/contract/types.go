@@ -22,12 +22,14 @@ type Ack struct {
 }
 
 // Limits caps what one tenant may do. Zero means the broker default, and
-// unlimited for maxConnections and messagesPerSecond (see tenant.Limits).
+// unlimited for maxConnections, messagesPerSecond and maxSessions (see
+// tenant.Limits).
 type Limits struct {
 	MaxConnections          int     `json:"maxConnections"`
 	MessagesPerSecond       float64 `json:"messagesPerSecond"`
 	Burst                   int     `json:"burst"`
 	MaxSessionExpirySeconds int64   `json:"maxSessionExpirySeconds"`
+	MaxSessions             int     `json:"maxSessions"`
 }
 
 // Tenant is one isolated customer of the broker.
@@ -292,7 +294,7 @@ func seconds(name string, n int64) (time.Duration, error) {
 // toLimits converts wire limits to tenant limits. Negative limits are
 // invalid: the limiter would read them as "unlimited".
 func toLimits(l Limits) (tenant.Limits, error) {
-	if l.MaxConnections < 0 || l.MessagesPerSecond < 0 || l.Burst < 0 {
+	if l.MaxConnections < 0 || l.MessagesPerSecond < 0 || l.Burst < 0 || l.MaxSessions < 0 {
 		return tenant.Limits{}, fmt.Errorf("%w: limits must not be negative", tether.ErrInvalidInput)
 	}
 
@@ -306,6 +308,7 @@ func toLimits(l Limits) (tenant.Limits, error) {
 		MessagesPerSecond: l.MessagesPerSecond,
 		Burst:             l.Burst,
 		MaxSessionExpiry:  expiry,
+		MaxSessions:       l.MaxSessions,
 	}, nil
 }
 
@@ -315,6 +318,7 @@ func fromLimits(l tenant.Limits) Limits {
 		MessagesPerSecond:       l.MessagesPerSecond,
 		Burst:                   l.Burst,
 		MaxSessionExpirySeconds: int64(l.MaxSessionExpiry / time.Second),
+		MaxSessions:             l.MaxSessions,
 	}
 }
 

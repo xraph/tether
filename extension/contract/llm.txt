@@ -37,7 +37,7 @@ After admission, every caller is either an operator or a tenant user (`caller.go
 ## Shapes
 
     Tenant      {id, appId, externalId, name, enabled, limits: Limits, createdAt, updatedAt}
-    Limits      {maxConnections, messagesPerSecond, burst, maxSessionExpirySeconds}   (all numbers, 0 = default or unlimited)
+    Limits      {maxConnections, messagesPerSecond, burst, maxSessionExpirySeconds, maxSessions}   (all numbers, 0 = default or unlimited)
     Device      {id, tenantId, name, keyId, clientId?, roles: string[], metadata?, createdAt, updatedAt}
     Credentials {device: Device, username, password}                                   (username = keysmith key ID, password = the raw key)
     Client      {clientId, username?, deviceId?, remote?, connected, protocolVersion (4|5),
@@ -71,7 +71,7 @@ After admission, every caller is either an operator or a tenant user (`caller.go
 | Intent | Input | Output | Invalidates |
 |---|---|---|---|
 | `tenants.create` | `{appId, externalId, name?, limits?: Limits}` | `Tenant`. Missing `appId` or `externalId`, or a negative limit, is `BAD_REQUEST`; an `externalId` another tenant uses is `CONFLICT`. | `tenants.list`, `overview.stats` |
-| `tenants.update` | `{tenantId, name?, enabled?, limits?: Limits}` | `Tenant`. `limits` replaces all four. Live connections take the new limits, or are dropped when disabled. | `tenants.list`, `tenants.get`, `clients.list`, `overview.stats` |
+| `tenants.update` | `{tenantId, name?, enabled?, limits?: Limits}` | `Tenant`. `limits` replaces all five. Live connections take the new limits, or are dropped when disabled. | `tenants.list`, `tenants.get`, `clients.list`, `overview.stats` |
 | `tenants.delete` | `{tenantId}` | `Ack`. `CONFLICT` while the tenant has devices, and then nothing changes. | `tenants.list`, `tenants.get`, `clients.list`, `overview.stats` |
 | `devices.provision` | `{tenantId, name, clientId?, roles?: string[], expiresAt?}` | `Credentials`. `SecretResponse`: shown once, never replayed. | `devices.list` |
 | `devices.rotate` | `{tenantId, deviceId, graceSeconds?}` | `Credentials`. `SecretResponse`. The old key works for `graceSeconds` (0 is keysmith's default). A revoked device is `CONFLICT`. | `devices.list`, `devices.get` |

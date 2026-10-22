@@ -10,7 +10,8 @@ import (
 )
 
 // Limits caps what one tenant may do. A zero value means "use the broker
-// default", except MaxConnections where zero means unlimited.
+// default", except MaxConnections and MaxSessions, where zero means
+// unlimited.
 //
 // Limits holds plain value types only, so stores can persist it as JSON.
 type Limits struct {
@@ -35,6 +36,13 @@ type Limits struct {
 	// persistent session gets the cap as its expiry. Zero means the
 	// broker's cap. A change reaches connections made after it.
 	MaxSessionExpiry time.Duration `json:"max_session_expiry,omitempty"`
+
+	// MaxSessions is the most sessions the tenant may hold on one broker
+	// node: its open connections plus the kept sessions of disconnected
+	// persistent clients. A CONNECT that would start a new session over it
+	// is refused (0x97, 3.1.1: server unavailable); a client coming back to
+	// its own session is not. Zero means unlimited.
+	MaxSessions int `json:"max_sessions,omitempty"`
 }
 
 // Tenant is one isolated customer of the broker. The (AppID, ExternalID) pair
