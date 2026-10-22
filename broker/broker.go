@@ -42,6 +42,9 @@ type Deps struct {
 
 	// Logger receives the broker's and mochi's logs. Nil discards them.
 	Logger *slog.Logger
+
+	// Metrics receives the node-wide counters. Nil reports nothing.
+	Metrics Metrics
 }
 
 // Broker is a tenant-isolating MQTT broker. Create it with New, then Start
@@ -129,6 +132,10 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 
 	if deps.Logger == nil {
 		deps.Logger = slog.New(slog.DiscardHandler)
+	}
+
+	if deps.Metrics == nil {
+		deps.Metrics = noMetrics{}
 	}
 
 	return &Broker{

@@ -50,6 +50,10 @@ type clientState struct {
 	counters *tenantCounters
 	release  sync.Once
 
+	// metrics hears about the slot's release as a closed connection. Nil
+	// for states the hook did not create (tests).
+	metrics Metrics
+
 	// connectedAt is when the connection authenticated. sessionExpiry is
 	// how long, in seconds, mochi keeps the session after the connection
 	// ends, as the CONNECT asked for it and capped by the broker. Both are
@@ -166,7 +170,13 @@ func (st *clientState) markEnded() {
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
 // than once and from more than one goroutine.
 func (st *clientState) releaseSlot() {
-	st.release.Do(func() { st.limiter.ReleaseConnection(st.tenantID) })
+	st.release.Do(func() {
+		st.limiter.ReleaseConnection(st.tenantID)
+
+		if st.metrics != nil {
+			st.metrics.ConnectionClosed()
+		}
+	})
 }
 
 // transferSlot hands this connection's slot to a connection taking over its

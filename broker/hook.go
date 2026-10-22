@@ -85,6 +85,7 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	}
 
 	st := newClientState(cl, cl.ID, string(pk.Connect.Username), ident, ident.Tenant, g, h.b.deps.Limits, h.b.countersFor(tenantID))
+	st.metrics = h.b.deps.Metrics
 	st.sessionExpiry = sessionExpiry(cl, h.b.cfg.sessionExpirySeconds())
 
 	if !h.b.state.addUnlessDeleting(st, namespacedID(tenantID, cl.ID)) {
@@ -215,12 +216,15 @@ func (h *hook) expire(st *clientState) {
 // Before that, it sweeps the tenant's closed connections. Mochi skips
 // OnDisconnect when writing the success CONNACK or resending inflight
 // messages fails, so their slots would otherwise stay taken for good.
+//
+// A slot taken here is reported as an opened connection; an inherited one is
+// not, since the connection it came from never reports its close.
 func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) bool {
-	if h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
+	if h.acquire(tenantID, maxConns) {
 		return true
 	}
 
-	if h.b.state.sweepClosed(tenantID) > 0 && h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
+	if h.b.state.sweepClosed(tenantID) > 0 && h.acquire(tenantID, maxConns) {
 		return true
 	}
 
@@ -234,11 +238,24 @@ func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) bool {
 	}
 
 	// The old connection released its slot in the meantime.
-	return h.b.deps.Limits.AcquireConnection(tenantID, maxConns)
+	return h.acquire(tenantID, maxConns)
+}
+
+// acquire takes a fresh tenant connection slot and reports the connection
+// as opened.
+func (h *hook) acquire(tenantID string, maxConns int) bool {
+	if !h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
+		return false
+	}
+
+	h.b.deps.Metrics.ConnectionOpened()
+
+	return true
 }
 
 func (h *hook) refuse(cl *mqtt.Client, log *slog.Logger, code packets.Code, msg string, err error) bool {
 	h.b.state.refuse(cl, code)
+	h.b.deps.Metrics.AuthFailure(authReason(code))
 	log.Info("tether: connection refused", slog.String("reason", msg), slog.Int("code", int(code.Code)), slog.Any("error", err))
 
 	return false
@@ -418,6 +435,7 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 
 		pk.TopicName = name
 		counters.out.Add(1)
+		h.b.deps.Metrics.MessageOut()
 
 		return pk
 	default:
@@ -483,6 +501,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 
 	st.counters.in.Add(1)
+	h.b.deps.Metrics.MessageIn()
 
 	return pk, nil
 }
@@ -547,6 +566,17 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 		return true
 	}
 
+	if h.aclCheck(cl, name, write) {
+		return true
+	}
+
+	h.b.deps.Metrics.ACLDenied(aclOp(write))
+
+	return false
+}
+
+// aclCheck is OnACLCheck for a network client.
+func (h *hook) aclCheck(cl *mqtt.Client, name string, write bool) bool {
 	st := h.b.state.get(cl)
 	if st == nil {
 		if write || !cl.Closed() {
