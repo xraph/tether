@@ -25,8 +25,9 @@ type clientState struct {
 	roleIDs  []string
 	rawID    string
 
-	limiter *limits.Limiter
-	release sync.Once
+	limiter  *limits.Limiter
+	counters *tenantCounters
+	release  sync.Once
 }
 
 // releaseSlot gives the tenant's connection slot back. It is safe to call more

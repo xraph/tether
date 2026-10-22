@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/storage/badger"
@@ -53,11 +54,22 @@ type Broker struct {
 	// aclObserver, when set before Start, sees every ACL check. Tests only.
 	aclObserver func(clientID, topic string, write bool)
 
+	// sysInterval is how often tenant $SYS stats are published. Tests
+	// shorten it before Start.
+	sysInterval time.Duration
+
+	countersMu sync.Mutex
+	counters   map[string]*tenantCounters
+
 	mu      sync.Mutex
 	started bool
 	server  *mqtt.Server
 	tcpAddr net.Addr
 	tlsAddr net.Addr
+
+	// sysStop stops the $SYS publisher, which closes sysDone when it returns.
+	sysStop chan struct{}
+	sysDone chan struct{}
 
 	// listenerIDs are the mochi listeners setup added, for shutdown.
 	listenerIDs []string
@@ -87,7 +99,14 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		deps.Logger = slog.New(slog.DiscardHandler)
 	}
 
-	return &Broker{cfg: cfg, deps: deps, log: deps.Logger, state: newRegistry()}, nil
+	return &Broker{
+		cfg:         cfg,
+		deps:        deps,
+		log:         deps.Logger,
+		state:       newRegistry(),
+		sysInterval: defaultSysInterval,
+		counters:    make(map[string]*tenantCounters),
+	}, nil
 }
 
 // Start opens the listeners and starts serving. A broker starts once; a
@@ -131,6 +150,14 @@ func (b *Broker) Start(ctx context.Context) error {
 
 		return fmt.Errorf("tether/broker: serve: %w", err)
 	}
+
+	interval := b.sysInterval
+	if interval <= 0 {
+		interval = defaultSysInterval
+	}
+
+	b.sysStop, b.sysDone = make(chan struct{}), make(chan struct{})
+	go b.runSys(srv, interval, b.sysStop, b.sysDone)
 
 	return nil
 }
@@ -215,6 +242,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 	b.mu.Lock()
 	srv := b.server
 	ids := b.listenerIDs
+	sysStop, sysDone := b.sysStop, b.sysDone
 	b.server = nil
 	b.mu.Unlock()
 
@@ -224,7 +252,14 @@ func (b *Broker) Stop(ctx context.Context) error {
 
 	done := make(chan error, 1)
 
-	go func() { done <- shutdown(srv, ids) }()
+	go func() {
+		// The $SYS publisher goes first, so it never publishes into a
+		// server that is closing.
+		close(sysStop)
+		<-sysDone
+
+		done <- shutdown(srv, ids)
+	}()
 
 	select {
 	case err := <-done:

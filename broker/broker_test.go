@@ -215,10 +215,29 @@ func TestWillIsNamespaced(t *testing.T) {
 
 	assert.Equal(t, message{Topic: "status/dying", Payload: "gone"}, recv(t, aSub.msgs))
 
-	select {
-	case m := <-bSub.msgs:
-		t.Fatalf("tenant B received A's will: %+v", m)
-	default:
+	// Mochi sends the will before OnDisconnect drops the state, so once the
+	// state is gone the will's fan-out is over. Anything it sent B would sit
+	// in B's queue ahead of this sentinel.
+	waitStateDropped(t, b, ta.ID.String()+"/dying")
+	require.NoError(t, b.server.Publish(topic.Namespace(tb.ID.String(), "sentinel"), []byte("s"), false, 0))
+	assert.Equal(t, message{Topic: "sentinel", Payload: "s"}, recv(t, bSub.msgs), "B never sees A's will")
+}
+
+// waitStateDropped waits until no live connection owns the namespaced ID,
+// that is until mochi has called OnDisconnect for it.
+func waitStateDropped(t *testing.T, b *Broker, nsID string) {
+	t.Helper()
+
+	deadline := time.After(waitTimeout)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+
+	for b.state.hasID(nsID) {
+		select {
+		case <-deadline:
+			t.Fatal("connection state never dropped")
+		case <-tick.C:
+		}
 	}
 }
 
@@ -430,18 +449,7 @@ func TestOfflineSessionReceivesQueuedMessages(t *testing.T) {
 
 	// Wait until the broker has dropped the connection's state, so the
 	// message below meets an offline session.
-	nsID := ta.ID.String() + "/keeper"
-	deadline := time.After(waitTimeout)
-	tick := time.NewTicker(10 * time.Millisecond)
-	defer tick.Stop()
-
-	for b.state.hasID(nsID) {
-		select {
-		case <-deadline:
-			t.Fatal("connection state never dropped")
-		case <-tick.C:
-		}
-	}
+	waitStateDropped(t, b, ta.ID.String()+"/keeper")
 
 	pub, _, err := connect5(t, addr, "pub", "pub", true)
 	require.NoError(t, err)
@@ -503,8 +511,12 @@ func TestInvalidSubscribeFilters(t *testing.T) {
 func TestSubscribeOutsideTenantDenied(t *testing.T) {
 	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
 	b := startBroker(t,
-		map[string]*auth.Identity{"a": ident(ta, "a"), "b": ident(tb, "b")},
-		map[string]acl.Rules{"a": {Subscribe: []string{"#"}}, "b": {Publish: []string{"#"}}})
+		map[string]*auth.Identity{"a": ident(ta, "a"), "b": ident(tb, "b"), "b-sub": ident(tb, "b-sub")},
+		map[string]acl.Rules{
+			"a":     {Subscribe: []string{"#"}},
+			"b":     {Publish: []string{"#"}},
+			"b-sub": {Subscribe: []string{"#"}},
+		})
 	addr := b.Addr().String()
 
 	a, _, err := connect5(t, addr, "a", "a", true)
@@ -514,9 +526,19 @@ func TestSubscribeOutsideTenantDenied(t *testing.T) {
 	bNS := tb.ID.String()
 	require.Equal(t, []byte{1, 1}, subscribe5(t, a, bNS+"/#", "$share/g/"+bNS+"/#"))
 
+	bSub, _, err := connect5(t, addr, "b-sub", "b-sub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, bSub, "#"))
+
 	bc, _, err := connect5(t, addr, "b", "b", true)
 	require.NoError(t, err)
 	require.Equal(t, byte(0), publish5(t, bc, "x", "secret"))
+	require.Equal(t, byte(0), publish5(t, bc, "y", "secret"))
+
+	// "y" reached B's own subscriber, so the fan-out of "x" is over: anything
+	// it sent A would sit in A's queue ahead of the sentinel.
+	assert.Equal(t, message{Topic: "x", Payload: "secret"}, recv(t, bSub.msgs))
+	assert.Equal(t, message{Topic: "y", Payload: "secret"}, recv(t, bSub.msgs))
 
 	// Sentinel through A's own space: published by the broker into A's
 	// namespace under the literal "<B>/sentinel" name A subscribed to.

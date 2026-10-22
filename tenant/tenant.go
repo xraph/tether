@@ -18,12 +18,15 @@ type Limits struct {
 	// hold. Zero means unlimited.
 	MaxConnections int `json:"max_connections,omitempty"`
 
-	// MessagesPerSecond is the sustained publish rate per connection. Zero
-	// means the broker default.
+	// MessagesPerSecond is the sustained publish rate of the whole tenant on
+	// one broker node: every connection of the tenant on that node draws from
+	// one budget. Zero means the broker default, and the broker has no default
+	// rate, so zero means unlimited.
 	MessagesPerSecond float64 `json:"messages_per_second,omitempty"`
 
-	// Burst is the publish burst allowance on top of MessagesPerSecond. Zero
-	// means the broker default.
+	// Burst is how many publishes the tenant may send at once on one node,
+	// on top of MessagesPerSecond. Zero means MessagesPerSecond rounded up,
+	// and at least one.
 	Burst int `json:"burst,omitempty"`
 
 	// MaxSessionExpiry caps the session expiry a client may request. Zero

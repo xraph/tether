@@ -123,6 +123,7 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		roleIDs:  roleIDs,
 		rawID:    cl.ID,
 		limiter:  h.b.deps.Limits,
+		counters: h.b.countersFor(tenantID),
 	})
 
 	return true
@@ -288,8 +289,9 @@ func (h *hook) reject(cl *mqtt.Client, pk packets.Packet, code packets.Code) (pa
 }
 
 // OnPacketEncode strips the tenant prefix from every PUBLISH a networked
-// client receives, and gives a refused CONNECT the CONNACK reason
-// OnConnectAuthenticate chose (mochi always sends bad username or password).
+// client receives and counts it as a message out for the receiver's tenant,
+// and gives a refused CONNECT the CONNACK reason OnConnectAuthenticate chose
+// (mochi always sends bad username or password).
 func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 	switch pk.FixedHeader.Type {
 	case packets.Connack:
@@ -311,20 +313,18 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			return pk
 		}
 
-		tenantID, ok := h.tenantOf(cl)
-		if ok {
-			if name, ok := topic.Strip(tenantID, pk.TopicName); ok {
-				pk.TopicName = name
-
-				return pk
-			}
+		tenantID, counters, ok := h.tenantOf(cl)
+		if !ok {
+			return h.withhold(cl, pk)
 		}
 
-		// Every delivery passed OnACLCheck, which only allows names in the
-		// client's namespace, so this is a bug. The packet cannot be dropped
-		// here; at least its payload does not leave.
-		h.b.log.Error("tether: outbound publish outside the client's namespace", slog.String("client", cl.ID))
-		pk.Payload = nil
+		name, ok := topic.Strip(tenantID, pk.TopicName)
+		if !ok {
+			return h.withhold(cl, pk)
+		}
+
+		pk.TopicName = name
+		counters.out.Add(1)
 
 		return pk
 	default:
@@ -332,8 +332,39 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 	}
 }
 
+// withhold fails closed on an outbound PUBLISH whose topic is not in the
+// receiver's namespace. Every delivery passed OnACLCheck, which only allows
+// names in the client's namespace, so this is a bug; but the packet would
+// carry another tenant's ID, topic and data, and OnPacketEncode cannot drop
+// it. So the client is stopped (implementation specific error), which closes
+// its connection before mochi writes, and the packet that mochi then fails to
+// write is a blank one: a fixed topic naming no tenant, no payload and no
+// properties. Nothing is counted.
+func (h *hook) withhold(cl *mqtt.Client, pk packets.Packet) packets.Packet {
+	h.b.log.Error("tether: outbound publish outside the client's namespace, closing the client", slog.String("client", cl.ID))
+	cl.Stop(packets.ErrImplementationSpecificError)
+
+	return packets.Packet{
+		FixedHeader:     pk.FixedHeader,
+		PacketID:        pk.PacketID,
+		ProtocolVersion: pk.ProtocolVersion,
+		Mods:            pk.Mods,
+		TopicName:       withheldTopic,
+	}
+}
+
 // OnPublish runs after the ACL check. The topic is already namespaced; this
-// re-checks it after mochi's alias handling, as a guard.
+// re-checks it after mochi's alias handling, as a guard. Then it spends one
+// message of the tenant's rate budget (limits.AllowMessage, per tenant on
+// this node) and counts the message in. The inline client is never limited
+// or counted.
+//
+// Over the budget, a 5.0 QoS 1 publish gets PUBACK 0x97 (quota exceeded):
+// mochi writes a PUBACK with a code returned here, and it type-asserts the
+// error, so the code is returned bare, never wrapped. Everything else is
+// dropped with ErrRejectPacket: for 3.1.1 or QoS 0 mochi would publish the
+// message anyway on any other error, and for QoS 2 it would answer with a
+// PUBACK where a PUBREC belongs.
 func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
 	if cl.Net.Inline {
 		return pk, nil
@@ -348,7 +379,17 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrRejectPacket
 	}
 
-	// Seam for Task 8: per-tenant message rate limits and message counters.
+	if !h.b.deps.Limits.AllowMessage(st.tenantID, st.tenant.Limits) {
+		h.b.log.Debug("tether: publish over the tenant's rate limit", slog.String("client", cl.ID), slog.String("tenant", st.tenantID))
+
+		if cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos == 1 {
+			return pk, packets.ErrQuotaExceeded
+		}
+
+		return pk, packets.ErrRejectPacket
+	}
+
+	st.counters.in.Add(1)
 
 	return pk, nil
 }
@@ -395,8 +436,7 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 
 	rel, ok := h.relative(st.tenantID, name, !write)
 	if !ok {
-		// Seam for Task 8: the tenant's own $SYS/... topics are readable by
-		// every client of the tenant.
+		// Another tenant's name, or mochi's own global $SYS/...
 		return false
 	}
 
@@ -404,7 +444,19 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 		return canPublish(st.acl, rel)
 	}
 
+	// The tenant's own $SYS/... (namespaced "$SYS/<tenant>/...") is readable
+	// by every client of the tenant, grants or not.
+	if isSys(rel) {
+		return true
+	}
+
 	return st.acl.CanSubscribe(rel)
+}
+
+// isSys reports whether a tenant-relative name or filter is under "$SYS",
+// exactly as the broker publishes it.
+func isSys(rel string) bool {
+	return rel == sysPrefix || strings.HasPrefix(rel, sysPrefix+"/")
 }
 
 // relative turns a namespaced name or filter back into the tenant-relative
@@ -427,13 +479,19 @@ func (h *hook) relative(tenantID, name string, isFilter bool) (string, bool) {
 	return rel, true
 }
 
-// tenantOf returns the client's tenant, from its state or its namespaced ID.
-func (h *hook) tenantOf(cl *mqtt.Client) (string, bool) {
+// tenantOf returns the client's tenant and its counters, from the client's
+// state or its namespaced ID.
+func (h *hook) tenantOf(cl *mqtt.Client) (string, *tenantCounters, bool) {
 	if st := h.b.state.get(cl); st != nil {
-		return st.tenantID, true
+		return st.tenantID, st.counters, true
 	}
 
-	return tenantOfID(cl.ID)
+	tenantID, ok := tenantOfID(cl.ID)
+	if !ok {
+		return "", nil, false
+	}
+
+	return tenantID, h.b.countersFor(tenantID), true
 }
 
 // withoutShare returns the filter part of "$share/<group>/<filter>", the

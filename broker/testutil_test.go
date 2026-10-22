@@ -233,7 +233,9 @@ func dial5(t *testing.T, addr string, cp *paho.Connect) (*client5, *paho.Connack
 	conn, err := dial(t, addr)
 	require.NoError(t, err)
 
-	msgs := make(chan message, 16)
+	// Roomy, because a full channel blocks paho's reader and with it the
+	// client's Disconnect in the test cleanup.
+	msgs := make(chan message, 1024)
 	discs := make(chan *paho.Disconnect, 1)
 	c := paho.NewClient(paho.ClientConfig{
 		Conn: conn,
