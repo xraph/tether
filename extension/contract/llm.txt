@@ -8,7 +8,7 @@ Tether's admin operations as a Forge dashboard contract contributor. The React p
 
 `Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry, deps Deps) error` loads the embedded `manifest.yaml`, runs `loader.Validate`, calls `reg.Register`, then registers one typed handler per intent. `Deps{Services ServicesProvider; AllowAnonymous bool}` where `ServicesProvider func() *api.Services` is called on every request (nil means Tether has not started). The extension implements `dashboard.ContractContributorAware` and passes `(*Extension).Services`. `ContributorName = "tether"`.
 
-Contributor `tether`, capabilities `tether.read`, `tether.write`, app block `displayName Tether`, `slug tether`, `icon radio-tower`. 20 intents, all version 1: 8 queries (capability read) and 12 commands (capability write, each with `invalidates`).
+Contributor `tether`, capabilities `tether.read`, `tether.write`, app block `displayName Tether`, `slug tether`, `icon radio-tower`. 23 intents, all version 1: 9 queries (capability read) and 14 commands (capability write, each with `invalidates`).
 
 No intent declares `requires`, so role policy is the dashboard's. Every intent does have an admission check (R18): it is registered with `dispatcher.BeforeDispatch(requireUser)`, which answers `UNAUTHENTICATED` (message "authentication required") before the handler runs unless the principal has an authenticated user (`p.User.Authenticated()`). A dashboard with `enable_auth` off, the default, sends principals with no user, so it is refused. `Deps.AllowAnonymous` (the extension's `WithInsecureDashboard()`) skips the check. The contributor is registered either way, so the plugin sees its intents and the refusal, not a missing app. The plugin should treat `UNAUTHENTICATED` as "sign in or enable dashboard auth".
 
@@ -36,6 +36,7 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
     Stats       {scope: "node"|"tenant", tenantId?, tenants?, connected, sessions, subscriptions,
                  retained, messagesIn, messagesOut}
     TopicRules  {roleSlug, publish: string[], subscribe: string[]}                     (filters use %c and %u)
+    Role        {slug, name, parentSlug?, publish: string[], subscribe: string[]}
 
 `Device` never has a password. `Credentials` is the only shape that does.
 
@@ -48,6 +49,7 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
 | `tenants.get` | `{tenantId}` | `Tenant` |
 | `devices.list` | `{tenantId, limit?, offset?}` | `{items: Device[], limit, offset}` |
 | `devices.get` | `{tenantId, deviceId}` | `Device` |
+| `roles.list` | `{tenantId}` | `{items: Role[]}`, every role of the tenant sorted by slug. |
 | `roles.topics.get` | `{tenantId, roleSlug}` | `TopicRules`. Unknown role is `NOT_FOUND`. |
 | `clients.list` | `{tenantId}` | `{items: Client[]}`: open connections and kept sessions on this node, sorted by client ID |
 | `retained.list` | `{tenantId, filter?}` | `{items: Retained[]}`. `filter` defaults to `#` (everything but `$SYS`); an invalid one is `BAD_REQUEST`. |
@@ -64,7 +66,9 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
 | `devices.revoke` | `{tenantId, deviceId, reason?}` | `Ack`. The record stays; live connections end through the keysmith plugin events. | `devices.list`, `devices.get`, `clients.list`, `overview.stats` |
 | `devices.delete` | `{tenantId, deviceId}` | `Ack` | `devices.list`, `devices.get`, `clients.list`, `overview.stats` |
 | `devices.roles.set` | `{tenantId, deviceId, roles: string[]}` | `Device`. An unknown role is `BAD_REQUEST`. | `devices.list`, `devices.get` |
-| `roles.topics.set` | `{tenantId, roleSlug, publish: string[], subscribe: string[]}` | `TopicRules` as stored. An invalid filter is `BAD_REQUEST`, an unknown role `NOT_FOUND`. | `roles.topics.get` |
+| `roles.create` | `{tenantId, slug, name?, parentSlug?, publish?: string[], subscribe?: string[]}` | `Role`. A missing or malformed slug (1 to 63 of `a-z0-9_-`), an invalid filter or an unknown parent is `BAD_REQUEST`; a slug the tenant already uses is `CONFLICT`. `name` defaults to the slug. | `roles.list`, `roles.topics.get` |
+| `roles.delete` | `{tenantId, roleSlug}` | `Ack`. Unknown role is `NOT_FOUND`; `CONFLICT` while a device holds it or another role names it as its parent, and then nothing changes. | `roles.list`, `roles.topics.get` |
+| `roles.topics.set` | `{tenantId, roleSlug, publish: string[], subscribe: string[]}` | `TopicRules` as stored. An invalid filter is `BAD_REQUEST`, an unknown role `NOT_FOUND`. | `roles.list`, `roles.topics.get` |
 | `clients.kick` | `{tenantId, clientId}` | `Ack`. Disconnects, keeps the session. | `clients.list`, `overview.stats` |
 | `sessions.delete` | `{tenantId, clientId}` | `Ack`. Disconnects and deletes the session. | `clients.list`, `overview.stats` |
 | `retained.delete` | `{tenantId, topic}` | `Ack`. Nothing retained there is `NOT_FOUND`. | `retained.list`, `overview.stats` |
@@ -73,4 +77,4 @@ No intent declares `requires`, so role policy is the dashboard's. Every intent d
 
 ## Tests
 
-`contract_test.go` registers the contract on a real dispatcher over a real stack (memory store, keysmith and warden engines, a broker on a loopback port, paho clients) and dispatches envelopes as a signed-in admin, so it checks the JSON the plugin receives: the lifecycle of tenants, the single appearance of the password, tenant scope on every device, role and client intent, the `PERMISSION_DENIED` rule over the whole manifest, broker-down answers, the node and tenant stats, and the admission check (every intent refuses an anonymous principal and a user with no subject; `AllowAnonymous` and a signed-in principal pass). `manifest_test.go` loads and validates the manifest (20 intents, every command invalidates real queries, every intent has a handler). `extension/dashboard_contract_test.go` boots Forge with the real dashboard and reads `/capabilities`, and its real POST endpoint with auth off (UNAUTHENTICATED by default, served with `WithInsecureDashboard`), because `Registry.Register` rejects manifests that `loader.Validate` accepts and the dashboard only logs it.
+`contract_test.go` registers the contract on a real dispatcher over a real stack (memory store, keysmith and warden engines, a broker on a loopback port, paho clients) and dispatches envelopes as a signed-in admin, so it checks the JSON the plugin receives: the lifecycle of tenants, the single appearance of the password, tenant scope on every device, role and client intent, the `PERMISSION_DENIED` rule over the whole manifest, broker-down answers, the node and tenant stats, and the admission check (every intent refuses an anonymous principal and a user with no subject; `AllowAnonymous` and a signed-in principal pass). `manifest_test.go` loads and validates the manifest (23 intents, every command invalidates real queries, every intent has a handler). `extension/dashboard_contract_test.go` boots Forge with the real dashboard and reads `/capabilities`, and its real POST endpoint with auth off (UNAUTHENTICATED by default, served with `WithInsecureDashboard`), because `Registry.Register` rejects manifests that `loader.Validate` accepts and the dashboard only logs it.

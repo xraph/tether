@@ -26,6 +26,9 @@ All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged 
 | `POST .../devices/:deviceId/rotate` | optional body `{grace_seconds}`; 200 `{device, username, password}`, `no-store`. A revoked device is 409. |
 | `POST .../devices/:deviceId/revoke` | optional body `{reason}`; 204, the record stays |
 | `PUT .../devices/:deviceId/roles` | body `{roles: [slugs]}` (required, `[]` clears); 200 with the device. An unknown role is 400. |
+| `POST /:tenantId/roles` | body `{slug, name, parent_slug, publish, subscribe}` (only `slug` is required); 201 with `{slug, name, parent_slug?, publish, subscribe}`. A bad slug, a bad filter or an unknown parent is 400, a slug the tenant already uses is 409. |
+| `GET /:tenantId/roles` | `{items: [{slug, name, parent_slug?, publish, subscribe}]}` sorted by slug |
+| `DELETE /:tenantId/roles/:roleSlug` | 204. 404 for no such role (or one of another tenant); 409 while a device holds it or another role names it as its parent, and then nothing changes. |
 | `GET\|PUT /:tenantId/roles/:roleSlug/topics` | `{publish: [...], subscribe: [...]}`; PUT replaces both lists. Invalid filter 400, unknown role 404. |
 | `GET /:tenantId/clients` | `broker.ClientInfo` list |
 | `POST /:tenantId/clients/:clientId/kick`, `DELETE /:tenantId/sessions/:clientId` | 204 |
@@ -54,7 +57,7 @@ Public. HTTP Basic: username is the key ID, password the raw key. Body `{"topic"
 
 `mapError` is the one place errors become HTTP: `ErrInvalidInput` 400 (with the reason), `auth.ErrBadCredentials` 401, `auth.ErrNotAuthorized` and `ErrTenantDisabled` 403, `tether.ErrNotAuthorized` 403 (with the reason, the ACL denial), `ErrNotFound` 404, `ErrConflict` 409 (with the reason), `auth.ErrRateLimited` 429, `auth.ErrUnavailable` 503, `warden.ErrRoleNotFound` 400, `keysmith.ErrKeyNotFound` 404, a rotate of a revoked key 409, anything else 500. 404, 401 and 403 texts are fixed; an unmapped error never reaches the body (and Forge redacts 5xx bodies) but is logged through `Services.Logger`. A broker that is not running makes `ErrNotFound` and `ErrConflict` mean nothing, so those become 503.
 
-Forge's binder treats a non-pointer field without `omitempty` or `optional:"true"` as required (400 "invalid request: ..."); the request structs rely on that for `name`, `app_id`, `external_id` and `roles`.
+Forge's binder treats a non-pointer field without `omitempty` or `optional:"true"` as required (400 "invalid request: ..."); the request structs rely on that for `name`, `app_id`, `external_id`, `roles` and a role's `slug`.
 
 ## Tests
 

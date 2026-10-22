@@ -423,7 +423,7 @@ func TestTenantScopedIntentsRefuseWithoutTenantID(t *testing.T) {
 		requireCode(t, dashcontract.CodePermissionDenied, derr)
 	}
 
-	assert.Equal(t, 17, denied)
+	assert.Equal(t, 20, denied)
 
 	// An empty string is no tenant either.
 	_, err = h.query("devices.list", map[string]any{"tenantId": ""})
@@ -602,6 +602,80 @@ func TestRolesAndDeviceRoles(t *testing.T) {
 
 	_, err = h.command("devices.roles.set", map[string]any{"tenantId": tid, "deviceId": did, "roles": []string{"nope"}})
 	requireCode(t, dashcontract.CodeBadRequest, err)
+}
+
+func TestRolesCreateListDelete(t *testing.T) {
+	h := newHarness(t, true)
+	tid := h.createTenant("acme")
+	other := h.createTenant("beta")
+
+	none := h.mustQuery("roles.list", map[string]any{"tenantId": tid})
+	assert.Equal(t, []any{}, none["items"], "an empty list is [] and not null")
+
+	made := h.mustCommand("roles.create", map[string]any{
+		"tenantId": tid, "slug": "sensor", "name": "Sensor",
+		"publish": []string{"sensors/%c/up"}, "subscribe": []string{"sensors/%c/#"},
+	})
+	assert.Equal(t, map[string]any{
+		"slug": "sensor", "name": "Sensor",
+		"publish": []any{"sensors/%c/up"}, "subscribe": []any{"sensors/%c/#"},
+	}, made)
+
+	child := h.mustCommand("roles.create", map[string]any{"tenantId": tid, "slug": "child", "parentSlug": "sensor"})
+	assert.Equal(t, "child", child["name"])
+	assert.Equal(t, "sensor", child["parentSlug"])
+	assert.Equal(t, []any{}, child["publish"])
+
+	// The topics intents see the same role.
+	rules := h.mustQuery("roles.topics.get", map[string]any{"tenantId": tid, "roleSlug": "sensor"})
+	assert.Equal(t, []any{"sensors/%c/up"}, rules["publish"])
+
+	listed := h.mustQuery("roles.list", map[string]any{"tenantId": tid})["items"].([]any)
+	require.Len(t, listed, 2)
+	assert.Equal(t, "child", listed[0].(map[string]any)["slug"])
+	assert.Equal(t, "sensor", listed[1].(map[string]any)["slug"])
+
+	// Another tenant lists none of them, and cannot delete them.
+	assert.Equal(t, []any{}, h.mustQuery("roles.list", map[string]any{"tenantId": other})["items"])
+
+	_, err := h.command("roles.delete", map[string]any{"tenantId": other, "roleSlug": "sensor"})
+	requireCode(t, dashcontract.CodeNotFound, err)
+
+	// Errors.
+	_, err = h.command("roles.create", map[string]any{"tenantId": tid, "slug": "sensor"})
+	requireCode(t, dashcontract.CodeConflict, err)
+
+	for _, in := range []map[string]any{
+		{"tenantId": tid},
+		{"tenantId": tid, "slug": "Bad Slug"},
+		{"tenantId": tid, "slug": "ok", "publish": []string{"a/#/b"}},
+		{"tenantId": tid, "slug": "ok", "parentSlug": "ghost"},
+	} {
+		_, err = h.command("roles.create", in)
+		requireCode(t, dashcontract.CodeBadRequest, err)
+	}
+
+	_, err = h.command("roles.delete", map[string]any{"tenantId": tid})
+	requireCode(t, dashcontract.CodeBadRequest, err)
+
+	// A role a device holds, and a role that is a parent, cannot go.
+	did := h.provision(tid, "d1")["device"].(map[string]any)["id"].(string)
+	h.mustCommand("devices.roles.set", map[string]any{"tenantId": tid, "deviceId": did, "roles": []string{"child"}})
+
+	_, err = h.command("roles.delete", map[string]any{"tenantId": tid, "roleSlug": "child"})
+	requireCode(t, dashcontract.CodeConflict, err)
+
+	_, err = h.command("roles.delete", map[string]any{"tenantId": tid, "roleSlug": "sensor"})
+	requireCode(t, dashcontract.CodeConflict, err)
+
+	h.mustCommand("devices.roles.set", map[string]any{"tenantId": tid, "deviceId": did, "roles": []string{}})
+	assert.Equal(t, map[string]any{"ok": true}, h.mustCommand("roles.delete", map[string]any{"tenantId": tid, "roleSlug": "child"}))
+	assert.Equal(t, map[string]any{"ok": true}, h.mustCommand("roles.delete", map[string]any{"tenantId": tid, "roleSlug": "sensor"}))
+
+	_, err = h.query("roles.topics.get", map[string]any{"tenantId": tid, "roleSlug": "sensor"})
+	requireCode(t, dashcontract.CodeNotFound, err)
+
+	assert.Equal(t, []any{}, h.mustQuery("roles.list", map[string]any{"tenantId": tid})["items"])
 }
 
 // Everything that calls the broker answers UNAVAILABLE while it is stopped,

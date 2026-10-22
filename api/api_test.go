@@ -803,6 +803,12 @@ func TestTenantScopeInPath(t *testing.T) {
 	expect(t, e.do(http.MethodGet, pathA+"/roles/b-role/topics", nil), http.StatusNotFound)
 	expect(t, e.do(http.MethodPut, pathA+"/roles/b-role/topics", map[string]any{"publish": []string{"#"}}), http.StatusNotFound)
 
+	// Roles are per tenant: A lists none of B's and cannot delete one.
+	l = expect(t, e.do(http.MethodGet, pathA+"/roles", nil), http.StatusOK).json()
+	assert.Empty(t, l["items"])
+	expect(t, e.do(http.MethodDelete, pathA+"/roles/b-role", nil), http.StatusNotFound)
+	expect(t, e.do(http.MethodGet, tenantPath(b)+"/roles/b-role/topics", nil), http.StatusOK)
+
 	// Nothing of B's changed.
 	cb.requireAlive(t)
 	expect(t, e.do(http.MethodGet, tenantPath(b)+"/devices/"+devB.id, nil), http.StatusOK)
@@ -1108,4 +1114,116 @@ func TestPublishPinnedDeviceUsesItsClientIDGrant(t *testing.T) {
 	// Only the HTTP path skips the pin: this device still connects as pump-7.
 	c := e.connect(pinned, "pump-7")
 	c.requireAlive(t)
+}
+
+// ---------------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------------
+
+// A role made over REST carries its grants, can be given to a device that
+// then connects with them, and cannot be deleted until the device lets go.
+func TestRoleLifecycle(t *testing.T) {
+	e := newEnv(t)
+	tid := e.createTenant("aorg_1", nil)
+	roles := tenantPath(tid) + "/roles"
+
+	r := expect(t, e.do(http.MethodPost, roles, map[string]any{
+		"slug": "sensor", "name": "Sensor",
+		"publish": []string{"up/%c"}, "subscribe": []string{"down/%c"},
+	}), http.StatusCreated).json()
+	assert.Equal(t, "sensor", r["slug"])
+	assert.Equal(t, "Sensor", r["name"])
+	assert.Equal(t, []any{"up/%c"}, r["publish"])
+	assert.Equal(t, []any{"down/%c"}, r["subscribe"])
+	assert.NotContains(t, r, "parent_slug")
+
+	// The grants are the ones the topics route reads.
+	g := expect(t, e.do(http.MethodGet, roles+"/sensor/topics", nil), http.StatusOK).json()
+	assert.Equal(t, []any{"up/%c"}, g["publish"])
+
+	// A role with no grants and a parent.
+	r = expect(t, e.do(http.MethodPost, roles, map[string]any{"slug": "child", "parent_slug": "sensor"}), http.StatusCreated).json()
+	assert.Equal(t, "child", r["name"], "the name defaults to the slug")
+	assert.Equal(t, "sensor", r["parent_slug"])
+	assert.Equal(t, []any{}, r["publish"])
+
+	l := expect(t, e.do(http.MethodGet, roles, nil), http.StatusOK).json()
+	items := l["items"].([]any)
+	require.Len(t, items, 2)
+	assert.Equal(t, "child", items[0].(map[string]any)["slug"], "sorted by slug")
+	assert.Equal(t, "sensor", items[1].(map[string]any)["slug"])
+
+	// A device holding it publishes under its grant.
+	d := e.provision(tid, "pump", map[string]any{"client_id": "pump-1", "roles": []string{"sensor"}})
+	c := e.connect(d, "pump-1")
+	c.publishRetained(t, "up/pump-1", "1")
+
+	ret := expect(t, e.do(http.MethodGet, tenantPath(tid)+"/retained", nil), http.StatusOK).json()
+	require.Len(t, ret["items"], 1, "the grant let the publish through")
+
+	// It is in use, so the delete is refused and changes nothing.
+	expect(t, e.do(http.MethodDelete, roles+"/sensor", nil), http.StatusConflict)
+	expect(t, e.do(http.MethodGet, roles+"/sensor/topics", nil), http.StatusOK)
+
+	// The device lets go; the child still names it as its parent.
+	expect(t, e.do(http.MethodPut, tenantPath(tid)+"/devices/"+d.id+"/roles", map[string]any{"roles": []string{}}), http.StatusOK)
+	expect(t, e.do(http.MethodDelete, roles+"/sensor", nil), http.StatusConflict)
+
+	expect(t, e.do(http.MethodDelete, roles+"/child", nil), http.StatusNoContent)
+	expect(t, e.do(http.MethodDelete, roles+"/sensor", nil), http.StatusNoContent)
+	expect(t, e.do(http.MethodDelete, roles+"/sensor", nil), http.StatusNotFound)
+	expect(t, e.do(http.MethodGet, roles+"/sensor/topics", nil), http.StatusNotFound)
+
+	l = expect(t, e.do(http.MethodGet, roles, nil), http.StatusOK).json()
+	assert.Equal(t, []any{}, l["items"], "an empty list is [] and not null")
+}
+
+func TestRoleCreateErrors(t *testing.T) {
+	e := newEnv(t)
+	tid := e.createTenant("aorg_1", nil)
+	roles := tenantPath(tid) + "/roles"
+
+	expect(t, e.do(http.MethodPost, roles, map[string]any{"slug": "sensor"}), http.StatusCreated)
+
+	// A slug the tenant already uses.
+	expect(t, e.do(http.MethodPost, roles, map[string]any{"slug": "sensor"}), http.StatusConflict)
+
+	for name, body := range map[string]map[string]any{
+		"missing slug":   {"name": "x"},
+		"bad slug":       {"slug": "Not A Slug"},
+		"bad filter":     {"slug": "ok", "publish": []string{"a/#/b"}},
+		"unknown parent": {"slug": "ok", "parent_slug": "ghost"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			expect(t, e.do(http.MethodPost, roles, body), http.StatusBadRequest)
+		})
+	}
+
+	// Nothing but the first role was stored.
+	l := expect(t, e.do(http.MethodGet, roles, nil), http.StatusOK).json()
+	assert.Len(t, l["items"], 1)
+
+	// A malformed or unknown tenant.
+	expect(t, e.do(http.MethodPost, "/tether/v1/tenants/not-an-id/roles", map[string]any{"slug": "x"}), http.StatusBadRequest)
+	expect(t, e.do(http.MethodPost, tenantPath("ttnt_01h2xcejqtf2nbrexx3vqjhp41")+"/roles", map[string]any{"slug": "x"}), http.StatusNotFound)
+	expect(t, e.do(http.MethodGet, tenantPath("ttnt_01h2xcejqtf2nbrexx3vqjhp41")+"/roles", nil), http.StatusNotFound)
+	expect(t, e.do(http.MethodDelete, tenantPath("ttnt_01h2xcejqtf2nbrexx3vqjhp41")+"/roles/sensor", nil), http.StatusNotFound)
+}
+
+// Two tenants may use the same slug, and each sees only its own.
+func TestRolesSameSlugInTwoTenants(t *testing.T) {
+	e := newEnv(t)
+	a := e.createTenant("aorg_1", nil)
+	b := e.createTenant("aorg_2", nil)
+
+	expect(t, e.do(http.MethodPost, tenantPath(a)+"/roles", map[string]any{"slug": "sensor", "publish": []string{"a"}}), http.StatusCreated)
+	expect(t, e.do(http.MethodPost, tenantPath(b)+"/roles", map[string]any{"slug": "sensor", "publish": []string{"b"}}), http.StatusCreated)
+
+	ga := expect(t, e.do(http.MethodGet, tenantPath(a)+"/roles/sensor/topics", nil), http.StatusOK).json()
+	gb := expect(t, e.do(http.MethodGet, tenantPath(b)+"/roles/sensor/topics", nil), http.StatusOK).json()
+	assert.Equal(t, []any{"a"}, ga["publish"])
+	assert.Equal(t, []any{"b"}, gb["publish"])
+
+	expect(t, e.do(http.MethodDelete, tenantPath(a)+"/roles/sensor", nil), http.StatusNoContent)
+	expect(t, e.do(http.MethodGet, tenantPath(b)+"/roles/sensor/topics", nil), http.StatusOK)
 }

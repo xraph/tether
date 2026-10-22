@@ -22,7 +22,7 @@ import (
 	"github.com/xraph/tether/store/memory"
 )
 
-// Register mounts the brief's routes and nothing else.
+// Register mounts the documented routes and nothing else.
 func TestRegisterMountsExactlyTheBriefsRoutes(t *testing.T) {
 	st := memory.New()
 	t.Cleanup(func() { _ = st.Close() })
@@ -65,6 +65,8 @@ func TestRegisterMountsExactlyTheBriefsRoutes(t *testing.T) {
 		"/tether/v1/tenants/:tenantId/devices/:deviceId/rotate": {"POST"},
 		"/tether/v1/tenants/:tenantId/devices/:deviceId/revoke": {"POST"},
 		"/tether/v1/tenants/:tenantId/devices/:deviceId/roles":  {"PUT"},
+		"/tether/v1/tenants/:tenantId/roles":                    {"POST", "GET"},
+		"/tether/v1/tenants/:tenantId/roles/:roleSlug":          {"DELETE"},
 		"/tether/v1/tenants/:tenantId/roles/:roleSlug/topics":   {"GET", "PUT"},
 		"/tether/v1/tenants/:tenantId/clients":                  {"GET"},
 		"/tether/v1/tenants/:tenantId/clients/:clientId/kick":   {"POST"},
@@ -93,5 +95,5 @@ func TestRegisterMountsExactlyTheBriefsRoutes(t *testing.T) {
 		n += len(methods)
 	}
 
-	assert.Len(t, got, n, "no route beyond the brief's")
+	assert.Len(t, got, n, "no route beyond the documented ones")
 }

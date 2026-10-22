@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/perm
 
-Reads and writes a role's MQTT topic grants in warden role metadata. Imports warden, acl, auth, scope, tenant, topic and the root package; it does not import broker (a test asserts `*Loader` satisfies `broker.PermLoader`).
+Manages a tenant's roles and their MQTT topic grants in warden role metadata (create, list, delete a role; read and replace its grants). Imports warden, acl, auth, scope, tenant, topic and the root package; it does not import broker (a test asserts `*Loader` satisfies `broker.PermLoader`).
 
 Metadata shape, under `perm.MetadataKey` ("tether"): `{"publish": [...], "subscribe": [...]}`, with the `%c` and `%u` placeholders that `acl.Compile` expands.
 
@@ -10,5 +10,10 @@ Metadata shape, under `perm.MetadataKey` ("tether"): `{"publish": [...], "subscr
 - `NewLoader(eng *warden.Engine, opts ...LoaderOption) *Loader`; `WithLogger(*slog.Logger)` (default discards).
 - `(*Loader).Load(ctx, *auth.Identity) (acl.Rules, []string, error)`: the broker's `PermLoader`. Runs `eng.SubjectRoles(scope.With(ctx, AppID, ExternalID), warden.SubjectAPIKey, PrincipalID)`, merges the `all` roles' grants with `acl.Merge`, returns the ID of every role in `all`. A role with malformed grants is skipped (slug logged at warn) but its ID is still returned, so one bad role cannot lock a device out of the others. A nil identity, no tenant, a non-"api_key" kind or an empty principal ID wraps `tether.ErrInvalidInput`.
 - `NewRoles(eng) *Roles`; `GetRules(ctx, t, slug)` and `SetRules(ctx, t, slug, rules)`: roles are looked up by slug in the tenant root namespace ("") with warden tenant ID `t.ExternalID`. A missing role is `tether.ErrNotFound`. `SetRules` checks every filter with `topic.Valid(f, true, 0)` first (error names the filter, wraps `tether.ErrInvalidInput`, nothing written), copies the metadata map (stores may return the one they hold), keeps other keys, replaces `tether`, calls `UpdateRole`, then `eng.Plugins().EmitRoleUpdated` (nil-guarded) and `eng.InvalidateTenant`, because warden store writes fire no hooks and leave its cache alone.
+
+- `Roles.Create(ctx, t, RoleInput{Slug, Name, ParentSlug string; Rules acl.Rules}) (*RoleInfo, error)` (R19): creates a warden role in the tenant root namespace (warden tenant ID `t.ExternalID`). Slug required, 1 to 63 chars of `a-z0-9_-`, starting with a letter or digit; name defaults to the slug; every filter must pass `topic.Valid`; a parent must exist. All of those are `tether.ErrInvalidInput` and nothing is written. A taken slug (`warden.ErrAlreadyExists`) is `tether.ErrConflict`. Grants are stored under `MetadataKey` (always, even empty). Emits `OnRoleCreated` and calls `eng.InvalidateTenant`, because warden store writes do neither.
+- `Roles.List(ctx, t) ([]RoleInfo, error)`: every root-namespace role of the tenant, sorted by slug, never nil, paged through warden 200 at a time. A role whose grants metadata is malformed is listed with empty grants (the loader grants it nothing too).
+- `Roles.Delete(ctx, t, slug) error`: `tether.ErrNotFound` for no such role; `tether.ErrConflict` while any warden assignment holds it (`ListSubjectsForRole`), while another role names it as `ParentSlug` (`ListChildRoles`), or for a system role; nothing changes then. Emits `OnRoleDeleted` and invalidates the tenant. The checks and the delete are separate warden calls, so an assignment made in between is not caught.
+- `RoleInfo{Slug, Name, ParentSlug string; acl.Rules}`: JSON `slug`, `name`, `parent_slug` (omitempty), and `publish`, `subscribe` flat (the embedded rules).
 
 Limits: `SetRules` is read-modify-write with no lock, so concurrent writes to one role can lose one. It does not reject `$share/...` grants; `acl.Compile` drops them.

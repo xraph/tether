@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/warden"
+	wid "github.com/xraph/warden/id"
 	"github.com/xraph/warden/keysmithbridge"
 	"github.com/xraph/warden/role"
 	wmemory "github.com/xraph/warden/store/memory"
@@ -35,10 +37,37 @@ const (
 // The broker consumes the loader through its own interface.
 var _ broker.PermLoader = (*perm.Loader)(nil)
 
-// updateRecorder is a warden plugin that records OnRoleUpdated calls.
+// updateRecorder is a warden plugin that records role hook calls.
 type updateRecorder struct {
 	mu      sync.Mutex
 	updated []*role.Role
+	created []*role.Role
+	deleted []wid.RoleID
+}
+
+func (u *updateRecorder) OnRoleCreated(_ context.Context, r *role.Role) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.created = append(u.created, r)
+
+	return nil
+}
+
+func (u *updateRecorder) OnRoleDeleted(_ context.Context, rid wid.RoleID) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.deleted = append(u.deleted, rid)
+
+	return nil
+}
+
+func (u *updateRecorder) hooks() (created []*role.Role, deleted []wid.RoleID) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	return append([]*role.Role(nil), u.created...), append([]wid.RoleID(nil), u.deleted...)
 }
 
 func (*updateRecorder) Name() string { return "update-recorder" }
@@ -440,4 +469,275 @@ func TestRolesIsTenantScoped(t *testing.T) {
 
 	_, err := perm.NewRoles(e.eng).GetRules(t.Context(), other, "device")
 	assert.ErrorIs(t, err, tether.ErrNotFound)
+}
+
+func TestCreateStoresRoleAndEmits(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	got, err := roles.Create(t.Context(), e.ten, perm.RoleInput{
+		Slug:  "sensor",
+		Name:  "Sensor",
+		Rules: acl.Rules{Publish: []string{"sensors/%c/up"}, Subscribe: []string{"sensors/%c/#"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, &perm.RoleInfo{
+		Slug: "sensor", Name: "Sensor",
+		Rules: acl.Rules{Publish: []string{"sensors/%c/up"}, Subscribe: []string{"sensors/%c/#"}},
+	}, got)
+
+	// It is a warden role in the tenant root namespace, and the same code
+	// paths that read grants see it.
+	stored, err := e.eng.Store().GetRoleBySlug(e.ctx, testOrg, "", "sensor")
+	require.NoError(t, err)
+	assert.Equal(t, testApp, stored.AppID)
+	assert.False(t, stored.ID.IsNil())
+
+	rules, err := roles.GetRules(t.Context(), e.ten, "sensor")
+	require.NoError(t, err)
+	assert.Equal(t, got.Rules, rules)
+
+	created, _ := e.rec.hooks()
+	require.Len(t, created, 1, "OnRoleCreated fires once")
+	assert.Equal(t, "sensor", created[0].Slug)
+
+	// A device holding it gets the grants through the loader.
+	e.assign(t, "sensor")
+
+	loaded, ids, err := perm.NewLoader(e.eng).Load(t.Context(), e.identity())
+	require.NoError(t, err)
+	assert.Equal(t, rules.Publish, loaded.Publish)
+	assert.Equal(t, []string{stored.ID.String()}, ids)
+}
+
+func TestCreateDefaultsAndEmptyRules(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	got, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "bare"})
+	require.NoError(t, err)
+	assert.Equal(t, "bare", got.Name, "the name defaults to the slug")
+	assert.Equal(t, []string{}, got.Publish, "lists are never nil")
+	assert.Equal(t, []string{}, got.Subscribe)
+}
+
+func TestCreateRejectsBadInput(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	for name, in := range map[string]perm.RoleInput{
+		"empty slug":     {},
+		"upper case":     {Slug: "Sensor"},
+		"slash":          {Slug: "a/b"},
+		"space":          {Slug: "a b"},
+		"leading dash":   {Slug: "-a"},
+		"too long":       {Slug: strings.Repeat("a", 64)},
+		"bad publish":    {Slug: "ok", Rules: acl.Rules{Publish: []string{"a/#/b"}}},
+		"bad subscribe":  {Slug: "ok", Rules: acl.Rules{Subscribe: []string{""}}},
+		"unknown parent": {Slug: "ok", ParentSlug: "ghost"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := roles.Create(t.Context(), e.ten, in)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, tether.ErrInvalidInput)
+		})
+	}
+
+	_, err := roles.Create(t.Context(), nil, perm.RoleInput{Slug: "ok"})
+	assert.ErrorIs(t, err, tether.ErrInvalidInput)
+
+	got, err := roles.List(t.Context(), e.ten)
+	require.NoError(t, err)
+	assert.Empty(t, got, "a rejected create stores nothing")
+
+	created, _ := e.rec.hooks()
+	assert.Empty(t, created, "and emits nothing")
+}
+
+func TestCreateDuplicateSlugIsConflict(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+
+	_, err = roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, tether.ErrConflict)
+
+	// Another tenant may use the same slug.
+	other := &tenant.Tenant{ID: id.NewTenantID(), AppID: testApp, ExternalID: "aorg_other", Enabled: true}
+	_, err = roles.Create(t.Context(), other, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+}
+
+func TestCreateWithParentInherits(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "base", Rules: acl.Rules{Publish: []string{"base/up"}}})
+	require.NoError(t, err)
+
+	child, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "child", ParentSlug: "base", Rules: acl.Rules{Publish: []string{"child/up"}}})
+	require.NoError(t, err)
+	assert.Equal(t, "base", child.ParentSlug)
+
+	e.assign(t, "child")
+
+	loaded, _, err := perm.NewLoader(e.eng).Load(t.Context(), e.identity())
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"base/up", "child/up"}, loaded.Publish)
+}
+
+func TestListSortedAndTenantScoped(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	none, err := roles.List(t.Context(), e.ten)
+	require.NoError(t, err)
+	assert.NotNil(t, none, "an empty list is not nil")
+	assert.Empty(t, none)
+
+	for _, slug := range []string{"zeta", "alpha", "mid"} {
+		_, err = roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: slug, Rules: acl.Rules{Publish: []string{slug + "/up"}}})
+		require.NoError(t, err)
+	}
+
+	// A role of another tenant, and one in a namespace below the root, are
+	// not listed.
+	other := &tenant.Tenant{ID: id.NewTenantID(), AppID: testApp, ExternalID: "aorg_other", Enabled: true}
+	_, err = roles.Create(t.Context(), other, perm.RoleInput{Slug: "theirs"})
+	require.NoError(t, err)
+
+	require.NoError(t, e.eng.Store().CreateRole(e.ctx, &role.Role{
+		TenantID: testOrg, AppID: testApp, NamespacePath: "team/a", Name: "nested", Slug: "nested",
+	}))
+
+	got, err := roles.List(t.Context(), e.ten)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+	assert.Equal(t, []string{"alpha", "mid", "zeta"}, []string{got[0].Slug, got[1].Slug, got[2].Slug})
+	assert.Equal(t, []string{"alpha/up"}, got[0].Publish)
+
+	theirs, err := roles.List(t.Context(), other)
+	require.NoError(t, err)
+	require.Len(t, theirs, 1)
+	assert.Equal(t, "theirs", theirs[0].Slug)
+}
+
+func TestListShowsMalformedRoleWithNoGrants(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	e.createRole(t, "broken", "", map[string]any{perm.MetadataKey: "everything"})
+
+	got, err := perm.NewRoles(e.eng).List(t.Context(), e.ten)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "broken", got[0].Slug)
+	assert.Equal(t, acl.Rules{Publish: []string{}, Subscribe: []string{}}, got[0].Rules)
+}
+
+func TestDeleteRemovesRoleAndEmits(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+
+	rid := e.roleID(t, "sensor")
+
+	require.NoError(t, roles.Delete(t.Context(), e.ten, "sensor"))
+
+	_, err = roles.GetRules(t.Context(), e.ten, "sensor")
+	assert.ErrorIs(t, err, tether.ErrNotFound)
+
+	_, deleted := e.rec.hooks()
+	require.Len(t, deleted, 1, "OnRoleDeleted fires once")
+	assert.Equal(t, rid, deleted[0].String())
+
+	// Deleting it again is a not found, and the slug can be reused.
+	assert.ErrorIs(t, roles.Delete(t.Context(), e.ten, "sensor"), tether.ErrNotFound)
+
+	_, err = roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+}
+
+func TestDeleteRefusedWhileAssigned(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+
+	e.assign(t, "sensor")
+
+	err = roles.Delete(t.Context(), e.ten, "sensor")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, tether.ErrConflict)
+
+	_, deleted := e.rec.hooks()
+	assert.Empty(t, deleted, "a refused delete emits nothing")
+
+	_, err = roles.GetRules(t.Context(), e.ten, "sensor")
+	require.NoError(t, err, "and removes nothing")
+
+	// Once the key lets go, the delete goes through.
+	require.NoError(t, keysmithbridge.New(e.eng).UnassignRoleFromAPIKey(e.ctx, testOrg, testKey))
+	require.NoError(t, roles.Delete(t.Context(), e.ten, "sensor"))
+}
+
+func TestDeleteRefusedWhileParent(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "base"})
+	require.NoError(t, err)
+
+	_, err = roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "child", ParentSlug: "base"})
+	require.NoError(t, err)
+
+	assert.ErrorIs(t, roles.Delete(t.Context(), e.ten, "base"), tether.ErrConflict)
+	require.NoError(t, roles.Delete(t.Context(), e.ten, "child"))
+	require.NoError(t, roles.Delete(t.Context(), e.ten, "base"))
+}
+
+func TestDeleteIsTenantScoped(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	roles := perm.NewRoles(e.eng)
+
+	_, err := roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "sensor"})
+	require.NoError(t, err)
+
+	other := &tenant.Tenant{ID: id.NewTenantID(), AppID: testApp, ExternalID: "aorg_other", Enabled: true}
+
+	assert.ErrorIs(t, roles.Delete(t.Context(), other, "sensor"), tether.ErrNotFound)
+
+	_, err = roles.GetRules(t.Context(), e.ten, "sensor")
+	require.NoError(t, err, "the other tenant's delete left it alone")
+
+	assert.ErrorIs(t, roles.Delete(t.Context(), nil, "sensor"), tether.ErrInvalidInput)
+	assert.ErrorIs(t, roles.Delete(t.Context(), e.ten, ""), tether.ErrInvalidInput)
 }

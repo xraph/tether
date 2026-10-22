@@ -101,10 +101,10 @@ func TestDashboardDiscoveryPublishesTetherContract(t *testing.T) {
 	// contributor name: a partial manifest still produces an entry.
 	assert.ElementsMatch(t, []string{
 		"overview.stats", "tenants.list", "tenants.get", "devices.list",
-		"devices.get", "roles.topics.get", "clients.list", "retained.list",
+		"devices.get", "roles.list", "roles.topics.get", "clients.list", "retained.list",
 		"tenants.create", "tenants.update", "tenants.delete",
 		"devices.provision", "devices.rotate", "devices.revoke",
-		"devices.delete", "devices.roles.set", "roles.topics.set",
+		"devices.delete", "devices.roles.set", "roles.create", "roles.delete", "roles.topics.set",
 		"clients.kick", "sessions.delete", "retained.delete",
 	}, intents)
 }

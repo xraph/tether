@@ -24,6 +24,7 @@ intents:
   - { name: tenants.get,       kind: query, version: 1, capability: read }
   - { name: devices.list,      kind: query, version: 1, capability: read }
   - { name: devices.get,       kind: query, version: 1, capability: read }
+  - { name: roles.list,        kind: query, version: 1, capability: read }
   - { name: roles.topics.get,  kind: query, version: 1, capability: read }
   - { name: clients.list,      kind: query, version: 1, capability: read }
   - { name: retained.list,     kind: query, version: 1, capability: read }
@@ -51,9 +52,14 @@ intents:
   - { name: devices.roles.set, kind: command, version: 1, capability: write,
       invalidates: [devices.list, devices.get] }
 
-  # Topic grants of a role.
+  # Roles and their topic grants. A role in use by a device cannot be
+  # deleted (CONFLICT), nor one that is another role's parent.
+  - { name: roles.create, kind: command, version: 1, capability: write,
+      invalidates: [roles.list, roles.topics.get] }
+  - { name: roles.delete, kind: command, version: 1, capability: write,
+      invalidates: [roles.list, roles.topics.get] }
   - { name: roles.topics.set, kind: command, version: 1, capability: write,
-      invalidates: [roles.topics.get] }
+      invalidates: [roles.list, roles.topics.get] }
 
   # Live clients and retained messages.
   - { name: clients.kick, kind: command, version: 1, capability: write,

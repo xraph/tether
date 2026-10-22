@@ -8,6 +8,7 @@ import (
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/device"
+	"github.com/xraph/tether/perm"
 	"github.com/xraph/tether/tenant"
 )
 
@@ -106,6 +107,15 @@ type TopicRules struct {
 	Subscribe []string `json:"subscribe"`
 }
 
+// Role is a role of a tenant with its topic grants. Each list is never null.
+type Role struct {
+	Slug       string   `json:"slug"`
+	Name       string   `json:"name"`
+	ParentSlug string   `json:"parentSlug,omitempty"`
+	Publish    []string `json:"publish"`
+	Subscribe  []string `json:"subscribe"`
+}
+
 // Lists. Paged lists echo the effective limit and offset, so a client knows
 // the page size when it sent none: a full page may have a next one.
 type (
@@ -126,6 +136,11 @@ type (
 	// ClientList is the answer of clients.list.
 	ClientList struct {
 		Items []Client `json:"items"`
+	}
+
+	// RoleList is the answer of roles.list.
+	RoleList struct {
+		Items []Role `json:"items"`
 	}
 
 	// RetainedList is the answer of retained.list.
@@ -215,10 +230,22 @@ type SetDeviceRolesInput struct {
 	Roles    []string `json:"roles"`
 }
 
-// RoleRef names a role: roles.topics.get.
+// RoleRef names a role: roles.topics.get and roles.delete.
 type RoleRef struct {
 	TenantID string `json:"tenantId"`
 	RoleSlug string `json:"roleSlug"`
+}
+
+// CreateRoleInput is roles.create. Name defaults to the slug, ParentSlug
+// names a role of the same tenant to inherit from, and the lists are the
+// role's topic grants (both optional, empty grants nothing).
+type CreateRoleInput struct {
+	TenantID   string   `json:"tenantId"`
+	Slug       string   `json:"slug"`
+	Name       string   `json:"name"`
+	ParentSlug string   `json:"parentSlug"`
+	Publish    []string `json:"publish"`
+	Subscribe  []string `json:"subscribe"`
 }
 
 // SetTopicsInput is roles.topics.set. It replaces both lists, so both are
@@ -320,6 +347,16 @@ func fromDevice(d *device.Device) Device {
 		Metadata:  d.Metadata,
 		CreatedAt: d.CreatedAt,
 		UpdatedAt: d.UpdatedAt,
+	}
+}
+
+func fromRole(r *perm.RoleInfo) Role {
+	return Role{
+		Slug:       r.Slug,
+		Name:       r.Name,
+		ParentSlug: r.ParentSlug,
+		Publish:    strs(r.Publish),
+		Subscribe:  strs(r.Subscribe),
 	}
 }
 

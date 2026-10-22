@@ -20,10 +20,13 @@ import (
 	"log/slog"
 	"maps"
 	"reflect"
+	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/xraph/warden"
+	wid "github.com/xraph/warden/id"
 	"github.com/xraph/warden/role"
 
 	"github.com/xraph/tether"
@@ -231,10 +234,11 @@ func (l *Loader) Load(ctx context.Context, ident *auth.Identity) (acl.Rules, []s
 	return acl.Merge(rules...), roleIDs, nil
 }
 
-// Roles reads and writes the topic grants of roles in the tenant root
-// namespace. It is safe for concurrent use, but a write is a read-modify-write
-// of the role's metadata, so two concurrent writes to the same role can lose
-// one of them.
+// Roles manages the roles of a tenant in its root namespace and their topic
+// grants: create, list and delete a role, and read and replace its grants.
+// It is safe for concurrent use, but a write to a role's grants is a
+// read-modify-write of its metadata, so two concurrent writes to the same role
+// can lose one of them.
 type Roles struct {
 	eng *warden.Engine
 }
@@ -304,6 +308,220 @@ func (r *Roles) SetRules(ctx context.Context, t *tenant.Tenant, roleSlug string,
 	r.eng.InvalidateTenant(ctx, t.ExternalID)
 
 	return nil
+}
+
+// maxSlugLen is the longest role slug Create accepts.
+const maxSlugLen = 63
+
+// slugPattern is what Create accepts as a slug: lower case letters, digits,
+// underscores and hyphens, starting with a letter or digit. It is a path
+// segment of the REST API, so it needs no escaping.
+var slugPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+
+// listPage is how many roles List asks warden for at a time.
+const listPage = 200
+
+// RoleInput is what [Roles.Create] takes. Slug is required and Name defaults
+// to it. ParentSlug names a role of the same tenant whose grants this one
+// inherits. Rules are the topic grants, which may be empty.
+type RoleInput struct {
+	Slug       string
+	Name       string
+	ParentSlug string
+	Rules      acl.Rules
+}
+
+// RoleInfo is a role as the admin API shows it. The grants are empty for a role
+// whose grants metadata is malformed, which is also what the broker grants it.
+type RoleInfo struct {
+	Slug       string `json:"slug"`
+	Name       string `json:"name"`
+	ParentSlug string `json:"parent_slug,omitempty"`
+
+	// Rules is embedded, so the JSON has "publish" and "subscribe" at the
+	// top level, the same shape the topics routes use.
+	acl.Rules
+}
+
+// Create makes a role in t's root namespace and returns it. The slug must be
+// 1 to 63 characters of a-z, 0-9, "_" and "-", starting with a letter or
+// digit; every filter must pass topic.Valid as a filter; a parent that does
+// not exist is an error. All of those wrap [tether.ErrInvalidInput], and
+// nothing is written. A slug the tenant already uses is [tether.ErrConflict].
+//
+// Warden's store writes fire no plugin hooks and do not touch its decision
+// cache, so Create emits OnRoleCreated itself and clears the tenant's cached
+// decisions.
+func (r *Roles) Create(ctx context.Context, t *tenant.Tenant, in RoleInput) (*RoleInfo, error) {
+	if t == nil {
+		return nil, fmt.Errorf("%w: perm: tenant is required", tether.ErrInvalidInput)
+	}
+
+	slug := strings.TrimSpace(in.Slug)
+
+	switch {
+	case slug == "":
+		return nil, fmt.Errorf("%w: perm: role slug is required", tether.ErrInvalidInput)
+	case len(slug) > maxSlugLen || !slugPattern.MatchString(slug):
+		return nil, fmt.Errorf("%w: perm: role slug %q must be 1 to %d characters of a-z, 0-9, _ and -, starting with a letter or digit",
+			tether.ErrInvalidInput, slug, maxSlugLen)
+	}
+
+	for _, f := range slices.Concat(in.Rules.Publish, in.Rules.Subscribe) {
+		if err := topic.Valid(f, true, 0); err != nil {
+			return nil, fmt.Errorf("tether/perm: grant %q: %w", f, err)
+		}
+	}
+
+	ctx = scope.With(ctx, t.AppID, t.ExternalID)
+
+	if in.ParentSlug != "" {
+		if _, err := r.eng.Store().GetRoleBySlug(ctx, t.ExternalID, rootNamespace, in.ParentSlug); err != nil {
+			if errors.Is(err, warden.ErrNotFound) {
+				return nil, fmt.Errorf("%w: perm: parent role %q does not exist", tether.ErrInvalidInput, in.ParentSlug)
+			}
+
+			return nil, fmt.Errorf("tether/perm: get parent role %q: %w", in.ParentSlug, err)
+		}
+	}
+
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		name = slug
+	}
+
+	now := time.Now().UTC()
+	rl := &role.Role{
+		ID:         wid.NewRoleID(),
+		TenantID:   t.ExternalID,
+		AppID:      t.AppID,
+		Name:       name,
+		Slug:       slug,
+		ParentSlug: in.ParentSlug,
+		Metadata: map[string]any{MetadataKey: map[string]any{
+			publishKey:   nonNil(in.Rules.Publish),
+			subscribeKey: nonNil(in.Rules.Subscribe),
+		}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	if err := r.eng.Store().CreateRole(ctx, rl); err != nil {
+		if errors.Is(err, warden.ErrAlreadyExists) {
+			return nil, fmt.Errorf("%w: perm: role %q already exists", tether.ErrConflict, slug)
+		}
+
+		return nil, fmt.Errorf("tether/perm: create role %q: %w", slug, err)
+	}
+
+	if p := r.eng.Plugins(); p != nil {
+		p.EmitRoleCreated(ctx, rl)
+	}
+
+	r.eng.InvalidateTenant(ctx, t.ExternalID)
+
+	return info(rl), nil
+}
+
+// List returns every role in t's root namespace, sorted by slug.
+func (r *Roles) List(ctx context.Context, t *tenant.Tenant) ([]RoleInfo, error) {
+	if t == nil {
+		return nil, fmt.Errorf("%w: perm: tenant is required", tether.ErrInvalidInput)
+	}
+
+	ctx = scope.With(ctx, t.AppID, t.ExternalID)
+	root := rootNamespace
+	out := []RoleInfo{}
+
+	for offset := 0; ; offset += listPage {
+		page, err := r.eng.Store().ListRoles(ctx, &role.ListFilter{
+			TenantID: t.ExternalID, NamespacePath: &root, Limit: listPage, Offset: offset,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("tether/perm: list roles: %w", err)
+		}
+
+		for _, rl := range page {
+			out = append(out, *info(rl))
+		}
+
+		if len(page) < listPage {
+			break
+		}
+	}
+
+	slices.SortFunc(out, func(a, b RoleInfo) int { return strings.Compare(a.Slug, b.Slug) })
+
+	return out, nil
+}
+
+// Delete removes the role with slug roleSlug from t. A role that does not
+// exist is [tether.ErrNotFound]. A role still assigned to an API key, or still
+// the parent of another role, is [tether.ErrConflict] and nothing changes:
+// take it off its devices first. A system role is a conflict too.
+//
+// Like Create, it emits the warden plugin hook (OnRoleDeleted) and clears the
+// tenant's cached decisions. The checks and the delete are separate warden
+// calls, so an assignment made in between is not caught.
+func (r *Roles) Delete(ctx context.Context, t *tenant.Tenant, roleSlug string) error {
+	rl, err := r.get(ctx, t, roleSlug)
+	if err != nil {
+		return err
+	}
+
+	ctx = scope.With(ctx, t.AppID, t.ExternalID)
+
+	assigned, err := r.eng.Store().ListSubjectsForRole(ctx, t.ExternalID, rl.ID)
+	if err != nil {
+		return fmt.Errorf("tether/perm: list assignments of role %q: %w", roleSlug, err)
+	}
+
+	if len(assigned) > 0 {
+		return fmt.Errorf("%w: perm: role %q is assigned to %d subject(s)", tether.ErrConflict, roleSlug, len(assigned))
+	}
+
+	children, err := r.eng.Store().ListChildRoles(ctx, t.ExternalID, roleSlug)
+	if err != nil {
+		return fmt.Errorf("tether/perm: list children of role %q: %w", roleSlug, err)
+	}
+
+	if len(children) > 0 {
+		return fmt.Errorf("%w: perm: role %q is the parent of %d role(s)", tether.ErrConflict, roleSlug, len(children))
+	}
+
+	if err := r.eng.Store().DeleteRole(ctx, t.ExternalID, rl.ID); err != nil {
+		switch {
+		case errors.Is(err, warden.ErrNotFound):
+			return fmt.Errorf("tether/perm: role %q: %w", roleSlug, tether.ErrNotFound)
+		case errors.Is(err, warden.ErrSystemRoleImmutable):
+			return fmt.Errorf("%w: perm: role %q is a system role", tether.ErrConflict, roleSlug)
+		}
+
+		return fmt.Errorf("tether/perm: delete role %q: %w", roleSlug, err)
+	}
+
+	if p := r.eng.Plugins(); p != nil {
+		p.EmitRoleDeleted(ctx, rl.ID)
+	}
+
+	r.eng.InvalidateTenant(ctx, t.ExternalID)
+
+	return nil
+}
+
+// info converts a warden role. Malformed grants read as none.
+func info(rl *role.Role) *RoleInfo {
+	rules, err := RulesFromMetadata(rl.Slug, rl.Metadata)
+	if err != nil {
+		rules = acl.Rules{}
+	}
+
+	return &RoleInfo{
+		Slug:       rl.Slug,
+		Name:       rl.Name,
+		ParentSlug: rl.ParentSlug,
+		Rules:      acl.Rules{Publish: nonNil(rules.Publish), Subscribe: nonNil(rules.Subscribe)},
+	}
 }
 
 // get loads the role, mapping warden's not-found to tether's.

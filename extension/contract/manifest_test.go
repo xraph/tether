@@ -18,7 +18,7 @@ func TestEmbeddedManifestLoadsAndValidates(t *testing.T) {
 
 	assert.Equal(t, ContributorName, m.Contributor.Name)
 	assert.Equal(t, []string{"tether.read", "tether.write"}, m.Contributor.Capabilities)
-	assert.Len(t, m.Intents, 20)
+	assert.Len(t, m.Intents, 23)
 
 	require.NotNil(t, m.Contributor.App)
 	assert.Equal(t, "Tether", m.Contributor.App.DisplayName)
@@ -61,8 +61,8 @@ func TestManifestInvalidatesNameQueries(t *testing.T) {
 		}
 	}
 
-	assert.Equal(t, 12, commands)
-	assert.Len(t, queries, 8)
+	assert.Equal(t, 14, commands)
+	assert.Len(t, queries, 9)
 }
 
 // The manifest and the registered handlers must list the same intents.
