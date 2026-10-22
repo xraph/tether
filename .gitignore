@@ -1,0 +1,12 @@
+# ─── Local agent config ─────────────────────────────────────
+.claude/
+
+# ─── Build output ───────────────────────────────────────────
+/bin/
+tmp/
+coverage.out
+coverage.html
+build-errors.log
+
+# ─── OS ─────────────────────────────────────────────────────
+.DS_Store

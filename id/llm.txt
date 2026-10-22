@@ -1,0 +1,11 @@
+# tether/id
+
+Import: github.com/xraph/tether/id
+
+One `ID` struct over go.jetify.com/typeid/v2. Zero value is `Nil`; `ID.String()` is "" for Nil.
+
+- Prefixes: `PrefixTenant` = "ttnt", `PrefixDevice` = "tdev".
+- Aliases: `TenantID = ID`, `DeviceID = ID` (the prefix is checked at parse time, not by the type system).
+- Constructors: `New(prefix)`, `NewTenantID()`, `NewDeviceID()`.
+- Parsers: `Parse(s)`, `ParseWithPrefix(s, prefix)`, `ParseTenantID(s)`, `ParseDeviceID(s)`.
+- Methods: `String`, `Prefix`, `IsNil`, `MarshalText`, `UnmarshalText`, `Value` (nil for Nil), `Scan` (string or []byte; nil gives Nil).

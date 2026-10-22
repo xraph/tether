@@ -1,0 +1,13 @@
+# tether (root package)
+
+Import: github.com/xraph/tether
+
+Tether is a multi-tenant MQTT broker for Go. The root package currently exposes:
+
+- `Version` (const string): the current version, "0.1.0".
+- Sentinel errors, all `errors.New("tether: ...")`, matched with `errors.Is`:
+  `ErrNotFound`, `ErrConflict`, `ErrInvalidInput`, `ErrTenantDisabled`, `ErrNotAuthorized`.
+
+Store backends wrap these as `tether/<backend>: <op>: %w`.
+
+The broker, stores and Forge extension land in later tasks. Design: _project_files/TETHER-DESIGN.md.
