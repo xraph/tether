@@ -1,0 +1,13 @@
+# tether/store
+
+Import: github.com/xraph/tether/store
+
+`Store` embeds `tenant.Store` and `device.Store` and adds `Migrate(ctx)` (idempotent), `Ping(ctx)` and `Close()`. Backends:
+
+- `store/memory`: `memory.New() *Store`. In-process, mutex-guarded, copies (deep for device `Roles` and `Metadata`) on every read and write. Timestamps are UTC truncated to microseconds. `Close` only makes `Ping` fail. Methods return `ctx.Err()` for a cancelled context. Errors read `tether/memory: <op>: ... %w`.
+- `store/sqlite`, `store/postgres`: added in a later task.
+- `store/storetest`: `Run(t, newStore func(t *testing.T) store.Store)` is the conformance suite. It calls `Migrate`, uses only the `store.Store` interface, creates its own data with unique app, external and key IDs, and does not assume an empty database or any order beyond `CreatedAt` ascending then ID. `newStore` must register its own cleanup. Every backend runs it.
+
+Wire a backend with:
+
+    storetest.Run(t, func(t *testing.T) store.Store { s := memory.New(); t.Cleanup(func() { _ = s.Close() }); return s })

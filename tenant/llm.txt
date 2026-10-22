@@ -1,0 +1,16 @@
+# tether/tenant
+
+Import: github.com/xraph/tether/tenant
+
+Tenant model and store interface. Imports only `id`, so the root package can import it without a cycle.
+
+- `Tenant{ID id.TenantID, AppID, ExternalID, Name string, Enabled bool, Limits Limits, CreatedAt, UpdatedAt time.Time}`. The `(AppID, ExternalID)` pair is unique: it maps a tenant to the host application's own identifier.
+- `Limits{MaxConnections int, MessagesPerSecond float64, Burst int, MaxSessionExpiry time.Duration}`. Zero means "use the broker default", except `MaxConnections`, where zero means unlimited. Plain value types only: stores persist it as JSON.
+- `ListFilter{Limit, Offset int}`: Limit 0 is no limit, negative values are invalid input.
+- `Store`: `CreateTenant`, `GetTenant`, `GetTenantByExternal`, `UpdateTenant`, `DeleteTenant`, `ListTenants`.
+
+Contract (every backend passes `store/storetest`):
+- Missing record: error wrapping `tether.ErrNotFound` (Get, GetByExternal, Update, Delete). Duplicate ID or `(AppID, ExternalID)`, on Create or on Update moving onto another tenant's pair: `tether.ErrConflict`. Nil record or nil ID: `tether.ErrInvalidInput`.
+- Create sets `CreatedAt`/`UpdatedAt` on the caller's struct when zero and normalises set ones to UTC at microsecond precision. Update keeps the stored `CreatedAt`, sets `UpdatedAt` to now, and writes both back to the caller's struct.
+- `DeleteTenant` does not cascade. The service layer refuses to delete a tenant that still has devices.
+- `ListTenants` order is `CreatedAt` ascending, then ID.

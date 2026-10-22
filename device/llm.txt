@@ -1,0 +1,17 @@
+# tether/device
+
+Import: github.com/xraph/tether/device
+
+Device model and store interface. Imports only `id`, so the root package can import it without a cycle.
+
+- `Device{ID id.DeviceID, TenantID id.TenantID, Name, KeyID, ClientID string, Roles []string, Metadata map[string]any, CreatedAt, UpdatedAt time.Time}`. `KeyID` is the keysmith key ID (the MQTT username), unique across all tenants, never empty. `ClientID` empty means any MQTT client ID. `Roles` and `Metadata` stay JSON-compatible (strings, bools, float64, nested `map[string]any` and `[]any`) because SQL stores persist them as JSON.
+- `ListFilter{TenantID id.TenantID, Limit, Offset int}`: `TenantID` is required (zero is invalid input, never "all tenants"), Limit 0 is no limit, negative values are invalid.
+- `Store`: `CreateDevice`, `GetDevice(tenantID, deviceID)`, `GetDeviceByKey(keyID)`, `UpdateDevice`, `DeleteDevice(tenantID, deviceID)`, `ListDevices`, `CountDevices(tenantID)`.
+
+Contract (every backend passes `store/storetest`):
+- A device under another tenant is `tether.ErrNotFound` for Get, Update and Delete. Missing records wrap `tether.ErrNotFound` too.
+- Duplicate `KeyID` (Create, or Update onto another device's key) and duplicate device ID, under any tenant, wrap `tether.ErrConflict`. Deleting a device frees its `KeyID`.
+- Nil record, nil ID, nil TenantID or empty `KeyID` wraps `tether.ErrInvalidInput`.
+- The store does not check that the tenant exists. The service layer does.
+- Timestamps behave as in `tenant`: Create fills zero ones, Update keeps `CreatedAt` and bumps `UpdatedAt`.
+- `ListDevices` order is `CreatedAt` ascending, then ID. `GetDeviceByKey` is global: the result's `TenantID` says who owns the key.
