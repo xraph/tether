@@ -1,0 +1,15 @@
+# tether/acl
+
+Import: github.com/xraph/tether/acl
+
+Pure package (no mochi, no forge, no warden). Compiles a role's topic grants into a per-connection check. Grants and checked names are plain, tenant-relative names: the broker strips `$share/<group>/` and the tenant namespace before asking.
+
+- `Rules{Publish, Subscribe []string}` (json `publish`/`subscribe`): the warden role metadata shape. `Vars{ClientID, Username}`.
+- `Merge(rs ...Rules) Rules`: union, exact-string de-duplication, first-seen order, no shared memory with the inputs.
+- `Compile(r, v) *Set`: once per connection. Expands `%c` (client ID) and `%u` (username), every occurrence, scanning left to right. A `%` not followed by `c` or `u` stays literal (`%%c` is `%` plus the expanded `%c`).
+- A grant is dropped, never widened, when a placeholder it uses has an empty value or one holding `/`, `+`, `#` or NUL; when the expanded grant fails `topic.Valid(g, true, 0)`; or when it is in the `$share/...` form. A bad value only drops the grants that use that placeholder.
+- `(*Set).CanPublish(name)`: true if a publish grant `Match`es. False for an empty name or one holding `+` or `#`.
+- `(*Set).CanSubscribe(filterOrTopic)`: true if a subscribe grant `Covers` it. A literal topic is covered exactly when it matches, so one method serves SUBSCRIBE filters and delivery topics.
+- `(*Set).Dropped() []string`: the original unexpanded grants that were dropped, publish first then subscribe, input order, a copy. Log these.
+
+A nil or empty `*Set` allows nothing and no method panics on it. A Set is immutable after Compile, safe for concurrent use, and the two checks do not allocate. Normal `$` rules apply: a grant starting with `+` or `#` never covers or matches a name starting with `$`.
