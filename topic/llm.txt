@@ -1,0 +1,14 @@
+# tether/topic
+
+Import: github.com/xraph/tether/topic
+
+Pure package (no mochi, no forge). Tenant namespacing and MQTT topic matching. Levels split on "/". A tenant ID is a TypeID, so it is always one valid level.
+
+- `Namespace(tenant, name) string`: plain name -> `<tenant>/<name>`. First level starting with `$` (not `$share`) -> tenant inserted after it (`$SYS/x` -> `$SYS/<tenant>/x`, `$SYS` -> `$SYS/<tenant>`), so the "leading wildcard never matches `$`" rule survives and mochi's global `$SYS` stays out of tenant space. `$share/<group>/<filter>` keeps `$share/<group>/` and namespaces the filter part by the same rules. Call only on input that passed `Valid`.
+- `Strip(tenant, name) (string, bool)`: exact inverse. False for another tenant's name, mochi's own `$SYS/...`, a tenant that is only a prefix of a level, and a `<tenant>/$...` name (Namespace never produces one).
+- `Match(filter, name) bool`: `+` one level (empty included), `#` parent and below, last level only. A filter whose first level is `+` or `#` never matches a name whose first level starts with `$`.
+- `Covers(grant, filter) bool`: every topic `filter` can match is matched by `grant` (grant `#` covers the rest and the parent, grant `+` covers `+` or a literal, a literal covers itself, filter `#` needs grant `#` there). Same `$` rule as `Match`.
+- `Valid(name, isFilter, maxLen) error`: errors wrap `tether.ErrInvalidInput`. Non-empty, no NUL, byte length <= maxLen (0 = no limit). Names: no `+` or `#`, first level may not be `$share`. Filters: `+`/`#` whole levels, `#` last. `$share/<group>/<filter>`: group non-empty and wildcard-free, filter part non-empty, valid and not itself `$share`.
+
+`Match` and `Covers` take plain names: strip `$share/<group>/` before ACL checks.
+Fuzz targets: `FuzzNamespaceRoundTrip`, `FuzzCoversImpliesMatch` (fuzz_test.go).
