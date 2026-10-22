@@ -1,0 +1,12 @@
+# tether/limits
+
+Import: github.com/xraph/tether/limits
+
+Per-tenant connection slots and message rates, keyed by tenant ID string. No mochi, no forge. Safe for concurrent use.
+
+- `New() *Limiter`.
+- `(*Limiter).AcquireConnection(tenantID string, max int) bool`: takes a slot. `max <= 0` is unlimited but still counted. Every true needs one `ReleaseConnection`.
+- `(*Limiter).ReleaseConnection(tenantID string)`: gives a slot back. Extra releases are ignored; the count never goes negative.
+- `(*Limiter).AllowMessage(tenantID string, l tenant.Limits) bool`: one token from the tenant's `golang.org/x/time/rate` bucket. `MessagesPerSecond <= 0` means no limit (the caller substitutes a broker default first if it has one). `Burst <= 0` becomes `ceil(MessagesPerSecond)`, at least 1. The bucket is rebuilt, full, whenever the rate or burst differs from the one it was built with.
+
+The rate is per tenant, shared by all its connections. Buckets are kept for every tenant seen and never evicted.

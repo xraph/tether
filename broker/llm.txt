@@ -1,0 +1,45 @@
+# tether/broker
+
+Import: github.com/xraph/tether/broker
+
+The multi-tenant MQTT broker: one mochi-mqtt v2.7.9 server, one Tether hook. Every network client is resolved to a tenant at CONNECT, and its client ID and every topic it sends are prefixed with the tenant ID (a `ttnt_...` TypeID) server side. The prefix comes off again on every PUBLISH the client receives.
+
+## API
+
+- `Config{TCPAddress string; TLS *TLSConfig; WebSocketAddress string; DataDir string; MaxSessionExpiry time.Duration; MaxPacketSize uint32; MaxTopicLength int}`, yaml/json snake_case. `TLSConfig{Address, CertFile, KeyFile string}`.
+- `DefaultConfig()`: TCP `:1883`, session expiry cap 7 days, packet 1 MiB, topic 1024 bytes, no TLS, no WebSocket, no persistence. `New` fills zero limits with these defaults. At least one listener is required.
+- `PermLoader`: `Load(ctx, *auth.Identity) (acl.Rules, roleIDs []string, error)`. Called once per CONNECT.
+- `Deps{Auth auth.Authenticator; Perms PermLoader; Limits *limits.Limiter; Logger *slog.Logger}`. Auth and Perms are required; nil Limits gets `limits.New()`, nil Logger discards. mochi logs through the same logger (`component=mochi`).
+- `New(cfg, deps) (*Broker, error)`: validates, opens nothing. Errors wrap `tether.ErrInvalidInput`.
+- `(*Broker).Start(ctx)`: opens its own listeners (so `Addr` is real), adds the hook, then mochi's badger storage hook when `DataDir` is set, then serves. Start once; a second call wraps `tether.ErrConflict`.
+- `(*Broker).Stop(ctx)`: stops accepting, disconnects clients, waits for them, closes mochi and storage. Returns ctx's error if ctx ends first. No-op when not started or already stopped.
+- `(*Broker).Addr() net.Addr`: the TCP listener's address, nil if none.
+
+Listeners: TCP and TLS use `net.ListenConfig` (TLS through `tls.NewListener`, TLS 1.2 minimum) wrapped in `listeners.NewNet`. WebSocket uses mochi's `listeners.NewWebsocket`, which binds `WebSocketAddress` itself and answers with subprotocol `mqtt` on any path; its real port is not exposed, so give it a fixed one.
+
+Mochi options: `InlineClient: true`; capabilities `TopicAliasMaximum: 0`, `MaximumSessionExpiryInterval` from config (seconds), `MaximumPacketSize` from config.
+
+## Hook (hook.go)
+
+Provides exactly OnConnectAuthenticate, OnACLCheck, OnSessionEstablish, OnPacketRead, OnPacketEncode, OnPublish, OnDisconnect. It must stay the only provider of OnConnectAuthenticate and OnACLCheck (mochi ORs them).
+
+- OnConnectAuthenticate: `Auth.Authenticate` (Credentials.ClientID is the raw or mochi-assigned ID), refuse a nil or disabled tenant, `Perms.Load`, `acl.Compile` with `Vars{ClientID: raw ID, Username}` (dropped grants logged once), refuse a will whose topic fails `topic.Valid` or the publish check, then take a tenant connection slot. State is stored per `*mqtt.Client`.
+- CONNACK codes. Mochi always answers a false OnConnectAuthenticate with 0x86, so the hook records the code it wants per client and OnPacketEncode rewrites that CONNACK's reason code (and reason string) on its way out. 5.0: 0x86 bad credentials, 0x87 not authorized (auth error, disabled tenant, will outside the grants), 0x88 unavailable (auth outage, permission load failure, no tenant), 0x9F auth rate limited, 0x97 tenant connection limit, 0x90 invalid will topic. 3.1.1: 0x04 for bad credentials, 0x03 for 0x88/0x97/0x9F, 0x05 for the rest.
+- Slot takeover: at the tenant's limit, a client reconnecting with a client ID a live connection owns inherits that connection's slot (mochi is about to take the old one over), so a device can always replace its own connection.
+- OnSessionEstablish: `cl.ID = <tenant>/<raw ID>` (before mochi's session lookup, so takeover, storage and `Clients` use it; nobody can collide with another tenant or with mochi's `inline` client); namespaces the will topic; sets `Props.TopicAliasMaximum = 0`. A client mochi assigned an ID keeps the un-prefixed one in its CONNACK.
+- OnPacketRead (network clients): PUBLISH with an empty topic (alias only), or one failing `topic.Valid(name, false, MaxTopicLength)`, is rejected with `packets.ErrRejectPacket`, after a DISCONNECT for 5.0 clients (0x94 alias, 0x82 no topic, 0x90 invalid or too long). No ACL check ever sees it. Otherwise the topic is namespaced. SUBSCRIBE and UNSUBSCRIBE keep their filter count: valid filters are namespaced, an invalid or over-long one becomes "", which mochi refuses with 0x8F before the ACL check.
+- OnACLCheck: inline client allowed. Otherwise strip the client's tenant (`topic.Strip`; outside the namespace is denied), strip `$share/<group>/` for reads, run `topic.Valid`, then `CanPublish` (also refusing anything starting with `$SYS`, as mochi does) or `CanSubscribe`. A client with no state that is closed (a kept session, live-disconnected or restored from storage) gets read access to names in the tenant of its namespaced ID only, so deliveries queue for offline sessions; the grants were checked when the subscription was made.
+- OnPacketEncode: PUBLISH to a network client gets `topic.Strip`ped with its tenant. A name that does not strip (should not happen: delivery passed the ACL) is logged and sent with an empty payload.
+- OnPublish: guard that the namespaced topic is still the client's after alias handling; seam for Task 8 rate limits and counters.
+- OnDisconnect: releases the slot and drops the state. Mochi also calls it for sessions it restores from storage; those have no state.
+
+Task 8 seams: tenant `$SYS` read allowance where OnACLCheck denies a name outside the namespace; rate limits and message counters in OnPublish.
+
+## Mochi v2.7.9 workarounds
+
+- `Server.Close` can deadlock: `Clients.GetByListener` read-locks twice, so a client added or deleted in between blocks it forever. `Stop` closes the listeners with a no-op closer, disconnects every client and waits for `Listeners.ClientsWg` before calling `Close`.
+- When writing the success CONNACK fails, attachClient returns without OnDisconnect. The slot is released when the same client ID next connects (registry `bind`), not before.
+
+## Tests
+
+Package-internal (`broker_test.go`, `testutil_test.go`): `aclObserver` on `Broker` is the unexported ACL spy. 3.1.1 clients use `github.com/eclipse/paho.mqtt.golang`, 5.0 clients `github.com/eclipse/paho.golang/paho` or raw `paho.golang/packets` over a `net.Conn`. Waits are channel based with a 5 s bound. Set `TETHER_TEST_LOG=1` to see broker and mochi logs.

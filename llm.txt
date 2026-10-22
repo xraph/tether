@@ -12,4 +12,4 @@ The `auth` package has its own errors (`auth.ErrBadCredentials`, `ErrNotAuthoriz
 
 Store backends wrap these as `tether/<backend>: <op>: %w`.
 
-The broker, stores and Forge extension land in later tasks. Design: _project_files/TETHER-DESIGN.md.
+The broker is in `broker/` and per-tenant limits in `limits/` (see their llm.txt). The Forge extension lands in a later task. Design: _project_files/TETHER-DESIGN.md.
