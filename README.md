@@ -40,14 +40,16 @@ curl -s -X POST localhost:8080/tether/v1/tenants/$TENANT_ID/roles \
 
 Only `slug` is required. You can also pass a `name` and a `parent_slug` to inherit another role's grants, list a tenant's roles with `GET .../roles`, replace a role's topics later with `PUT .../roles/sensor/topics`, and remove one with `DELETE .../roles/sensor` once no device holds it.
 
-Then give the tenant a device with that role:
+Then give the tenant a device with that role, pinned to the client ID it will connect with:
 
 ```bash
 curl -s -X POST localhost:8080/tether/v1/tenants/$TENANT_ID/devices \
   -H "Authorization: Bearer $TETHER_ADMIN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"pump","roles":["sensor"]}'
+  -d '{"name":"pump","client_id":"pump-1","roles":["sensor"]}'
 ```
+
+`%c` only keeps devices apart when they're pinned like this, because an unpinned device can connect with any client ID it likes, another device's included, so give unpinned devices grants on `%u` (the key ID) instead.
 
 You get back a `username` (a keysmith key ID, `akey_...`) and a `password` (the raw key, `tdk_live_...`). This is the only time you see the password. Tether stores a hash, so if the device loses it you rotate the key with `POST .../devices/$DEVICE_ID/rotate`. A device with no role can connect, and that's all it can do.
 
