@@ -19,7 +19,7 @@ Order of decisions:
 3. `res.Key.ID.String()` must equal the username, else `ErrBadCredentials` (the raw key does not carry its ID).
 4. `GetDeviceByKey`: not found gives `ErrNotAuthorized` (a keysmith key with no Tether device), other errors `ErrUnavailable`.
 5. Tenant from `res.Key.AppID` and `res.Key.TenantID` through `TenantResolver`: not found, disabled, or not the device's tenant gives `ErrNotAuthorized`; other errors `ErrUnavailable`.
-6. Device `ClientID` pin: a set pin that differs from `Credentials.ClientID` gives `ErrNotAuthorized`, unless `Credentials.SkipClientIDPin` is set (R16: then the check is skipped, on a cache hit too, and `Identity.ClientID` carries the pin so the caller can expand `%c` with it). Every other check still runs.
+6. Device `ClientID` pin: a set pin that differs from `Credentials.ClientID` gives `ErrNotAuthorized`, unless `Credentials.SkipClientIDPin` is set (the HTTP publish endpoint, which has no client ID: then the check is skipped, on a cache hit too, and `Identity.ClientID` carries the pin so the caller can expand `%c` with it). Every other check still runs.
 
 Known limitation: keysmith v1.8.0 `ValidateKey` returns `ErrInvalidKey` for any failure of its key lookup (`GetByHash`), a database outage included, and does the same for a cancelled context. Tether cannot tell that from a wrong key, so while keysmith's store is down every uncached device is refused with `ErrBadCredentials` (CONNACK 0x86), not `ErrUnavailable` (0x88). Cached devices keep connecting until their entry expires. `TestKeysmithLookupOutageSurfacesAsBadCredentials` pins this against the real engine and should flip to `ErrUnavailable` when keysmith distinguishes outages.
 

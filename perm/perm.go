@@ -212,9 +212,10 @@ func SubjectKind(principalKind string) (warden.SubjectKind, bool) {
 // A role whose [MetadataKey] metadata is malformed is skipped, so one bad role
 // cannot lock a device out of the grants of its others. Its slug is logged at
 // warn level when a logger is set. An identity that is nil, has no tenant or
-// has no principal kind or ID is an error wrapping [tether.ErrInvalidInput], as is any
-// warden failure (wrapped as is). A principal kind that cannot connect is an
-// error wrapping [auth.ErrNotAuthorized].
+// has no principal kind or ID is an error wrapping [tether.ErrInvalidInput]. A
+// principal kind that cannot connect is an error wrapping
+// [auth.ErrNotAuthorized]. A warden failure comes back wrapped with %w, so
+// errors.Is still finds warden's own error; it is never ErrInvalidInput.
 func (l *Loader) Load(ctx context.Context, ident *auth.Identity) (acl.Rules, []string, error) {
 	switch {
 	case ident == nil || ident.Tenant == nil:

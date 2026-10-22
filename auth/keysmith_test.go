@@ -225,7 +225,7 @@ func TestClientIDPin(t *testing.T) {
 	assert.EqualValues(t, 1, e.val.calls.Load(), "a refused pin still caches the key, later calls never reach keysmith")
 }
 
-// Controller ruling R16. A caller with no MQTT client ID (the HTTP publish
+// A caller with no MQTT client ID (the HTTP publish
 // endpoint) sets SkipClientIDPin and gets the device's pin back in the
 // identity. The MQTT path never sets it.
 func TestSkipClientIDPin(t *testing.T) {

@@ -335,7 +335,7 @@ func bindState(h *hook, cl *mqtt.Client, tn *tenant.Tenant, rawID string, rules 
 		h.b.deps.Limits, h.b.countersFor(tn.ID.String())))
 }
 
-// Controller ruling R8: a closed client without state is an offline session.
+// A closed client without state is an offline session.
 // It may receive inside its own tenant only, and never write.
 func TestACLCheckOfflineSession(t *testing.T) {
 	h, srv, ta := unitHook(t, tenant.Limits{})
@@ -392,7 +392,7 @@ func TestACLCheckTenantSys(t *testing.T) {
 	assert.False(t, h.OnACLCheck(none, topic.Namespace(aNS, "t"), false))
 }
 
-// Controller ruling 1: a PUBLISH that does not strip with the receiver's
+// A PUBLISH that does not strip with the receiver's
 // tenant must not leave, neither its topic nor its payload nor its properties.
 func TestOutboundStripFailureFailsClosed(t *testing.T) {
 	h, srv, ta := unitHook(t, tenant.Limits{})

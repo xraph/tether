@@ -385,7 +385,7 @@ func TestRoleUnassignmentDropsSubscription(t *testing.T) {
 	assertConnected(t, c)
 }
 
-// Controller ruling R12: adding a role must not take away the subscriptions
+// Adding a role must not take away the subscriptions
 // of a role the device keeps. SetRoles applies only the difference, so no
 // reload ever sees the device without role a.
 func TestSetRolesKeepsSubscriptionOfKeptRole(t *testing.T) {

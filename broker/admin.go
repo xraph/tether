@@ -235,7 +235,7 @@ func (b *Broker) reloadMatching(ctx context.Context, keep func(*clientState) boo
 	}
 }
 
-// Reload retry defaults (controller ruling R14).
+// Reload retry defaults.
 const (
 	defaultRetryBase   = time.Second
 	defaultRetryMax    = 30 * time.Second
@@ -328,8 +328,7 @@ func (b *Broker) startRetry(srv *mqtt.Server, st *clientState) {
 	go b.retryReload(srv, st, stop)
 }
 
-// retryReload retries a reload that failed on an outage (controller ruling
-// R14): after retryBase, then doubling up to retryMax, until it succeeds or
+// retryReload retries a reload that failed on an outage: after retryBase, then doubling up to retryMax, until it succeeds or
 // retryWindow has passed since the first failure. If it is still failing
 // then, the connection is disconnected with 0x88 server unavailable, so it
 // authorizes again when it reconnects instead of keeping grants that may
@@ -443,7 +442,7 @@ func (b *Broker) compile(rules acl.Rules, roleIDs []string, clientID, username s
 // connection's current grants: its subscriptions, and the PUBLISH packets
 // queued for it while it was offline, which mochi would otherwise resend
 // right after the CONNACK. An offline session receives anything in its
-// tenant (controller ruling R8), so a grant revoked while the device was
+// tenant, so a grant revoked while the device was
 // away is enforced here.
 func (b *Broker) pruneSession(srv *mqtt.Server, st *clientState) {
 	set := st.acl()

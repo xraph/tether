@@ -405,7 +405,7 @@ func TestRunning(t *testing.T) {
 	assert.False(t, (&Broker{}).Running(), "zero value")
 }
 
-// Controller ruling R8 follow-through. An offline session receives anything
+// An offline session receives anything
 // in its tenant, so a grant revoked while the device is away is enforced
 // when the session is inherited: the subscription goes, and so do the
 // messages queued for it.
@@ -429,7 +429,7 @@ func TestPrunesInheritedSessionOnReconnect(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte{1}, subscribe5(t, p, "self"))
 
-	// Queued for the offline session (R8), then "self" proves the fan-out
+	// Queued for the offline session, then "self" proves the fan-out
 	// of cmd/q is over.
 	require.Equal(t, byte(0), publish5(t, p, "cmd/q", "queued"))
 	require.Equal(t, byte(0), publish5(t, p, "self", "done"))
@@ -840,7 +840,7 @@ func TestDisconnectPrincipalDoesNotWaitForAStalledClient(t *testing.T) {
 	waitStateDropped(t, b, topic.Namespace(ta.ID.String(), "stuck"))
 }
 
-// fastRetry shortens the reload retry backoff (ruling R14) for a test.
+// fastRetry shortens the reload retry backoff for a test.
 func fastRetry(b *Broker, base, maxDelay, window time.Duration) {
 	b.retryBase, b.retryMax, b.retryWindow = base, maxDelay, window
 }
@@ -904,7 +904,7 @@ func retryEnv(t *testing.T) (*Broker, *mutablePerms, *client5, func(string) stri
 	return b, perms, c, func(s string) string { return topic.Namespace(ta.ID.String(), s) }
 }
 
-// Ruling R14: a reload that fails on an outage is retried, so the change it
+// A reload that fails on an outage is retried, so the change it
 // carried is not lost.
 func TestReloadRetriesAfterOutage(t *testing.T) {
 	b, perms, c, ns := retryEnv(t)
@@ -982,7 +982,7 @@ func TestStopDuringPendingReloadRetry(t *testing.T) {
 	assert.Equal(t, int64(0), b.pendingRetries.Load(), "Stop waited for the retry to end")
 }
 
-// Admin operations (Task 12).
+// Admin operations.
 
 // publishRetained5 publishes a retained message at QoS 1.
 func publishRetained5(t *testing.T, c *client5, name, payload string) {

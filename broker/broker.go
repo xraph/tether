@@ -78,7 +78,7 @@ type Broker struct {
 	// registers its state to learn whether a change may have missed it.
 	changes atomic.Uint64
 
-	// Reload retries (controller ruling R14). A reload that fails on an
+	// Reload retries. A reload that fails on an
 	// outage is retried after retryBase, doubling up to retryMax, for at
 	// most retryWindow; then the client is disconnected with 0x88. Tests
 	// shorten them.

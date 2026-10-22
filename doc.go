@@ -9,7 +9,8 @@
 // the password is the raw key), and warden roles decide which topics a device
 // may publish to and subscribe to.
 //
-// The project is in development. This package holds the version and the
-// sentinel errors; the broker, stores and extension live in subpackages as
-// they land.
+// This package holds the version and the sentinel errors. The broker is in
+// broker, the admin REST API in api, authentication in auth, topic grants in
+// perm, device and tenant management in service, the stores in store, and
+// the Forge extension in extension; cmd/tether is the standalone server.
 package tether

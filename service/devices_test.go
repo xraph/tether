@@ -635,7 +635,7 @@ func TestSetRolesRestoresPreviousRolesOnFailure(t *testing.T) {
 	assert.Equal(t, []string{"sensor"}, got.Roles)
 }
 
-// Controller ruling R12: SetRoles applies only the difference, so a role the
+// SetRoles applies only the difference, so a role the
 // device keeps is never unassigned (a live device would lose its
 // subscriptions in the gap).
 func TestSetRolesAppliesOnlyTheDiff(t *testing.T) {

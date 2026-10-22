@@ -1092,7 +1092,7 @@ func TestPublishBodyOverTheIdempotencyDefault(t *testing.T) {
 	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/big", "payload": payload}, "Idempotency-Key", "big-1"), http.StatusOK)
 }
 
-// Controller ruling R16. A device pinned to a client ID publishes over HTTP
+// A device pinned to a client ID publishes over HTTP
 // with that ID as %c, so "devices/%c/up" is its own topic and no one else's.
 // An unpinned device has no client ID, so a %c grant stays unusable for it.
 func TestPublishPinnedDeviceUsesItsClientIDGrant(t *testing.T) {

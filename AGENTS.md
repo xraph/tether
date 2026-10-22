@@ -31,7 +31,17 @@ CI is `.github/workflows/ci.yml`. It calls the shared `xraph/workflows` `go-ci.y
 
 ## Layout
 
-The root package is `tether`: the version, the sentinel errors and, as it lands, the broker itself. `id/` holds the TypeID types. The planned shape follows relay and keysmith: `store/` with `memory`, `sqlite`, `postgres` and a shared `storetest` suite, and `extension/` with `extension/contract/` for the dashboard contract. Every package with a public surface gets an `llm.txt` written for agents, the way forge does, so update it in the same commit when the surface changes.
+The root package is `tether`: the version and the sentinel errors. The rest follows relay and keysmith:
+
+- `broker/`: the mochi server, the Tether hook (tenancy, ACL, limits, session expiry), admin operations and the reactions to key and role changes.
+- `api/`: the admin REST API and the device HTTP publish endpoint.
+- `auth/`: keysmith device keys, authsome JWTs and the chain between them.
+- `events/`: the keysmith and warden plugins and the reactor that applies their events to the broker.
+- `perm/`: warden roles and their topic grants, and the loader the broker uses.
+- `service/`: tenant and device management on top of a store, keysmith and warden.
+- `extension/`: the Forge extension, with `extension/contract/` for the dashboard contract.
+- `cmd/tether/`: the standalone server.
+- Smaller pieces: `acl/` (compiled grants), `topic/` (validation and namespacing), `limits/` (per-tenant rate and connection limits), `scope/` (keysmith, warden and forge tenant scope), `tenant/` and `device/` (models), `id/` (TypeIDs), and `store/` with `memory`, `sqlite`, `postgres` and the shared `storetest` suite. Every package with a public surface gets an `llm.txt` written for agents, the way forge does, so update it in the same commit when the surface changes.
 
 ## Conventions
 
