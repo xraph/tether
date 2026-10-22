@@ -286,21 +286,25 @@ func (r *Roles) GetRules(ctx context.Context, t *tenant.Tenant, roleSlug string)
 // SetRules replaces the grants of the role with slug roleSlug in t. Every
 // filter must pass topic.Valid as a filter, or the call fails with an error
 // wrapping [tether.ErrInvalidInput] that names it, and nothing is written. A
-// role that does not exist is [tether.ErrNotFound]. Other metadata keys on the
-// role are kept.
+// role that does not exist is [tether.ErrNotFound]. A shared filter
+// ("$share/...", any casing) is invalid input too, since acl drops it. A
+// system role cannot be changed: [tether.ErrConflict]. Other metadata keys on
+// the role are kept.
 //
 // Warden's store writes fire no plugin hooks and do not touch its decision
 // cache, so SetRules emits OnRoleUpdated itself and clears the tenant's cached
 // decisions.
 func (r *Roles) SetRules(ctx context.Context, t *tenant.Tenant, roleSlug string, rules acl.Rules) error {
-	for _, f := range slices.Concat(rules.Publish, rules.Subscribe) {
-		if err := topic.Valid(f, true, 0); err != nil {
-			return fmt.Errorf("tether/perm: grant %q: %w", f, err)
-		}
+	if err := validGrants(rules); err != nil {
+		return err
 	}
 
 	existing, err := r.get(ctx, t, roleSlug)
 	if err != nil {
+		return err
+	}
+
+	if err := writable(existing); err != nil {
 		return err
 	}
 
@@ -368,8 +372,8 @@ type RoleInfo struct {
 
 // Create makes a role in t's root namespace and returns it. The slug must be
 // 1 to 63 characters of a-z, 0-9, "_" and "-", starting with a letter or
-// digit; every filter must pass topic.Valid as a filter; a parent that does
-// not exist is an error. All of those wrap [tether.ErrInvalidInput], and
+// digit; every filter must pass topic.Valid as a filter and not be a shared
+// subscription; a parent that does not exist is an error. All of those wrap [tether.ErrInvalidInput], and
 // nothing is written. A slug the tenant already uses is [tether.ErrConflict].
 //
 // Warden's store writes fire no plugin hooks and do not touch its decision
@@ -390,10 +394,8 @@ func (r *Roles) Create(ctx context.Context, t *tenant.Tenant, in RoleInput) (*Ro
 			tether.ErrInvalidInput, slug, maxSlugLen)
 	}
 
-	for _, f := range slices.Concat(in.Rules.Publish, in.Rules.Subscribe) {
-		if err := topic.Valid(f, true, 0); err != nil {
-			return nil, fmt.Errorf("tether/perm: grant %q: %w", f, err)
-		}
+	if err := validGrants(in.Rules); err != nil {
+		return nil, err
 	}
 
 	ctx = scope.With(ctx, t.AppID, t.ExternalID)
@@ -481,7 +483,8 @@ func (r *Roles) List(ctx context.Context, t *tenant.Tenant) ([]RoleInfo, error) 
 // Delete removes the role with slug roleSlug from t. A role that does not
 // exist is [tether.ErrNotFound]. A role still assigned to an API key, or still
 // the parent of another role, is [tether.ErrConflict] and nothing changes:
-// take it off its devices first. A system role is a conflict too.
+// take it off its devices first. A system role is a conflict too, checked
+// before anything else.
 //
 // Like Create, it emits the warden plugin hook (OnRoleDeleted) and clears the
 // tenant's cached decisions. The checks and the delete are separate warden
@@ -490,6 +493,10 @@ func (r *Roles) Delete(ctx context.Context, t *tenant.Tenant, roleSlug string) e
 	rl, err := r.get(ctx, t, roleSlug)
 	if err != nil {
 		return err
+	}
+
+	if werr := writable(rl); werr != nil {
+		return werr
 	}
 
 	ctx = scope.With(ctx, t.AppID, t.ExternalID)
@@ -528,6 +535,34 @@ func (r *Roles) Delete(ctx context.Context, t *tenant.Tenant, roleSlug string) e
 	}
 
 	r.eng.InvalidateTenant(ctx, t.ExternalID)
+
+	return nil
+}
+
+// validGrants checks every filter of rules: it must pass topic.Valid as a
+// filter and must not be a shared subscription ("$share/...", in any
+// casing), which acl drops, so storing one would show a grant that grants
+// nothing. Either wraps [tether.ErrInvalidInput] and names the filter.
+func validGrants(rules acl.Rules) error {
+	for _, f := range slices.Concat(rules.Publish, rules.Subscribe) {
+		if err := topic.Valid(f, true, 0); err != nil {
+			return fmt.Errorf("tether/perm: grant %q: %w", f, err)
+		}
+
+		if first, _, _ := strings.Cut(f, "/"); strings.EqualFold(first, "$share") {
+			return fmt.Errorf("%w: perm: grant %q is a shared subscription, which grants nothing", tether.ErrInvalidInput, f)
+		}
+	}
+
+	return nil
+}
+
+// writable refuses a write to a system role with [tether.ErrConflict], through
+// warden's own check: warden's store writes do not make it.
+func writable(rl *role.Role) error {
+	if err := role.CheckWritable(rl); err != nil {
+		return fmt.Errorf("%w: perm: %w", tether.ErrConflict, err)
+	}
 
 	return nil
 }

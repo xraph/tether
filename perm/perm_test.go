@@ -824,3 +824,51 @@ func TestDeleteIsTenantScoped(t *testing.T) {
 	assert.ErrorIs(t, roles.Delete(t.Context(), nil, "sensor"), tether.ErrInvalidInput)
 	assert.ErrorIs(t, roles.Delete(t.Context(), e.ten, ""), tether.ErrInvalidInput)
 }
+
+// A shared filter is not a grant: acl drops it, so storing one would show a
+// grant that does nothing. SetRules and Create refuse it in any casing.
+func TestShareFiltersAreNotGrants(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	e.createRole(t, "device", "", nil)
+
+	roles := perm.NewRoles(e.eng)
+
+	for _, f := range []string{"$share/g/a", "$SHARE/g/#", "$Share/g/x/y"} {
+		err := roles.SetRules(t.Context(), e.ten, "device", acl.Rules{Subscribe: []string{f}})
+		require.ErrorIs(t, err, tether.ErrInvalidInput, f)
+
+		_, err = roles.Create(t.Context(), e.ten, perm.RoleInput{Slug: "r", Rules: acl.Rules{Subscribe: []string{f}}})
+		require.ErrorIs(t, err, tether.ErrInvalidInput, f)
+	}
+
+	got, err := roles.GetRules(t.Context(), e.ten, "device")
+	require.NoError(t, err)
+	assert.Empty(t, got.Subscribe)
+}
+
+// A system role can be neither rewritten nor deleted through Tether: warden's
+// store does not check, so perm does.
+func TestSystemRolesAreReadOnly(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t)
+	require.NoError(t, e.eng.Store().CreateRole(e.ctx, &role.Role{
+		TenantID: testOrg, AppID: testApp, Name: "admin", Slug: "admin", IsSystem: true,
+		Metadata: map[string]any{perm.MetadataKey: map[string]any{"publish": []any{"a/#"}, "subscribe": []any{}}},
+	}))
+
+	roles := perm.NewRoles(e.eng)
+
+	err := roles.SetRules(t.Context(), e.ten, "admin", acl.Rules{Publish: []string{"#"}})
+	require.ErrorIs(t, err, tether.ErrConflict)
+
+	err = roles.Delete(t.Context(), e.ten, "admin")
+	require.ErrorIs(t, err, tether.ErrConflict)
+
+	got, err := roles.GetRules(t.Context(), e.ten, "admin")
+	require.NoError(t, err, "the role is still there")
+	assert.Equal(t, []string{"a/#"}, got.Publish, "and its grants are unchanged")
+	assert.Empty(t, e.rec.calls())
+}
