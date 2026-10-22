@@ -37,6 +37,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"TenantNotFound", testTenantNotFound},
 		{"TenantInvalidInput", testTenantInvalidInput},
 		{"TenantList", testTenantList},
+		{"TenantUpdateSetsUpdatedAt", testTenantUpdateSetsUpdatedAt},
+		{"TenantDeleteDoesNotCascade", testTenantDeleteDoesNotCascade},
 		{"DeviceCRUD", testDeviceCRUD},
 		{"DeviceByKey", testDeviceByKey},
 		{"DeviceKeyUnique", testDeviceKeyUnique},
@@ -44,6 +46,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"DeviceInvalidInput", testDeviceInvalidInput},
 		{"DeviceListIsTenantScoped", testDeviceListIsTenantScoped},
 		{"DeviceList", testDeviceList},
+		{"DeviceUpdateSetsUpdatedAt", testDeviceUpdateSetsUpdatedAt},
+		{"DeviceCreateWithoutTenant", testDeviceCreateWithoutTenant},
 		{"CountDevices", testCountDevices},
 	}
 
@@ -712,4 +716,114 @@ func testCountDevices(t *testing.T, s store.Store) {
 	dup.KeyID = created[1].KeyID
 	require.Error(t, s.CreateDevice(ctx, dup))
 	assert.Equal(t, 2, count(tnA.ID), "a conflicting create is not counted")
+}
+
+// The next two tests pin "Update sets UpdatedAt to now" without sleeping: the
+// record is created with an UpdatedAt far in the past, so an Update that does
+// not bump it leaves a value that is not after that stamp.
+
+func testTenantUpdateSetsUpdatedAt(t *testing.T, s store.Store) {
+	ctx := context.Background()
+
+	tn := newTenant()
+	tn.CreatedAt = stamp(0)
+	tn.UpdatedAt = stamp(0)
+	mustCreateTenant(t, s, tn)
+
+	got, err := s.GetTenant(ctx, tn.ID)
+	require.NoError(t, err)
+	require.True(t, got.UpdatedAt.Equal(stamp(0)), "Create keeps a caller-supplied UpdatedAt")
+
+	before := time.Now().UTC().Truncate(time.Microsecond)
+
+	upd := *got
+	upd.Name = "renamed"
+	require.NoError(t, s.UpdateTenant(ctx, &upd))
+
+	assert.True(t, upd.UpdatedAt.After(stamp(0)), "Update bumps UpdatedAt, got %v", upd.UpdatedAt)
+	assert.False(t, upd.UpdatedAt.Before(before), "UpdatedAt is now, got %v want >= %v", upd.UpdatedAt, before)
+	assert.True(t, upd.CreatedAt.Equal(stamp(0)), "Update keeps CreatedAt")
+
+	read, err := s.GetTenant(ctx, tn.ID)
+	require.NoError(t, err)
+	assert.True(t, read.UpdatedAt.Equal(upd.UpdatedAt), "read-back UpdatedAt: want %v got %v", upd.UpdatedAt, read.UpdatedAt)
+	assert.True(t, read.CreatedAt.Equal(stamp(0)))
+}
+
+func testDeviceUpdateSetsUpdatedAt(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	tn := mustCreateTenant(t, s, newTenant())
+
+	d := newDevice(tn.ID)
+	d.CreatedAt = stamp(0)
+	d.UpdatedAt = stamp(0)
+	mustCreateDevice(t, s, d)
+
+	got, err := s.GetDevice(ctx, tn.ID, d.ID)
+	require.NoError(t, err)
+	require.True(t, got.UpdatedAt.Equal(stamp(0)), "Create keeps a caller-supplied UpdatedAt")
+
+	before := time.Now().UTC().Truncate(time.Microsecond)
+
+	upd := *got
+	upd.Name = "renamed"
+	require.NoError(t, s.UpdateDevice(ctx, &upd))
+
+	assert.True(t, upd.UpdatedAt.After(stamp(0)), "Update bumps UpdatedAt, got %v", upd.UpdatedAt)
+	assert.False(t, upd.UpdatedAt.Before(before), "UpdatedAt is now, got %v want >= %v", upd.UpdatedAt, before)
+	assert.True(t, upd.CreatedAt.Equal(stamp(0)), "Update keeps CreatedAt")
+
+	read, err := s.GetDevice(ctx, tn.ID, d.ID)
+	require.NoError(t, err)
+	assert.True(t, read.UpdatedAt.Equal(upd.UpdatedAt), "read-back UpdatedAt: want %v got %v", upd.UpdatedAt, read.UpdatedAt)
+	assert.True(t, read.CreatedAt.Equal(stamp(0)))
+}
+
+// testTenantDeleteDoesNotCascade pins that DeleteTenant leaves devices alone.
+// The service layer (not the store) refuses to delete a tenant that still has
+// devices, so a backend must not add ON DELETE CASCADE or RESTRICT.
+func testTenantDeleteDoesNotCascade(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	tn := mustCreateTenant(t, s, newTenant())
+	d := mustCreateDevice(t, s, newDevice(tn.ID))
+
+	require.NoError(t, s.DeleteTenant(ctx, tn.ID), "DeleteTenant succeeds while devices exist")
+
+	_, err := s.GetTenant(ctx, tn.ID)
+	require.ErrorIs(t, err, tether.ErrNotFound)
+
+	got, err := s.GetDevice(ctx, tn.ID, d.ID)
+	require.NoError(t, err, "the device survives its tenant's deletion")
+	assertDeviceEqual(t, d, got)
+
+	byKey, err := s.GetDeviceByKey(ctx, d.KeyID)
+	require.NoError(t, err)
+	assert.Equal(t, d.ID, byKey.ID)
+
+	n, err := s.CountDevices(ctx, tn.ID)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	list, err := s.ListDevices(ctx, device.ListFilter{TenantID: tn.ID})
+	require.NoError(t, err)
+	assert.Equal(t, []id.DeviceID{d.ID}, deviceIDs(list))
+}
+
+// testDeviceCreateWithoutTenant pins that CreateDevice does not check the
+// tenant exists. The service layer does, so a backend must not add a foreign
+// key from devices to tenants.
+func testDeviceCreateWithoutTenant(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	neverCreated := id.NewTenantID()
+
+	d := newDevice(neverCreated)
+	require.NoError(t, s.CreateDevice(ctx, d), "CreateDevice does not check the tenant exists")
+
+	got, err := s.GetDevice(ctx, neverCreated, d.ID)
+	require.NoError(t, err)
+	assertDeviceEqual(t, d, got)
+
+	n, err := s.CountDevices(ctx, neverCreated)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
 }
