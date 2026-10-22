@@ -233,7 +233,7 @@ func (e *env) grant(tenantID, external string, d device, slug string, pub, sub [
 	e.createRole(external, slug)
 
 	expect(e.t, e.do(http.MethodPut, "/tether/v1/tenants/"+tenantID+"/roles/"+slug+"/topics",
-		map[string]any{"publish": pub, "subscribe": sub}), http.StatusOK)
+		map[string]any{"publish": orEmpty(pub), "subscribe": orEmpty(sub)}), http.StatusOK)
 	expect(e.t, e.do(http.MethodPut, "/tether/v1/tenants/"+tenantID+"/devices/"+d.id+"/roles",
 		map[string]any{"roles": []string{slug}}), http.StatusOK)
 }
@@ -625,9 +625,24 @@ func TestDeviceRolesAndTopics(t *testing.T) {
 	got := expect(t, e.do(http.MethodGet, topics, nil), http.StatusOK).json()
 	assert.Equal(t, []any{"dev/%u/cmd/#"}, got["subscribe"])
 
-	expect(t, e.do(http.MethodPut, topics, map[string]any{"publish": []string{"a/#/b"}}), http.StatusBadRequest)
+	expect(t, e.do(http.MethodPut, topics, map[string]any{"publish": []string{"a/#/b"}, "subscribe": []string{}}), http.StatusBadRequest)
 	expect(t, e.do(http.MethodGet, base+"/roles/ghost/topics", nil), http.StatusNotFound)
-	expect(t, e.do(http.MethodPut, base+"/roles/ghost/topics", map[string]any{}), http.StatusNotFound)
+	expect(t, e.do(http.MethodPut, base+"/roles/ghost/topics", map[string]any{"publish": []string{}, "subscribe": []string{}}), http.StatusNotFound)
+
+	// The PUT replaces both lists, so both must be there: a missing (or
+	// null) one is refused rather than read as "clear it", and nothing
+	// changes. [] clears a list.
+	for _, body := range []any{
+		map[string]any{},
+		map[string]any{"publish": []string{"x"}},
+		map[string]any{"subscribe": []string{"x"}},
+		[]byte(`{"publish":null,"subscribe":[]}`),
+	} {
+		expect(t, e.do(http.MethodPut, topics, body), http.StatusBadRequest)
+	}
+
+	kept := expect(t, e.do(http.MethodGet, topics, nil), http.StatusOK).json()
+	assert.Equal(t, []any{"dev/%u/up"}, kept["publish"], "a refused PUT changed nothing")
 
 	dev := expect(t, e.do(http.MethodPut, base+"/devices/"+d.id+"/roles", map[string]any{"roles": []string{"sensor"}}), http.StatusOK).json()
 	assert.Equal(t, []any{"sensor"}, dev["roles"])
@@ -805,7 +820,7 @@ func TestTenantScopeInPath(t *testing.T) {
 	// Role grants are per tenant too: A has no such role.
 	e.createRole("aorg_2", "b-role")
 	expect(t, e.do(http.MethodGet, pathA+"/roles/b-role/topics", nil), http.StatusNotFound)
-	expect(t, e.do(http.MethodPut, pathA+"/roles/b-role/topics", map[string]any{"publish": []string{"#"}}), http.StatusNotFound)
+	expect(t, e.do(http.MethodPut, pathA+"/roles/b-role/topics", map[string]any{"publish": []string{"#"}, "subscribe": []string{}}), http.StatusNotFound)
 
 	// Roles are per tenant: A lists none of B's and cannot delete one.
 	l = expect(t, e.do(http.MethodGet, pathA+"/roles", nil), http.StatusOK).json()
@@ -901,7 +916,7 @@ func TestPublishDeniedOutsideGrant(t *testing.T) {
 
 	// A grant that needs the client ID cannot match without one.
 	e.createRole("aorg_9", "byclient")
-	expect(t, e.do(http.MethodPut, tenantPath(tid)+"/roles/byclient/topics", map[string]any{"publish": []string{"c/%c/up"}}), http.StatusOK)
+	expect(t, e.do(http.MethodPut, tenantPath(tid)+"/roles/byclient/topics", map[string]any{"publish": []string{"c/%c/up"}, "subscribe": []string{}}), http.StatusOK)
 	expect(t, e.do(http.MethodPut, tenantPath(tid)+"/devices/"+bare.id+"/roles", map[string]any{"roles": []string{"byclient"}}), http.StatusOK)
 	expect(t, e.publish(bare.username, bare.password, map[string]any{"topic": "c/bare/up", "payload": ""}), http.StatusForbidden)
 	expect(t, e.publish(bare.username, bare.password, map[string]any{"topic": "c/%c/up", "payload": ""}), http.StatusForbidden)
@@ -1310,4 +1325,13 @@ func TestPublishDollarTopicsFollowMQTT(t *testing.T) {
 	// up/# does not reach "$" names.
 	e.grant(tid, "aorg_1", d, "plain", []string{"#"}, nil)
 	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "$other/x", "payload": ""}), http.StatusForbidden)
+}
+
+// orEmpty is s, or [] for nil, so a PUT of role topics names both lists.
+func orEmpty(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+
+	return s
 }

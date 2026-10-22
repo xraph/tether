@@ -201,7 +201,16 @@ func (e *env) role(tenantID, slug string, pub, sub []string) {
 	}))
 
 	e.do(http.MethodPut, e.base+"/v1/tenants/"+tenantID+"/roles/"+slug+"/topics",
-		map[string]any{"publish": pub, "subscribe": sub}, http.StatusOK)
+		map[string]any{"publish": nonNil(pub), "subscribe": nonNil(sub)}, http.StatusOK)
+}
+
+// nonNil is s, or [] for nil: the topics PUT needs both lists.
+func nonNil(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+
+	return s
 }
 
 // device is a provisioned device.

@@ -38,7 +38,7 @@ curl -s -X POST localhost:8080/tether/v1/tenants/$TENANT_ID/roles \
   -d '{"slug":"sensor","publish":["sensors/%c/up"],"subscribe":["sensors/%c/#"]}'
 ```
 
-Only `slug` is required. You can also pass a `name` and a `parent_slug` to inherit another role's grants, list a tenant's roles with `GET .../roles`, replace a role's topics later with `PUT .../roles/sensor/topics`, and remove one with `DELETE .../roles/sensor` once no device holds it.
+Only `slug` is required. You can also pass a `name` and a `parent_slug` to inherit another role's grants, list a tenant's roles with `GET .../roles`, replace a role's topics later with `PUT .../roles/sensor/topics` (send both `publish` and `subscribe`, with `[]` for a list you want empty), and remove one with `DELETE .../roles/sensor` once no device holds it.
 
 Then give the tenant a device with that role, pinned to the client ID it will connect with:
 

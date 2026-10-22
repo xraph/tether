@@ -2,10 +2,12 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/xraph/forge"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/perm"
 )
@@ -30,7 +32,9 @@ type topicsPath struct {
 
 // setTopicsRequest is PUT /v1/tenants/:tenantId/roles/:roleSlug/topics. The
 // two lists replace the role's grants; they use the "%c" and "%u"
-// placeholders acl.Compile expands.
+// placeholders acl.Compile expands. Both are required ([] clears one): a
+// list left out would otherwise clear grants the caller never meant to
+// touch.
 type setTopicsRequest struct {
 	TenantID  string   `path:"tenantId"`
 	RoleSlug  string   `path:"roleSlug"`
@@ -105,6 +109,10 @@ func (a *API) getTopics(c forge.Context, req *topicsPath) (*acl.Rules, error) {
 }
 
 func (a *API) setTopics(c forge.Context, req *setTopicsRequest) (*acl.Rules, error) {
+	if req.Publish == nil || req.Subscribe == nil {
+		return nil, mapError(fmt.Errorf("%w: publish and subscribe are both required (use [] for none)", tether.ErrInvalidInput))
+	}
+
 	tn, err := a.tenant(c, req.TenantID)
 	if err != nil {
 		return nil, err

@@ -29,7 +29,7 @@ All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged 
 | `POST /:tenantId/roles` | body `{slug, name, parent_slug, publish, subscribe}` (only `slug` is required); 201 with `{slug, name, parent_slug?, publish, subscribe}`. A bad slug, a bad filter or an unknown parent is 400, a slug the tenant already uses is 409. |
 | `GET /:tenantId/roles` | `{items: [{slug, name, parent_slug?, publish, subscribe}]}` sorted by slug |
 | `DELETE /:tenantId/roles/:roleSlug` | 204. 404 for no such role (or one of another tenant); 409 while a device holds it or another role names it as its parent, and then nothing changes. |
-| `GET\|PUT /:tenantId/roles/:roleSlug/topics` | `{publish: [...], subscribe: [...]}`; PUT replaces both lists. Invalid filter 400, unknown role 404. |
+| `GET\|PUT /:tenantId/roles/:roleSlug/topics` | `{publish: [...], subscribe: [...]}`; PUT replaces both lists, so both are required (`[]` clears one; a missing or null list is 400 and nothing changes). Invalid filter 400, unknown role 404. |
 | `GET /:tenantId/clients` | `broker.ClientInfo` list |
 | `POST /:tenantId/clients/:clientId/kick`, `DELETE /:tenantId/sessions/:clientId` | 204 |
 | `GET /:tenantId/retained?filter=` | default filter `#`; invalid filter 400 |
