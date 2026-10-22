@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/xraph/keysmith"
@@ -92,6 +94,26 @@ type Devices struct {
 	roles    RoleAssigner
 	sessions SessionDeleter
 	log      *slog.Logger
+
+	// roleLocks serialise the role changes of one device (SetRoles and
+	// Delete), striped by device ID so memory stays fixed: two calls on one
+	// device interleaving their assign and unassign steps would leave the
+	// key with a mix of both role sets.
+	roleLocks [roleLockStripes]sync.Mutex
+}
+
+// roleLockStripes is how many locks the devices' role changes share.
+const roleLockStripes = 64
+
+// lockRoles locks the role changes of device d and returns the unlock.
+func (s *Devices) lockRoles(d id.DeviceID) func() {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(d.String()))
+
+	mu := &s.roleLocks[h.Sum32()%roleLockStripes]
+	mu.Lock()
+
+	return mu.Unlock
 }
 
 // SessionDeleter deletes an MQTT session: the client's subscriptions and
@@ -297,6 +319,8 @@ func (s *Devices) endSession(t *tenant.Tenant, d *device.Device) {
 // With WithSessions, the session of a device pinned to a client ID is
 // deleted once the record is.
 func (s *Devices) Delete(ctx context.Context, tenantID id.TenantID, deviceID id.DeviceID) error {
+	defer s.lockRoles(deviceID)()
+
 	d, t, err := s.load(ctx, tenantID, deviceID)
 	if err != nil {
 		return err
@@ -330,12 +354,16 @@ func (s *Devices) Delete(ctx context.Context, tenantID id.TenantID, deviceID id.
 // assignment event and prunes what the grants no longer allow).
 //
 // If a step fails, the previous roles are put back the same way and the
-// error is returned.
+// error is returned. Calls for one device (and Delete) run one at a time in
+// this process; with several processes on one store they can still
+// interleave.
 func (s *Devices) SetRoles(ctx context.Context, tenantID id.TenantID, deviceID id.DeviceID, roles []string) error {
 	roles, err := cleanRoles(roles)
 	if err != nil {
 		return err
 	}
+
+	defer s.lockRoles(deviceID)()
 
 	d, t, err := s.load(ctx, tenantID, deviceID)
 	if err != nil {

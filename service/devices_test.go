@@ -775,3 +775,33 @@ func TestKeysAreScopedToTheTenantsOwnExternalID(t *testing.T) {
 	_, err = kid.ParseKeyID(c.Username)
 	require.NoError(t, err)
 }
+
+// Concurrent SetRoles calls on one device run one after the other, so the
+// key ends up holding exactly the roles the device record names, never a
+// union or a remainder of two interleaved calls.
+func TestConcurrentSetRolesLeaveOneSet(t *testing.T) {
+	e := newDevEnv(t)
+	for _, slug := range []string{"r1", "r2", "r3", "r4"} {
+		e.createRole(t, slug)
+	}
+
+	c := e.provision(t, service.ProvisionInput{Name: "pump"})
+	sets := [][]string{{"r1", "r2"}, {"r3"}, {"r4", "r1"}, {}}
+
+	for round := range 20 {
+		var wg sync.WaitGroup
+
+		for _, set := range sets {
+			wg.Go(func() {
+				assert.NoError(t, e.devices.SetRoles(t.Context(), e.tenant.ID, c.Device.ID, set))
+			})
+		}
+
+		wg.Wait()
+
+		d, err := e.devices.Get(t.Context(), e.tenant.ID, c.Device.ID)
+		require.NoError(t, err)
+
+		assert.ElementsMatch(t, d.Roles, e.roleSlugs(t, c.Username), "round %d: the key's roles and the record disagree", round)
+	}
+}
