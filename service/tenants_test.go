@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -204,4 +206,71 @@ func TestDeleteRefusedWhileDevicesExist(t *testing.T) {
 
 	_, err = svc.Get(ctx, created.ID)
 	require.ErrorIs(t, err, tether.ErrNotFound)
+}
+
+func TestCreateRefusesAnExternalIDUsedUnderAnotherApp(t *testing.T) {
+	svc, _ := newService(t)
+	ctx := t.Context()
+
+	_, err := svc.Create(ctx, CreateTenantInput{AppID: "aapp_1", ExternalID: "aorg_1"})
+	require.NoError(t, err)
+
+	// Keysmith and warden isolate by tenant ID alone, so the same external ID
+	// under a second app would share keys and roles with the first.
+	_, err = svc.Create(ctx, CreateTenantInput{AppID: "aapp_2", ExternalID: "aorg_1"})
+	require.ErrorIs(t, err, tether.ErrConflict)
+
+	_, err = svc.Create(ctx, CreateTenantInput{AppID: "aapp_2", ExternalID: "aorg_2"})
+	require.NoError(t, err)
+
+	list, err := svc.List(ctx, tenant.ListFilter{})
+	require.NoError(t, err)
+	assert.Len(t, list, 2)
+}
+
+func TestCreateFindsAnExternalIDPastTheFirstPage(t *testing.T) {
+	svc, _ := newService(t)
+	ctx := t.Context()
+
+	for i := range 250 {
+		_, err := svc.Create(ctx, CreateTenantInput{AppID: "aapp_1", ExternalID: fmt.Sprintf("aorg_%d", i)})
+		require.NoError(t, err)
+	}
+
+	_, err := svc.Create(ctx, CreateTenantInput{AppID: "aapp_2", ExternalID: "aorg_249"})
+	require.ErrorIs(t, err, tether.ErrConflict)
+}
+
+func TestConcurrentCreatesOfOneExternalIDMakeOneTenant(t *testing.T) {
+	svc, _ := newService(t)
+
+	var wg sync.WaitGroup
+
+	errs := make(chan error, 8)
+
+	for i := range 8 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			_, err := svc.Create(t.Context(), CreateTenantInput{AppID: fmt.Sprintf("aapp_%d", i), ExternalID: "aorg_1"})
+			errs <- err
+		}()
+	}
+
+	wg.Wait()
+	close(errs)
+
+	ok := 0
+
+	for err := range errs {
+		if err == nil {
+			ok++
+		} else {
+			require.ErrorIs(t, err, tether.ErrConflict)
+		}
+	}
+
+	assert.Equal(t, 1, ok)
 }

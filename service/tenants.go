@@ -42,6 +42,10 @@ type Tenants struct {
 	store store.Store
 	now   func() time.Time
 
+	// createMu serialises Create, so two creates in this process cannot both
+	// pass the external ID check.
+	createMu sync.Mutex
+
 	mu    sync.Mutex
 	cache map[externalKey]cacheEntry
 	// gen counts evictions. A resolve that started before an eviction must
@@ -62,8 +66,15 @@ func NewTenants(s store.Store) *Tenants {
 }
 
 // Create stores a new, enabled tenant. A missing AppID or ExternalID wraps
-// tether.ErrInvalidInput, and an (AppID, ExternalID) pair already in use wraps
-// tether.ErrConflict.
+// tether.ErrInvalidInput. An ExternalID already used by another tenant, under
+// this app or any other, wraps tether.ErrConflict: keysmith and warden isolate
+// by tenant ID alone, so two tenants sharing an ExternalID would share keys
+// and roles.
+//
+// The check reads every tenant and is not atomic across processes: broker
+// nodes that create tenants on one store at the same moment can both pass it.
+// Create tenants through one node, or let the host application guarantee that
+// its tenant IDs are unique across apps.
 func (s *Tenants) Create(ctx context.Context, in CreateTenantInput) (*tenant.Tenant, error) {
 	if in.AppID == "" {
 		return nil, fmt.Errorf("%w: app ID is required", tether.ErrInvalidInput)
@@ -71,6 +82,13 @@ func (s *Tenants) Create(ctx context.Context, in CreateTenantInput) (*tenant.Ten
 
 	if in.ExternalID == "" {
 		return nil, fmt.Errorf("%w: external ID is required", tether.ErrInvalidInput)
+	}
+
+	s.createMu.Lock()
+	defer s.createMu.Unlock()
+
+	if err := s.checkExternalIDFree(ctx, in.ExternalID); err != nil {
+		return nil, err
 	}
 
 	t := &tenant.Tenant{
@@ -87,6 +105,31 @@ func (s *Tenants) Create(ctx context.Context, in CreateTenantInput) (*tenant.Ten
 	}
 
 	return t, nil
+}
+
+// externalScanPage is how many tenants checkExternalIDFree reads at a time.
+const externalScanPage = 200
+
+// checkExternalIDFree returns an error wrapping tether.ErrConflict when any
+// tenant already uses externalID.
+func (s *Tenants) checkExternalIDFree(ctx context.Context, externalID string) error {
+	for offset := 0; ; offset += externalScanPage {
+		page, err := s.store.ListTenants(ctx, tenant.ListFilter{Limit: externalScanPage, Offset: offset})
+		if err != nil {
+			return err
+		}
+
+		for _, t := range page {
+			if t.ExternalID == externalID {
+				return fmt.Errorf("%w: external ID %q is already used by tenant %s under app %q",
+					tether.ErrConflict, externalID, t.ID, t.AppID)
+			}
+		}
+
+		if len(page) < externalScanPage {
+			return nil
+		}
+	}
 }
 
 // Get returns the tenant with the given ID.

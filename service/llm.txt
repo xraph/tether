@@ -5,7 +5,7 @@ Import: github.com/xraph/tether/service
 Tenant management over a `store.Store`.
 
 `NewTenants(s store.Store) *Tenants`:
-- `Create(ctx, CreateTenantInput{AppID, ExternalID, Name string; Limits tenant.Limits})`: new tenants are enabled. Empty AppID or ExternalID wraps `tether.ErrInvalidInput`; a duplicate `(AppID, ExternalID)` wraps `tether.ErrConflict`.
+- `Create(ctx, CreateTenantInput{AppID, ExternalID, Name string; Limits tenant.Limits})`: new tenants are enabled. Empty AppID or ExternalID wraps `tether.ErrInvalidInput`; an ExternalID already used by another tenant, under this app or any other, wraps `tether.ErrConflict` (keysmith and warden isolate by tenant ID alone, so two tenants must never share one). The check scans every tenant and a mutex serialises `Create` within a process; it is not atomic across nodes sharing a store. `Update` cannot change ExternalID, so it needs no check.
 - `Get(ctx, id.TenantID)`, `List(ctx, tenant.ListFilter)`.
 - `Update(ctx, id.TenantID, UpdateTenantInput{Name *string; Enabled *bool; Limits *tenant.Limits})`: nil fields are untouched; evicts the resolve cache.
 - `Delete(ctx, id.TenantID)`: wraps `tether.ErrConflict` while the tenant has devices (the store does not cascade); evicts the resolve cache.
