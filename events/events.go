@@ -14,7 +14,10 @@
 // panic into the engine: keysmith stops dispatching at the first plugin error.
 package events
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Handler receives key and role changes from the plugins.
 //
@@ -27,6 +30,12 @@ type Handler interface {
 	// (revoked, suspended or expired) and false when only its secret
 	// changed (rotated; the old one may still work during a grace window).
 	KeyInvalidated(ctx context.Context, keyID string, disconnect bool)
+
+	// KeyRotated reports that the keysmith key keyID was rotated at
+	// rotatedAt with a grace window: its previous secret keeps working
+	// until graceEnds, and no longer. A rotation with no grace window is
+	// KeyInvalidated(keyID, true) instead.
+	KeyRotated(ctx context.Context, keyID string, rotatedAt, graceEnds time.Time)
 
 	// RolesChanged reports that the warden role roleID changed: updated,
 	// deleted, or a permission attached or detached.

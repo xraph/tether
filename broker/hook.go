@@ -201,18 +201,7 @@ func (h *hook) startExpiry(st *clientState) {
 		return
 	}
 
-	st.setExpiry(time.AfterFunc(time.Until(exp), func() { h.expire(st) }))
-}
-
-// expire disconnects a connection whose credentials expired, unless it is
-// already gone.
-func (h *hook) expire(st *clientState) {
-	if h.b.state.get(st.cl) != st || st.cl.Closed() {
-		return
-	}
-
-	h.b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
-	disconnect(h.server, h.b.log, st.cl, packets.ErrMaxConnectTime)
+	st.setExpiry(time.AfterFunc(time.Until(exp), func() { h.b.expireConnection(h.server, st) }))
 }
 
 // sessionRoom reports whether a CONNECT for rawID may hold a session of

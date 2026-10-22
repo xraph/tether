@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync/atomic"
+	"time"
 
 	"github.com/xraph/keysmith/key"
 	"github.com/xraph/keysmith/rotation"
@@ -19,12 +20,13 @@ const pluginName = "tether"
 // exists, so the plugin is created first and bound to its Handler later with
 // Bind. Events that arrive before Bind are dropped.
 //
-// Rotation reports KeyInvalidated(id, false): the previous secret keeps
-// working for the rotation's grace window. A rotation with no grace window
+// Rotation reports KeyRotated(id, rotatedAt, graceEnds): the previous secret
+// keeps working until the grace window ends. A rotation with no grace window
 // (keysmith.WithGrace(0), what a compromised key gets) reports
 // KeyInvalidated(id, true) instead, because the previous secret is dead at
 // once and a connection made with it cannot be told from one made with the
-// new secret. Revocation, suspension and expiry report
+// new secret. A rotation hook with no record reports KeyInvalidated(id,
+// false). Revocation, suspension and expiry report
 // KeyInvalidated(id, true). Every hook returns nil and
 // recovers a panic from the Handler, because keysmith stops dispatching at
 // the first plugin error and would fail the caller's operation.
@@ -66,9 +68,41 @@ func (p *KeysmithPlugin) Wired() bool { return p.wired.Load() }
 
 // OnKeyRotated implements keysmith's plugin.KeyRotated.
 func (p *KeysmithPlugin) OnKeyRotated(ctx context.Context, k *key.Key, rec *rotation.Record) error {
-	p.invalidated(ctx, k, rec != nil && rec.GraceTTL <= 0)
+	switch {
+	case rec == nil:
+		p.invalidated(ctx, k, false)
+	case rec.GraceTTL <= 0:
+		p.invalidated(ctx, k, true)
+	default:
+		p.rotated(ctx, k, rec)
+	}
 
 	return nil
+}
+
+// rotated reports a rotation with a grace window. The window ends at
+// rec.GraceEnds, or GraceTTL after the rotation when keysmith left it unset.
+// The rotation time is when keysmith made the record, before it stored the
+// new secret, so no connection made with the new secret can predate it.
+func (p *KeysmithPlugin) rotated(ctx context.Context, k *key.Key, rec *rotation.Record) {
+	ref := p.h.Load()
+	if ref == nil || k == nil || k.ID.IsNil() {
+		return
+	}
+
+	defer recoverHandler()
+
+	at := rec.CreatedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+
+	ends := rec.GraceEnds
+	if ends.IsZero() {
+		ends = at.Add(rec.GraceTTL)
+	}
+
+	ref.h.KeyRotated(ctx, k.ID.String(), at, ends)
 }
 
 // OnKeyRevoked implements keysmith's plugin.KeyRevoked.

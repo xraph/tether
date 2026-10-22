@@ -7,7 +7,8 @@ Turns keysmith key changes and warden role changes into reactions on live MQTT c
 ## Handler
 
 `Handler` is what the plugins report to:
-- `KeyInvalidated(ctx, keyID string, disconnect bool)`: disconnect is true when the key may no longer be used (revoked, suspended, expired, or rotated with no grace window), false for a rotation with a grace window.
+- `KeyInvalidated(ctx, keyID string, disconnect bool)`: disconnect is true when the key may no longer be used (revoked, suspended, expired, or rotated with no grace window), false for a rotation hook that carried no record.
+- `KeyRotated(ctx, keyID string, rotatedAt, graceEnds time.Time)`: the key was rotated at `rotatedAt` and its previous secret works until `graceEnds`.
 - `RolesChanged(ctx, roleID string)`: a role was updated or deleted, or a permission attached to or detached from it.
 - `SubjectChanged(ctx, subjectKind, subjectID string)`: a role was assigned to or unassigned from a warden subject (`"api_key"` for keysmith keys, `"user"`, `"service_acct"`).
 
@@ -15,15 +16,16 @@ Called synchronously from inside the engine call that made the change (and from 
 
 ## Plugins
 
-- `NewKeysmithPlugin() *KeysmithPlugin`: keysmith `plugin.Plugin` named `"tether"`. Register with `keysmith.WithExtension(p)` (construction only), then `p.MarkWired()`; `p.Wired() bool` reports it. `p.Bind(h Handler)` sets the handler later (nil unbinds); events before Bind are dropped. Hooks: `OnKeyRotated` gives `KeyInvalidated(id, false)`, or `(id, true)` when the rotation record's `GraceTTL <= 0` (the old secret is dead at once and its connections cannot be told apart, so all of the key's connections go; this is an addition to the plan's mapping); `OnKeyRevoked`, `OnKeySuspended`, `OnKeyExpired` give `KeyInvalidated(id, true)`. A nil key is ignored.
+- `NewKeysmithPlugin() *KeysmithPlugin`: keysmith `plugin.Plugin` named `"tether"`. Register with `keysmith.WithExtension(p)` (construction only), then `p.MarkWired()`; `p.Wired() bool` reports it. `p.Bind(h Handler)` sets the handler later (nil unbinds); events before Bind are dropped. Hooks: `OnKeyRotated` gives `KeyRotated(id, rec.CreatedAt, rec.GraceEnds)` (`GraceEnds` falls back to `CreatedAt + GraceTTL`, `CreatedAt` to now), `KeyInvalidated(id, true)` when the record's `GraceTTL <= 0` (the old secret is dead at once and its connections cannot be told apart, so all of the key's connections go), and `KeyInvalidated(id, false)` with no record; `OnKeyRevoked`, `OnKeySuspended`, `OnKeyExpired` give `KeyInvalidated(id, true)`. A nil key is ignored.
 - `NewWardenPlugin(h Handler) *WardenPlugin`: warden `plugin.Plugin` named `"tether"`, with `Bind(h)` and `MarkWired`/`Wired` like the keysmith one (nil h at construction leaves it unbound). `OnRoleUpdated`, `OnRoleDeleted`, `OnPermissionAttached`, `OnPermissionDetached` give `RolesChanged(roleID)`; `OnRoleAssigned`, `OnRoleUnassigned` give `SubjectChanged(a.SubjectKind, a.SubjectID)`. Warden emits no tenant; role IDs and key IDs are unique across tenants. Register with `warden.WithPlugin(p)` at construction: warden v1.8.0's `Engine.Plugins()` is nil unless the engine was built with a plugin or a decision cache, so runtime `Plugins().Register` can panic.
 - Every hook returns nil and recovers a Handler panic (logged through `slog.Default()`). Keysmith stops dispatching at the first plugin error and would fail the admin call.
 
 ## Reactor
 
-`NewReactor(evict func(keyID string), b BrokerControl) Handler`. `BrokerControl` is `DisconnectPrincipal(principalID, packets.Code) int`, `ReloadRole(ctx, roleID)`, `ReloadPrincipal(ctx, principalID)`, all on `*broker.Broker`. `evict` is `(*auth.Keysmith).Evict`, may be nil.
+`NewReactor(evict func(keyID string), b BrokerControl) Handler`. `BrokerControl` is `DisconnectPrincipal(principalID, packets.Code) int`, `ExpirePrincipal(principalID, connectedBefore, at time.Time) int`, `ReloadRole(ctx, roleID)`, `ReloadPrincipal(ctx, principalID)`, all on `*broker.Broker`. `evict` is `(*auth.Keysmith).Evict`, may be nil.
 - `KeyInvalidated(id, true)`: evict, then `DisconnectPrincipal(id, packets.ErrAdministrativeAction)` (0x98). Eviction comes first so a reconnect is validated by keysmith.
 - `KeyInvalidated(id, false)`: evict only. Live connections stay.
+- `KeyRotated(id, rotatedAt, graceEnds)`: evict, then `ExpirePrincipal(id, rotatedAt, graceEnds)`: every connection made before the rotation (with the previous secret) ends at the grace end with 0xA0. Connections made with the new secret stay; one made with the previous secret during the window already expires then, because keysmith's validation reports the grace end (`auth.Keysmith`).
 - `RolesChanged(id)`: `ReloadRole`.
 - `SubjectChanged` with kind `"api_key"`, `"user"` or `"service_acct"` (warden's names): `ReloadPrincipal(id)`. Other kinds and empty IDs are ignored. Principal IDs are matched across kinds, which is fine while key, user and service account IDs are typeIDs with distinct prefixes.
 - Empty IDs are ignored.

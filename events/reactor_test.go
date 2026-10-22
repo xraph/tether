@@ -57,6 +57,16 @@ func (r *recorder) KeyInvalidated(_ context.Context, keyID string, disconnect bo
 	r.add("KeyInvalidated", keyID, disconnect)
 }
 
+func (r *recorder) KeyRotated(_ context.Context, keyID string, rotatedAt, graceEnds time.Time) {
+	r.add("KeyRotated", keyID, rotatedAt, graceEnds)
+}
+
+func (r *recorder) ExpirePrincipal(principalID string, connectedBefore, at time.Time) int {
+	r.add("ExpirePrincipal", principalID, connectedBefore, at)
+
+	return 1
+}
+
 func (r *recorder) RolesChanged(_ context.Context, roleID string) {
 	r.add("RolesChanged", roleID)
 }
@@ -112,7 +122,11 @@ func TestKeysmithPluginMapsHooks(t *testing.T) {
 	h := &recorder{}
 	p.Bind(h)
 
-	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Hour}))
+	rotatedAt := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	graceEnds := rotatedAt.Add(time.Hour)
+
+	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Hour, CreatedAt: rotatedAt, GraceEnds: graceEnds}))
+	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Minute, CreatedAt: rotatedAt})) // no GraceEnds: TTL after
 	require.NoError(t, p.OnKeyRotated(ctx, k, nil))
 	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: 0})) // the old secret is dead at once
 	require.NoError(t, p.OnKeyRevoked(ctx, k, "stolen"))
@@ -121,7 +135,8 @@ func TestKeysmithPluginMapsHooks(t *testing.T) {
 
 	id := k.ID.String()
 	assert.Equal(t, []call{
-		{"KeyInvalidated", []any{id, false}},
+		{"KeyRotated", []any{id, rotatedAt, graceEnds}},
+		{"KeyRotated", []any{id, rotatedAt, rotatedAt.Add(time.Minute)}},
 		{"KeyInvalidated", []any{id, false}},
 		{"KeyInvalidated", []any{id, true}},
 		{"KeyInvalidated", []any{id, true}},
@@ -228,6 +243,10 @@ func TestReactor(t *testing.T) {
 
 	r.KeyInvalidated(ctx, "akey_revoked", true)
 	r.KeyInvalidated(ctx, "akey_rotated", false)
+
+	at := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	r.KeyRotated(ctx, "akey_grace", at, at.Add(time.Minute))
+	r.KeyRotated(ctx, "", at, at)
 	r.RolesChanged(ctx, "role_1")
 	r.SubjectChanged(ctx, "api_key", "akey_2")
 	r.SubjectChanged(ctx, "user", "usr_1")
@@ -243,11 +262,13 @@ func TestReactor(t *testing.T) {
 		{"Evict", []any{"akey_revoked"}},
 		{"DisconnectPrincipal", []any{"akey_revoked", byte(0x98)}},
 		{"Evict", []any{"akey_rotated"}},
+		{"Evict", []any{"akey_grace"}},
+		{"ExpirePrincipal", []any{"akey_grace", at, at.Add(time.Minute)}},
 		{"ReloadRole", []any{"role_1"}},
 		{"ReloadPrincipal", []any{"akey_2"}},
 		{"ReloadPrincipal", []any{"usr_1"}},
 		{"ReloadPrincipal", []any{"svc_1"}},
-	}, b.all(), "a rotation only evicts; users, service accounts and keys reload; other subjects and empty IDs are ignored")
+	}, b.all(), "an invalidation without disconnect only evicts, a graceful rotation ends old connections at the grace end; users, service accounts and keys reload; other subjects and empty IDs are ignored")
 }
 
 func TestReactorNilEvict(t *testing.T) {

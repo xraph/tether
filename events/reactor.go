@@ -2,6 +2,7 @@ package events
 
 import (
 	"context"
+	"time"
 
 	"github.com/mochi-mqtt/server/v2/packets"
 	"github.com/xraph/warden"
@@ -10,6 +11,7 @@ import (
 // BrokerControl is the part of *broker.Broker the reactor drives.
 type BrokerControl interface {
 	DisconnectPrincipal(principalID string, code packets.Code) int
+	ExpirePrincipal(principalID string, connectedBefore, at time.Time) int
 	ReloadRole(ctx context.Context, roleID string)
 	ReloadPrincipal(ctx context.Context, principalID string)
 }
@@ -26,9 +28,13 @@ type reactor struct {
 //
 //   - KeyInvalidated with disconnect: evict the key, then disconnect every
 //     connection authenticated with it (0x98 administrative action).
-//   - KeyInvalidated without disconnect (a rotation): evict the key only.
-//     Live connections stay; the previous secret keeps working for its grace
-//     window, and the next CONNECT validates against keysmith again.
+//   - KeyInvalidated without disconnect: evict the key only.
+//   - KeyRotated (a rotation with a grace window): evict the key, then end
+//     every connection made before the rotation, which used the previous
+//     secret, when the grace window closes (ExpirePrincipal; 0xA0 then).
+//     Connections made with the new secret stay, and one made with the
+//     previous secret during the window already expires with it, because
+//     keysmith says so when it validates (auth.Keysmith).
 //   - RolesChanged: reload the connections whose grants came from the role.
 //   - SubjectChanged for an "api_key", "user" or "service_acct" subject:
 //     reload that principal's connections. Other subject kinds are ignored,
@@ -52,6 +58,18 @@ func (r *reactor) KeyInvalidated(_ context.Context, keyID string, disconnect boo
 	if disconnect {
 		r.b.DisconnectPrincipal(keyID, packets.ErrAdministrativeAction)
 	}
+}
+
+func (r *reactor) KeyRotated(_ context.Context, keyID string, rotatedAt, graceEnds time.Time) {
+	if keyID == "" {
+		return
+	}
+
+	if r.evict != nil {
+		r.evict(keyID)
+	}
+
+	r.b.ExpirePrincipal(keyID, rotatedAt, graceEnds)
 }
 
 func (r *reactor) RolesChanged(ctx context.Context, roleID string) {

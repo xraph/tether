@@ -67,6 +67,81 @@ func (b *Broker) DisconnectPrincipal(principalID string, code packets.Code) int 
 	return n
 }
 
+// ExpirePrincipal makes every live connection authenticated as principalID
+// that connected before connectedBefore end at at, unless its credentials
+// expire sooner already: the connection's Identity.ExpiresAt becomes the
+// earlier of the two and its expiry timer is set again. When it fires the
+// client is disconnected with 0xA0 (maximum connect time), as for any
+// expired credentials. It returns how many connections it shortened.
+//
+// It is the rotation of a key with a grace window: connections made before
+// the rotation used the previous secret, which stops working at the window's
+// end. A connection made with that secret during the window already expires
+// with it (keysmith reports the grace end when it validates). A CONNECT in
+// flight when this runs authorizes again (Broker.changes), so it is not
+// missed.
+//
+// Before Start and after Stop it does nothing and returns 0.
+func (b *Broker) ExpirePrincipal(principalID string, connectedBefore, at time.Time) int {
+	if principalID == "" {
+		return 0
+	}
+
+	b.changes.Add(1)
+
+	srv := b.running()
+	if srv == nil {
+		return 0
+	}
+
+	n := 0
+
+	for _, st := range b.state.match(func(st *clientState) bool { return st.ident.Load().PrincipalID == principalID }) {
+		if st.cl.Closed() || !st.connectedAt.Before(connectedBefore) {
+			continue
+		}
+
+		if b.shorten(srv, st, at) {
+			n++
+		}
+	}
+
+	return n
+}
+
+// shorten sets st's credentials to expire at at, unless they expire sooner,
+// and sets its expiry timer again. It holds reloadMu, like every writer of
+// the identity.
+func (b *Broker) shorten(srv *mqtt.Server, st *clientState, at time.Time) bool {
+	st.reloadMu.Lock()
+	defer st.reloadMu.Unlock()
+
+	ident := *st.ident.Load()
+	if !ident.ExpiresAt.IsZero() && !at.Before(ident.ExpiresAt) {
+		return false
+	}
+
+	ident.ExpiresAt = at
+	st.ident.Store(&ident)
+	st.setExpiry(time.AfterFunc(time.Until(at), func() { b.expireConnection(srv, st) }))
+
+	b.log.Info("tether: connection ends with its credentials' grace window", slog.String("client", st.cl.ID),
+		slog.String("tenant", st.tenantID), slog.Time("at", at))
+
+	return true
+}
+
+// expireConnection disconnects a connection whose credentials expired with
+// 0xA0 (maximum connect time), unless it is already gone.
+func (b *Broker) expireConnection(srv *mqtt.Server, st *clientState) {
+	if b.state.get(st.cl) != st || st.cl.Closed() {
+		return
+	}
+
+	b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+	disconnect(srv, b.log, st.cl, packets.ErrMaxConnectTime)
+}
+
 // ReloadRole reloads the grants of every live connection whose current
 // grants came from roleID, directly or through role inheritance (the role
 // IDs its PermLoader returned). See ReloadPrincipal for what a reload does.

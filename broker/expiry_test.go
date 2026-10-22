@@ -169,3 +169,40 @@ func TestTenantCapExpires5Session(t *testing.T) {
 		return !found
 	}, 8*time.Second, 50*time.Millisecond)
 }
+
+// ExpirePrincipal ends the principal's connections made before the mark at
+// the given time, with 0xA0, and leaves later ones alone.
+func TestExpirePrincipalEndsOlderConnections(t *testing.T) {
+	tn := newTenant(tenant.Limits{})
+	b := startBroker(t, map[string]*auth.Identity{"dev": ident(tn, "dev")}, nil)
+	addr := b.Addr().String()
+
+	old, _, err := connect5(t, addr, "old", "dev", true)
+	require.NoError(t, err)
+
+	mark := time.Now()
+
+	// connectedAt is taken from the wall clock; make sure the next one is
+	// after the mark.
+	time.Sleep(5 * time.Millisecond)
+
+	fresh, _, err := connect5(t, addr, "new", "dev", true)
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, b.ExpirePrincipal("akey_dev", mark, time.Now().Add(200*time.Millisecond)))
+	assert.Equal(t, 0, b.ExpirePrincipal("akey_dev", mark, time.Now().Add(time.Hour)), "a later end does not extend it")
+	assert.Equal(t, 0, b.ExpirePrincipal("akey_nobody", mark, time.Now()))
+
+	select {
+	case d := <-old.disconnects:
+		assert.Equal(t, byte(0xA0), d.ReasonCode)
+	case <-time.After(waitTimeout):
+		require.FailNow(t, "the older connection was not ended")
+	}
+
+	select {
+	case d := <-fresh.disconnects:
+		require.FailNow(t, "the newer connection was ended", "reason %#x", d.ReasonCode)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

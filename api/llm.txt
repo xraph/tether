@@ -36,7 +36,7 @@ All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged 
 | `DELETE /:tenantId/retained?topic=` | 204; nothing retained there is 404 |
 | `GET /:tenantId/stats` | `{connected, sessions, subscriptions, retained, messages_in, messages_out}` on this node |
 
-Revoke, delete and rotate do not touch the broker: the keysmith plugin events (`events/`) disconnect and evict. The API does not duplicate that.
+Revoke, delete and rotate do not call the broker themselves: the keysmith plugin events (`events/`) disconnect, end pre-rotation connections at the grace end, and evict, and the device service deletes a pinned device's session. The API does not duplicate that.
 
 Every route that calls the broker (clients, kick, sessions, retained, stats, publish) is 503 while `Broker.Running()` is false. Tenant PATCH and DELETE are not gated: `UpdateTenant` is a no-op on a stopped broker, and the store write is the point.
 
