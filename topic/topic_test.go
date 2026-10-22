@@ -20,6 +20,9 @@ func TestNamespaceStrip(t *testing.T) {
 		{"$SYS", "$SYS/ttnt_a"},
 		{"$share/g/$SYS/x", "$share/g/$SYS/ttnt_a/x"},
 		{"/a", "ttnt_a//a"},
+		{"$SHARE/ttnt_b/#", "$SHARE/ttnt_b/ttnt_a/#"},
+		{"$Share/g/x", "$Share/g/ttnt_a/x"},
+		{"$sHaRe/g/$SYS/x", "$sHaRe/g/$SYS/ttnt_a/x"},
 	}
 	for _, c := range cases {
 		require.Equal(t, c.ns, topic.Namespace("ttnt_a", c.in))
@@ -49,6 +52,10 @@ func TestStripRejectsForeignNames(t *testing.T) {
 		"$share/g/ttnt_b/x",
 		"$share/g/$SYS/x",
 		"$share",
+		"$SHARE",
+		"$SHARE/g",
+		"$Share/g/ttnt_b/x",
+		"$SHARE/ttnt_a/x", // a group named like the tenant is not the tenant's filter
 	} {
 		got, ok := topic.Strip("ttnt_a", ns)
 		require.False(t, ok, "%q stripped to %q", ns, got)
@@ -202,6 +209,17 @@ func TestValid(t *testing.T) {
 		{"$share/g/x", false, 0, false},
 		{"$share", false, 0, false},
 		{"$sharex/g/x", false, 0, true},
+		{"$SHARE/ttnt_b/#", true, 0, true},
+		{"$Share/g/x", true, 0, true},
+		{"$SHARE", true, 0, false},
+		{"$Share", true, 0, false},
+		{"$SHARE/g", true, 0, false},
+		{"$SHARE/", true, 0, false},
+		{"$SHARE//x", true, 0, false},
+		{"$SHARE/+/x", true, 0, false},
+		{"$SHARE/g/$Share/h/x", true, 0, false},
+		{"$SHARE/g/x", false, 0, false},
+		{"$Share", false, 0, false},
 	}
 	for _, c := range cases {
 		err := topic.Valid(c.name, c.isFilter, c.maxLen)

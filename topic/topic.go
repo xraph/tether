@@ -18,9 +18,8 @@ import (
 )
 
 const (
-	sep         = "/"
-	share       = "$share"
-	sharePrefix = share + sep
+	sep   = "/"
+	share = "$share"
 )
 
 // Namespace places name inside tenant's topic space.
@@ -37,13 +36,35 @@ const (
 // input (a "$share/" name without a group and a filter) the result is
 // unspecified.
 func Namespace(tenant, name string) string {
-	if rest, ok := strings.CutPrefix(name, sharePrefix); ok {
-		if group, filter, found := strings.Cut(rest, sep); found {
-			return sharePrefix + group + sep + namespacePlain(tenant, filter)
-		}
+	if prefix, filter, ok := cutShare(name); ok {
+		return prefix + namespacePlain(tenant, filter)
 	}
 
 	return namespacePlain(tenant, name)
+}
+
+// cutShare splits a shared subscription "$share/<group>/<filter>" into its
+// "$share/<group>/" prefix, with the client's own casing, and the filter. The
+// "$share" level is matched case-insensitively because mochi does the same: a
+// "$SHARE/g/x" filter is a shared subscription there, and it has to be
+// namespaced as one, or the group would be read as the filter's first level.
+func cutShare(name string) (prefix, filter string, ok bool) {
+	first, rest, more := strings.Cut(name, sep)
+	if !more || !strings.EqualFold(first, share) {
+		return "", "", false
+	}
+
+	_, filter, found := strings.Cut(rest, sep)
+	if !found {
+		return "", "", false
+	}
+
+	return name[:len(name)-len(filter)], filter, true
+}
+
+// isShare reports whether a topic level is the reserved "$share" level, in any casing.
+func isShare(level string) bool {
+	return strings.EqualFold(level, share)
 }
 
 func namespacePlain(tenant, name string) string {
@@ -63,9 +84,9 @@ func namespacePlain(tenant, name string) string {
 // in tenant's namespace, for example another tenant's topic or one of the
 // broker's own global "$SYS" topics.
 func Strip(tenant, name string) (string, bool) {
-	if rest, ok := strings.CutPrefix(name, sharePrefix); ok {
-		_, filter, found := strings.Cut(rest, sep)
-		if !found {
+	if isShare(firstLevel(name)) {
+		prefix, filter, ok := cutShare(name)
+		if !ok {
 			return "", false
 		}
 
@@ -74,7 +95,7 @@ func Strip(tenant, name string) (string, bool) {
 			return "", false
 		}
 
-		return name[:len(name)-len(filter)] + stripped, true
+		return prefix + stripped, true
 	}
 
 	return stripPlain(tenant, name)
@@ -212,7 +233,8 @@ func wildcardFirst(filter string) bool {
 // may use "+" and "#" only as whole levels, with "#" last. A shared filter
 // "$share/<group>/<filter>" needs a non-empty group without wildcards and a
 // valid, non-empty filter part that is not itself shared. A topic name may not
-// start with the reserved "$share" level, which only subscriptions use.
+// start with the reserved "$share" level, which only subscriptions use. The
+// level is matched in any casing, as mochi does.
 func Valid(name string, isFilter bool, maxLen int) error {
 	switch {
 	case name == "":
@@ -228,14 +250,18 @@ func Valid(name string, isFilter bool, maxLen int) error {
 			return invalid("topic name contains a wildcard")
 		}
 
-		if firstLevel(name) == share {
+		if isShare(firstLevel(name)) {
 			return invalid("topic name uses the reserved $share level")
 		}
 
 		return nil
 	}
 
-	if rest, ok := strings.CutPrefix(name, sharePrefix); ok {
+	if first, rest, more := strings.Cut(name, sep); isShare(first) {
+		if !more {
+			return invalid("shared filter needs a group and a filter")
+		}
+
 		group, filter, found := strings.Cut(rest, sep)
 
 		switch {
@@ -245,13 +271,11 @@ func Valid(name string, isFilter bool, maxLen int) error {
 			return invalid("shared filter has an empty group")
 		case strings.ContainsAny(group, "+#"):
 			return invalid("shared filter group contains a wildcard")
-		case firstLevel(filter) == share:
+		case isShare(firstLevel(filter)):
 			return invalid("shared filter nests $share")
 		}
 
 		name = filter
-	} else if name == share {
-		return invalid("shared filter needs a group and a filter")
 	}
 
 	return validFilterLevels(name)

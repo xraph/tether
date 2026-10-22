@@ -11,4 +11,5 @@ Pure package (no mochi, no forge). Tenant namespacing and MQTT topic matching. L
 - `Valid(name, isFilter, maxLen) error`: errors wrap `tether.ErrInvalidInput`. Non-empty, no NUL, byte length <= maxLen (0 = no limit). Names: no `+` or `#`, first level may not be `$share`. Filters: `+`/`#` whole levels, `#` last. `$share/<group>/<filter>`: group non-empty and wildcard-free, filter part non-empty, valid and not itself `$share`.
 
 `Match` and `Covers` take plain names: strip `$share/<group>/` before ACL checks.
-Fuzz targets: `FuzzNamespaceRoundTrip`, `FuzzCoversImpliesMatch` (fuzz_test.go).
+The `$share` level is detected case-insensitively everywhere (mochi does the same); the client's casing is kept so Strip round-trips.
+Fuzz targets (fuzz_test.go): `FuzzNamespaceRoundTrip`, `FuzzCoversImpliesMatch`, `FuzzNamespaceIsolation` (parses the namespaced filter as mochi does and asserts it stays in the tenant's space).
