@@ -85,7 +85,8 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant session limit reached", nil)
 	}
 
-	if !h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections) {
+	from, ok := h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections)
+	if !ok {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant connection limit reached", nil)
 	}
 
@@ -96,14 +97,14 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	st.expiryShortened = cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval > st.expiryCap
 
 	if !h.b.state.addUnlessDeleting(st, namespacedID(tenantID, cl.ID)) {
-		st.releaseSlot()
+		st.returnSlot(from)
 
 		return h.refuse(cl, log, packets.ErrServerUnavailable, "session is being deleted", nil)
 	}
 
 	if h.b.changes.Load() != gen && !h.reauthorize(ctx, cl, pk, st, log) {
 		h.b.state.remove(cl)
-		st.releaseSlot()
+		st.returnSlot(from)
 
 		return false
 	}
@@ -246,26 +247,29 @@ func (h *hook) sessionRoom(tenantID, rawID string, limit int) bool {
 //
 // A slot taken here is reported as an opened connection; an inherited one is
 // not, since the connection it came from never reports its close.
-func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) bool {
+//
+// from is the connection an inherited slot came from, so a CONNECT refused
+// after this can give it back (clientState.returnSlot); nil for a fresh slot.
+func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) (from *clientState, ok bool) {
 	if h.acquire(tenantID, maxConns) {
-		return true
+		return nil, true
 	}
 
 	if h.b.state.sweepClosed(tenantID) > 0 && h.acquire(tenantID, maxConns) {
-		return true
+		return nil, true
 	}
 
 	prev := h.b.state.owner(namespacedID(tenantID, rawID))
 	if prev == nil {
-		return false
+		return nil, false
 	}
 
 	if prev.transferSlot() {
-		return true
+		return prev, true
 	}
 
 	// The old connection released its slot in the meantime.
-	return h.acquire(tenantID, maxConns)
+	return nil, h.acquire(tenantID, maxConns)
 }
 
 // acquire takes a fresh tenant connection slot and reports the connection

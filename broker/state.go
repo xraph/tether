@@ -48,7 +48,11 @@ type clientState struct {
 
 	limiter  *limits.Limiter
 	counters *tenantCounters
-	release  sync.Once
+	// slot is who holds the connection's tenant slot: slotHeld (the zero
+	// value) until releaseSlot gives it back to the tenant or transferSlot
+	// hands it to a takeover. A refused takeover can return a transferred
+	// slot (returnSlot).
+	slot atomic.Int32
 
 	// metrics hears about the slot's release as a closed connection. Nil
 	// for states the hook did not create (tests).
@@ -174,24 +178,50 @@ func (st *clientState) markEnded() {
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
 // than once and from more than one goroutine.
 func (st *clientState) releaseSlot() {
-	st.release.Do(func() {
+	if st.slot.CompareAndSwap(slotHeld, slotReleased) {
 		st.limiter.ReleaseConnection(st.tenantID)
 
 		if st.metrics != nil {
 			st.metrics.ConnectionClosed()
 		}
-	})
+
+		return
+	}
+
+	// A transferred slot is the taker's now; this connection is gone, so
+	// it can no longer be handed back.
+	st.slot.CompareAndSwap(slotTransferred, slotReleased)
 }
 
 // transferSlot hands this connection's slot to a connection taking over its
-// client ID. It reports false when the slot was already released; after a
-// transfer, releaseSlot does nothing.
+// client ID. It reports false when the slot was already released or handed
+// on; after a transfer, releaseSlot does nothing.
 func (st *clientState) transferSlot() bool {
-	transferred := false
-	st.release.Do(func() { transferred = true })
-
-	return transferred
+	return st.slot.CompareAndSwap(slotHeld, slotTransferred)
 }
+
+// returnSlot gives up the slot of a connection that was refused before it
+// took any session over. A slot it was handed by from (transferSlot) goes
+// back to from, which is still connected and will release it itself; if
+// from has gone meanwhile, or the slot was a fresh one, it is released.
+func (st *clientState) returnSlot(from *clientState) {
+	if from != nil && from.slot.CompareAndSwap(slotTransferred, slotHeld) {
+		// from holds it again. This state never held a slot of its own,
+		// and never reports one.
+		st.slot.Store(slotReleased)
+
+		return
+	}
+
+	st.releaseSlot()
+}
+
+// Who holds a connection's tenant slot (clientState.slot).
+const (
+	slotHeld int32 = iota
+	slotTransferred
+	slotReleased
+)
 
 // registry indexes connection state.
 //
@@ -409,8 +439,8 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 //
 // A closed connection never uses its slot again. One that is still tearing
 // down finds its state among the closing ones in OnDisconnect afterwards,
-// which marks it ended; the slot is released once (releaseSlot is behind a
-// sync.Once). A live connection is
+// which marks it ended; the slot is released once (releaseSlot moves it out
+// of the held state atomically). A live connection is
 // never closed, so its slot is never touched. The scan is linear in the
 // broker's connections and runs only when a tenant is at its limit.
 func (r *registry) sweepClosed(tenantID string) int {

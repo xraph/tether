@@ -4,10 +4,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eclipse/paho.golang/paho"
 	pahov3packets "github.com/eclipse/paho.mqtt.golang/packets"
+	"github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/tenant"
 )
@@ -87,4 +90,73 @@ func TestMaxInflightReachesMochi(t *testing.T) {
 	cfg.MaxInflight = 16
 	b = startBrokerWith(t, cfg, nil, nil, nil)
 	assert.Equal(t, uint16(16), b.server.Options.Capabilities.MaximumInflight)
+}
+
+// A takeover that was handed the old connection's slot and is then refused
+// (here: a change arrived while it connected, and authorizing again
+// failed) gives the slot back to the old connection, which is still open.
+// Releasing it instead would let the tenant open one connection too many.
+func TestRefusedTakeoverGivesTheSlotBack(t *testing.T) {
+	tn := newTenant(tenant.Limits{MaxConnections: 1})
+	authn := &switchAuth{ids: map[string]*auth.Identity{"dev": ident(tn, "dev")}}
+	perms := newMutablePerms(map[string]acl.Rules{})
+	b := startBrokerDeps(t, authn, perms)
+	addr := b.Addr().String()
+
+	old, _, err := connect5(t, addr, "dev-1", "dev", true)
+	require.NoError(t, err)
+
+	release := perms.hold("dev")
+	done := make(chan *paho.Connack, 1)
+
+	go func() {
+		_, ca, _ := dial5(t, addr, &paho.Connect{
+			ClientID: "dev-1", Username: "dev", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+			CleanStart: true, KeepAlive: 30,
+		})
+		done <- ca
+	}()
+
+	select {
+	case <-perms.started:
+	case <-time.After(waitTimeout):
+		require.FailNow(t, "the takeover never reached Load")
+	}
+
+	// A change lands while the takeover is in Load, and authorizing again
+	// will fail.
+	authn.setRefuse(true)
+	b.DisconnectPrincipal("akey_nobody", packets.ErrAdministrativeAction)
+	release()
+
+	select {
+	case ca := <-done:
+		require.NotNil(t, ca)
+		assert.NotEqual(t, byte(0), ca.ReasonCode, "the takeover is refused")
+	case <-time.After(waitTimeout):
+		require.FailNow(t, "the takeover never finished")
+	}
+
+	authn.setRefuse(false)
+
+	// The old connection is still there and still holds the tenant's one
+	// slot, so a second client ID is over the limit.
+	_, ca, err := connect5(t, addr, "dev-2", "dev", true)
+	require.Error(t, err)
+	require.NotNil(t, ca)
+	assert.Equal(t, byte(0x97), ca.ReasonCode)
+
+	select {
+	case d := <-old.disconnects:
+		require.FailNow(t, "the old connection was dropped", "reason %#x", d.ReasonCode)
+	default:
+	}
+
+	// When it leaves, the slot is free again.
+	require.NoError(t, old.Disconnect(&paho.Disconnect{}))
+	require.Eventually(t, func() bool {
+		_, _, err := connect5(t, addr, "dev-3", "dev", true)
+
+		return err == nil
+	}, waitTimeout, 20*time.Millisecond)
 }
