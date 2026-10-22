@@ -132,8 +132,16 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 // and a live connection already owns this client ID, the new connection is a
 // takeover that mochi is about to disconnect the old one for, so it inherits
 // the old connection's slot and needs no second one.
+//
+// Before that, it sweeps the tenant's closed connections. Mochi skips
+// OnDisconnect when writing the success CONNACK or resending inflight
+// messages fails, so their slots would otherwise stay taken for good.
 func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) bool {
 	if h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
+		return true
+	}
+
+	if h.b.state.sweepClosed(tenantID) > 0 && h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
 		return true
 	}
 

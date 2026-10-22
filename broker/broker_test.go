@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	pahov3packets "github.com/eclipse/paho.mqtt.golang/packets"
 	"github.com/gorilla/websocket"
 	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/listeners"
 	mochipackets "github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -612,4 +614,78 @@ func requireClosed(t *testing.T, conn net.Conn) {
 
 		require.Equal(t, packets.DISCONNECT, cp.Type, "only a DISCONNECT may precede the close")
 	}
+}
+
+// writeFailListener accepts real connections whose writes always fail, so
+// mochi's success CONNACK write fails and attachClient returns without
+// calling OnDisconnect. closed receives once per connection mochi closes.
+type writeFailListener struct {
+	net.Listener
+
+	closed chan struct{}
+}
+
+func (l *writeFailListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	return &writeFailConn{Conn: c, closed: l.closed}, nil
+}
+
+type writeFailConn struct {
+	net.Conn
+
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (c *writeFailConn) Write([]byte) (int, error) { return 0, errors.New("write refused by test") }
+
+func (c *writeFailConn) Close() error {
+	c.once.Do(func() { c.closed <- struct{}{} })
+
+	return c.Conn.Close()
+}
+
+// A handshake that dies on the success CONNACK skips OnDisconnect in mochi.
+// Its slot must come back without the client ever reconnecting.
+func TestSlotReleasedWhenConnackWriteFails(t *testing.T) {
+	ta := newTenant(tenant.Limits{MaxConnections: 1})
+	b := startBroker(t, map[string]*auth.Identity{"a": ident(ta, "a")}, nil)
+
+	raw, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	faulty := &writeFailListener{Listener: raw, closed: make(chan struct{}, 1)}
+	require.NoError(t, b.server.AddListener(listeners.NewNet("faulty", faulty)))
+	b.server.Listeners.Serve("faulty", b.server.EstablishConnection)
+
+	conn, err := dial(t, raw.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	// Empty client ID: mochi assigns a random one, so this ID never returns.
+	_, err = (&packets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, CleanStart: true, KeepAlive: 30,
+		Username: "a", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: &packets.Properties{},
+	}).WriteTo(conn)
+	require.NoError(t, err)
+
+	select {
+	case <-faulty.closed:
+	case <-time.After(waitTimeout):
+		t.Fatal("broker never closed the failed handshake")
+	}
+
+	_, _, err = connect5(t, b.Addr().String(), "next", "a", true)
+	require.NoError(t, err, "the leaked slot is swept and reused")
+
+	// The sweep never frees a live connection's slot.
+	_, ca, err := connect5(t, b.Addr().String(), "another", "a", true)
+	require.Error(t, err)
+	require.NotNil(t, ca)
+	assert.Equal(t, byte(0x97), ca.ReasonCode)
 }

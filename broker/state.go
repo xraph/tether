@@ -125,6 +125,42 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 	return st
 }
 
+// sweepClosed drops every state of tenantID whose connection is closed and
+// releases its slot. It returns how many it dropped.
+//
+// A closed connection never uses its slot again. One that is still tearing
+// down finds no state in OnDisconnect afterwards, which is fine: the slot is
+// released once (releaseSlot is behind a sync.Once). A live connection is
+// never closed, so its slot is never touched. The scan is linear in the
+// broker's connections and runs only when a tenant is at its limit.
+func (r *registry) sweepClosed(tenantID string) int {
+	r.mu.Lock()
+
+	var swept []*clientState
+
+	for cl, st := range r.byClient {
+		if st.tenantID != tenantID || !cl.Closed() {
+			continue
+		}
+
+		delete(r.byClient, cl)
+
+		if r.byID[cl.ID] == st {
+			delete(r.byID, cl.ID)
+		}
+
+		swept = append(swept, st)
+	}
+
+	r.mu.Unlock()
+
+	for _, st := range swept {
+		st.releaseSlot()
+	}
+
+	return len(swept)
+}
+
 // owner returns the state of the connection that owns the namespaced client
 // ID, or nil.
 func (r *registry) owner(nsID string) *clientState {
