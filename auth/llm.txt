@@ -7,7 +7,7 @@ Turns MQTT CONNECT credentials into a tenant-scoped identity. The broker calls `
 - `Credentials{ClientID, Username string; Password []byte; Remote string}`.
 - `Identity{Tenant *tenant.Tenant; PrincipalKind, PrincipalID, Username, DeviceID string; ExpiresAt time.Time}`. `PrincipalKind` is `auth.PrincipalKindAPIKey` ("api_key") and `PrincipalID` the key ID for keysmith. Zero `ExpiresAt` means no expiry; the broker disconnects the client at that time. Callers get a copy.
 - `Authenticator`: `Authenticate(ctx, Credentials) (*Identity, error)`.
-- Errors (every failure wraps exactly one): `ErrBadCredentials` (CONNACK 0x86), `ErrNotAuthorized` (0x87), `ErrUnavailable` (0x88), `ErrRateLimited` (0x9F).
+- Errors (every failure wraps exactly one): `ErrBadCredentials` (CONNACK 0x86), `ErrNotAuthorized` (0x87), `ErrUnavailable` (0x88), `ErrRateLimited` (0x9F). `ErrUnavailable` comes only from: a device or tenant lookup failing with anything but not-found, a validator error that is not a recognised keysmith credential error, and a validator result with no key. It does NOT cover a keysmith lookup-store outage (see Known limitation).
 
 ## Keysmith
 
@@ -15,11 +15,13 @@ Turns MQTT CONNECT credentials into a tenant-scoped identity. The broker calls `
 
 Order of decisions:
 1. Empty username or password: `ErrBadCredentials`.
-2. `ValidateKey` (cache by SHA-256 of the password first). `ErrInvalidKey`, `ErrKeyInactive`, `ErrKeyExpired`, `ErrKeyRevoked`, `ErrKeySuspended` give `ErrBadCredentials`; keysmith `ErrRateLimited` gives `ErrRateLimited`; anything else (and a nil result) gives `ErrUnavailable`.
+2. `ValidateKey` (cache by SHA-256 of the password first). `ErrInvalidKey`, `ErrKeyInactive`, `ErrKeyExpired`, `ErrKeyRevoked`, `ErrKeySuspended` give `ErrBadCredentials`; keysmith `ErrRateLimited` gives `ErrRateLimited`; any other validator error (and a nil result) gives `ErrUnavailable`.
 3. `res.Key.ID.String()` must equal the username, else `ErrBadCredentials` (the raw key does not carry its ID).
 4. `GetDeviceByKey`: not found gives `ErrNotAuthorized` (a keysmith key with no Tether device), other errors `ErrUnavailable`.
 5. Tenant from `res.Key.AppID` and `res.Key.TenantID` through `TenantResolver`: not found, disabled, or not the device's tenant gives `ErrNotAuthorized`; other errors `ErrUnavailable`.
 6. Device `ClientID` pin: a set pin that differs from `Credentials.ClientID` gives `ErrNotAuthorized`.
+
+Known limitation: keysmith v1.8.0 `ValidateKey` returns `ErrInvalidKey` for any failure of its key lookup (`GetByHash`), a database outage included, and does the same for a cancelled context. Tether cannot tell that from a wrong key, so while keysmith's store is down every uncached device is refused with `ErrBadCredentials` (CONNACK 0x86), not `ErrUnavailable` (0x88). Cached devices keep connecting until their entry expires. `TestKeysmithLookupOutageSurfacesAsBadCredentials` pins this against the real engine and should flip to `ErrUnavailable` when keysmith distinguishes outages.
 
 Cache: `WithCacheTTL(d)`, default 60 s, zero or less turns it off. Only successful validations are cached, and never past the key's `ExpiresAt` (or the grace window end for a rotated key, which also becomes `Identity.ExpiresAt`). A hit still checks username and client ID pin and resolves the tenant again, so a disabled tenant is refused at once. The device (pin, tenant) is read once per entry. A hit does not reach keysmith, so a revoked key, a changed device, and keysmith's rate limit and usage counting lag by up to the TTL: call `(*Keysmith).Evict(keyID)` when a key is revoked, rotated or suspended, or its device changes. `Evict` drops every entry for that key ID.
 

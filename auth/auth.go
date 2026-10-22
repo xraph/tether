@@ -23,8 +23,17 @@ var (
 	// is pinned to another client ID. CONNACK 0x87.
 	ErrNotAuthorized = errors.New("tether/auth: not authorized")
 
-	// ErrUnavailable means authentication could not be decided: a store or
-	// the key service failed. CONNACK 0x88.
+	// ErrUnavailable means authentication could not be decided, and the
+	// failure is not one this package can tell is about the credentials. It
+	// is returned when the device or tenant lookup fails with anything but
+	// "not found", when the key validator returns an error that is not a
+	// recognised keysmith credential error, and when it returns no key at all.
+	//
+	// It is not returned for every key-service outage. keysmith v1.8.0
+	// reports any failure of its key lookup, a database outage included, as
+	// keysmith.ErrInvalidKey, so during such an outage an uncached device gets
+	// ErrBadCredentials (CONNACK 0x86), not ErrUnavailable. That changes only
+	// when keysmith tells the two apart. CONNACK 0x88.
 	ErrUnavailable = errors.New("tether/auth: unavailable")
 
 	// ErrRateLimited means the key has been rate limited by its policy.

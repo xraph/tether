@@ -13,6 +13,7 @@ import (
 	"github.com/xraph/keysmith"
 	kid "github.com/xraph/keysmith/id"
 	"github.com/xraph/keysmith/key"
+	kstore "github.com/xraph/keysmith/store"
 	kmemory "github.com/xraph/keysmith/store/memory"
 
 	"github.com/xraph/tether/device"
@@ -577,4 +578,44 @@ func TestRealKeysmithEngine(t *testing.T) {
 
 	_, err = a.Authenticate(ctx, Credentials{ClientID: "c", Username: keyID, Password: []byte(created.RawKey)})
 	require.ErrorIs(t, err, ErrBadCredentials)
+}
+
+// failingKeyLookupStore is a keysmith store whose key lookup by hash fails the
+// way a database outage would. Everything else delegates to the embedded store.
+type failingKeyLookupStore struct {
+	kstore.Store
+}
+
+func (s failingKeyLookupStore) Keys() key.Store {
+	return failingKeyLookup{Store: s.Store.Keys()}
+}
+
+type failingKeyLookup struct {
+	key.Store
+}
+
+func (failingKeyLookup) GetByHash(context.Context, string) (*key.Key, error) {
+	return nil, errors.New("connection refused")
+}
+
+// TestKeysmithLookupOutageSurfacesAsBadCredentials pins a known keysmith
+// v1.8.0 limitation, not behaviour we want. keysmith reports any key lookup
+// failure, an outage included, as keysmith.ErrInvalidKey, so Tether sees a
+// wrong key and answers ErrBadCredentials (CONNACK 0x86) instead of
+// ErrUnavailable (0x88). When keysmith distinguishes outages, this test fails:
+// flip the expectation to ErrUnavailable and update auth/llm.txt and the
+// ErrUnavailable doc comment.
+func TestKeysmithLookupOutageSurfacesAsBadCredentials(t *testing.T) {
+	ctx := t.Context()
+
+	eng, err := keysmith.NewEngine(keysmith.WithStore(failingKeyLookupStore{Store: kmemory.New()}))
+	require.NoError(t, err)
+
+	e := newEnv(t)
+	a := NewKeysmith(eng, e.tenants, e.st)
+
+	_, err = a.Authenticate(ctx, Credentials{ClientID: "c", Username: e.keyID.String(), Password: []byte(rawKey)})
+	require.ErrorIs(t, err, ErrBadCredentials)
+	require.NotErrorIs(t, err, ErrUnavailable)
+	require.ErrorIs(t, err, keysmith.ErrInvalidKey)
 }
