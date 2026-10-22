@@ -1,0 +1,7 @@
+# tether/scope
+
+Import: github.com/xraph/tether/scope
+
+`With(ctx, appID, tenantID string) context.Context` puts the pair on the context in all three places the libraries Tether calls read it: `keysmith.WithTenant`, `warden.WithTenant` and `forge.WithScope(ctx, forge.NewOrgScope(appID, tenantID))` (replacing any forge scope already there).
+
+Keysmith reads forge's scope first and warden prefers its own explicit values, so a context with only one of them gives the two libraries different tenants once an outer layer set a scope. Always build the context for keysmith and warden calls with this function. This is the one package that imports all three.

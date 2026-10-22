@@ -1,0 +1,12 @@
+# tether/service
+
+Import: github.com/xraph/tether/service
+
+Tenant management over a `store.Store`.
+
+`NewTenants(s store.Store) *Tenants`:
+- `Create(ctx, CreateTenantInput{AppID, ExternalID, Name string; Limits tenant.Limits})`: new tenants are enabled. Empty AppID or ExternalID wraps `tether.ErrInvalidInput`; a duplicate `(AppID, ExternalID)` wraps `tether.ErrConflict`.
+- `Get(ctx, id.TenantID)`, `List(ctx, tenant.ListFilter)`.
+- `Update(ctx, id.TenantID, UpdateTenantInput{Name *string; Enabled *bool; Limits *tenant.Limits})`: nil fields are untouched; evicts the resolve cache.
+- `Delete(ctx, id.TenantID)`: wraps `tether.ErrConflict` while the tenant has devices (the store does not cascade); evicts the resolve cache.
+- `ResolveTenant(ctx, appID, externalID)`: cached 30 s per process, copy returned, misses not cached, disabled tenants returned as is (the caller checks `Enabled`). With several broker nodes on one store, a change made through one node reaches the others within 30 s. Satisfies `auth.TenantResolver`.

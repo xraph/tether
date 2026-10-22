@@ -8,6 +8,8 @@ Tether is a multi-tenant MQTT broker for Go. The root package currently exposes:
 - Sentinel errors, all `errors.New("tether: ...")`, matched with `errors.Is`:
   `ErrNotFound`, `ErrConflict`, `ErrInvalidInput`, `ErrTenantDisabled`, `ErrNotAuthorized`.
 
+The `auth` package has its own errors (`auth.ErrBadCredentials`, `ErrNotAuthorized`, `ErrUnavailable`, `ErrRateLimited`), distinct from these, because the broker maps them to CONNACK codes.
+
 Store backends wrap these as `tether/<backend>: <op>: %w`.
 
 The broker, stores and Forge extension land in later tasks. Design: _project_files/TETHER-DESIGN.md.
