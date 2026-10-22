@@ -644,3 +644,49 @@ func TestStopStopsTheBroker(t *testing.T) {
 	assert.False(t, e.ext.Broker().Running())
 	assert.Error(t, e.ext.Health(t.Context()))
 }
+
+// *Extension is provided to the container and is a vessel Starter, so
+// resolving it there starts it again. That must change nothing: no second
+// broker, no duplicate routes, and the first one keeps serving.
+func TestInjectingTheExtensionDoesNotStartItTwice(t *testing.T) {
+	e := start(t, false)
+	first := e.ext.Broker()
+	addr := first.Addr().String()
+
+	got, err := vessel.Inject[*extension.Extension](e.app.Container())
+	require.NoError(t, err)
+	assert.Same(t, e.ext, got)
+
+	assert.Same(t, first, e.ext.Broker(), "still the one broker")
+	assert.Equal(t, addr, e.ext.Broker().Addr().String())
+	assert.True(t, first.Running())
+
+	// Resolving it again is as harmless, and the routes still answer.
+	_, err = vessel.Inject[*extension.Extension](e.app.Container())
+	require.NoError(t, err)
+
+	e.do(http.MethodGet, e.base+"/v1/tenants", nil, http.StatusOK)
+
+	tid := e.tenant()
+	e.role(tid, "sensor", []string{"up"}, nil)
+	d := e.device(tid, "sensor")
+
+	_, err = e.connect(d, "dev-1")
+	require.NoError(t, err)
+}
+
+// Starting a started extension, and stopping a stopped one, return nil.
+func TestStartAndStopAreIdempotent(t *testing.T) {
+	e := start(t, false)
+
+	require.NoError(t, e.ext.Start(t.Context()))
+	assert.True(t, e.ext.Broker().Running())
+
+	ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+	defer cancel()
+
+	require.NoError(t, e.ext.Stop(ctx))
+	assert.False(t, e.ext.Broker().Running())
+	require.NoError(t, e.ext.Stop(ctx), "a second Stop is a no-op")
+	assert.False(t, e.ext.DashboardStatus().Configured)
+}

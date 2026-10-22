@@ -100,6 +100,11 @@ type Extension struct {
 	// ksExts are the keysmith extensions Keysmith built, guarded by mu.
 	ksExts []*keysmithext.Extension
 
+	// lifecycle serializes Start and Stop, so a second call (vessel starts
+	// every Starter it resolves, and *Extension is one) waits for the first
+	// and then finds it done.
+	lifecycle sync.Mutex
+
 	// Built by Start, read by the accessors.
 	mu       sync.RWMutex
 	broker   *broker.Broker
@@ -181,7 +186,23 @@ func (e *Extension) Register(app forge.App) error {
 // plugin (registered now if Warden did not), the store (migrated),
 // the services, the broker with the plugins bound to its reactor, the
 // routes, and finally the broker's listeners.
+//
+// Start is idempotent: on an extension that is already started it returns nil
+// and does nothing. That matters because *Extension is provided to the
+// container, and resolving it there (vessel.Inject[*extension.Extension]) makes
+// vessel start it once more.
 func (e *Extension) Start(ctx context.Context) error {
+	e.lifecycle.Lock()
+	defer e.lifecycle.Unlock()
+
+	e.mu.RLock()
+	already := e.started
+	e.mu.RUnlock()
+
+	if already {
+		return nil
+	}
+
 	if !e.config.DisableRoutes && len(e.adminMiddleware) == 0 && !e.insecureAdminRoutes {
 		return ErrAdminAuthRequired
 	}
@@ -398,8 +419,20 @@ func (e *Extension) unbind() {
 }
 
 // Stop unbinds the plugins and stops the broker, which disconnects every
-// client. The store is left open: Tether did not open it.
+// client. The store is left open: Tether did not open it. Stopping an
+// extension that is not started returns nil.
 func (e *Extension) Stop(ctx context.Context) error {
+	e.lifecycle.Lock()
+	defer e.lifecycle.Unlock()
+
+	e.mu.RLock()
+	running := e.started
+	e.mu.RUnlock()
+
+	if !running {
+		return nil
+	}
+
 	e.unbind()
 
 	e.mu.Lock()
