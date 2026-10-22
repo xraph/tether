@@ -24,7 +24,7 @@ Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store
 
 ## Lifecycle
 
-- Register: `BaseExtension.Register`, logger, config, then `vessel.Provide` of `*Extension`. Nothing else: keysmith and warden build their engines in their own Register, which runs first.
+- Register: `BaseExtension.Register`, logger, config, then `vessel.Provide` of `*Extension`. A config section the loader cannot read (with `RequireConfig` off) is logged and the programmatic config (DefaultConfig plus the options) is used, never the bare defaults; `TestUnreadableConfigKeepsTheOptions` pins it. Nothing else: keysmith and warden build their engines in their own Register, which runs first.
 - Start, in order:
   1. `ErrAdminAuthRequired` when routes are on, no `WithAdminMiddleware` and no `WithInsecureAdminRoutes`.
   2. `*keysmith.Engine` and `*warden.Engine` from the container. The keysmith engine must be the `Engine()` of an extension `Keysmith()` built, or Start returns `ErrKeysmithNotWired` (unless `WithoutKeysmithEvents`). `MarkWired` only says `Keysmith()` was called; a host that calls it and registers a different `keysmithext.New()` fails here, because the plugin never reached the engine the app runs.

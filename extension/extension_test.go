@@ -672,6 +672,28 @@ func TestConfigFromFile(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, publish(2049))
 }
 
+// A tether section the loader cannot read is logged and skipped, and the
+// options keep working: the extension falls back to its programmatic config,
+// not to the bare defaults.
+func TestUnreadableConfigKeepsTheOptions(t *testing.T) {
+	dir := t.TempDir()
+	yaml := "extensions:\n  tether: 5\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(yaml), 0o600))
+
+	cfg := extension.DefaultConfig()
+	cfg.BasePath = "/mqtt"
+	cfg.Broker = loopback()
+	cfg.Broker.MaxPacketSize = 4096
+
+	app := newAppWith(t, forge.WithConfigSearchPaths(dir), forge.WithEnableAppScopedConfig(false))
+	e := startApp(t, app, false, extension.WithInsecureAdminRoutes(), extension.WithConfig(cfg))
+
+	assert.Equal(t, 4096, e.ext.Services().MaxPublishPayload, "the programmatic broker config, not the default")
+
+	e.base = "/mqtt"
+	e.tenant()
+}
+
 // WithStore wins over the grove database in the container.
 func TestWithStoreWins(t *testing.T) {
 	st := memory.New()

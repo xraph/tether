@@ -164,7 +164,13 @@ func (e *Extension) Register(app forge.App) error {
 			return fmt.Errorf("tether: failed to load required config: %w", err)
 		}
 
-		e.Logger().Warn("tether: using default and programmatic config", forge.F("error", err.Error()))
+		// The loader may have written part of the file into cfg, or left it
+		// at the defaults: either way the options would be lost. The
+		// programmatic config (DefaultConfig with the options applied) is
+		// what the host asked for.
+		e.Logger().Warn("tether: config section unreadable, using the programmatic config", forge.F("error", err.Error()))
+
+		cfg = e.config
 	}
 
 	if cfg.BasePath == "" {
