@@ -34,9 +34,15 @@ Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store
   6. `events.NewReactor(authn.Evict, broker)` bound to both plugins, before the broker listens.
   7. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: cfg.Broker.MaxPacketSize}` (0 means api's 1 MiB default). Its error fails Start.
   8. `broker.Start`.
-- Stop: unbinds the plugins, stops the broker (which handles mochi's Close deadlock and the reload retries). Health: broker running and store ping. `DashboardStatus()` (`dashboard.DashboardStatusAware`): `Version` and `Configured` true from a successful Start until Stop. No dashboard contract yet.
+- Stop: unbinds the plugins, stops the broker (which handles mochi's Close deadlock and the reload retries). Health: broker running and store ping. `DashboardStatus()` (`dashboard.DashboardStatusAware`): `Version` and `Configured` true from a successful Start until Stop.
 
 Why `Use` and not `forge.WithGroupMiddleware`: api registers on groups nested in the admin group, and forge v1.12.10's `Group` copies a parent's `Use` middleware but not its `WithGroupMiddleware`. With the option the admin routes would mount open. `TestAdminMiddlewareGuardsAdminRoutesOnly` pins it.
+
+## Dashboard contract
+
+`(*Extension).RegisterContractContributor(disp, reg, wreg)` implements `dashboard.ContractContributorAware` and calls `contract.Register` (package `extension/contract`, see its `llm.txt`) with `Deps{Services: e.Services}`. The dashboard discovers it during its own Start. The handlers read `Services()` per request, so before Tether's Start they answer `UNAVAILABLE`, whichever extension started first. 20 intents under the contributor name `tether`: overview, tenants, devices, role topic grants, live clients and sessions, retained messages. `DashboardStatus()` feeds the dashboard's version check and setup panel.
+
+The contributor adds no authentication. `WithAdminMiddleware` guards the REST routes only; the dashboard's intents are guarded by the dashboard, whose `enable_auth` is off by default.
 
 ## Metrics
 
@@ -48,4 +54,4 @@ The broker, mochi, perm and the API take `*slog.Logger`; `logger.go` has a `slog
 
 ## Tests
 
-`extension_test.go`: a Forge app with grove SQLite in a temp dir (`vessel.Provide` of `*grove.DB`, which keysmith, warden and tether all pick up), keysmith and warden with routes off, tether with `WithInsecureAdminRoutes` on `127.0.0.1:0`, the router behind httptest, paho 3.1.1 clients. Covers the round trip, revoke over REST disconnecting the client within 2 s, a role narrowed over REST dropping a subscription (warden built by the helper, and plugin registered at Start), the three Start refusals and their opt-outs (including a host that calls `Keysmith()` but registers another keysmith), admin middleware scope, metrics from the scrape, config from a YAML file, `WithStore`, and Stop.
+`extension_test.go`: a Forge app with grove SQLite in a temp dir (`vessel.Provide` of `*grove.DB`, which keysmith, warden and tether all pick up), keysmith and warden with routes off, tether with `WithInsecureAdminRoutes` on `127.0.0.1:0`, the router behind httptest, paho 3.1.1 clients. Covers the round trip, revoke over REST disconnecting the client within 2 s, a role narrowed over REST dropping a subscription (warden built by the helper, and plugin registered at Start), the three Start refusals and their opt-outs (including a host that calls `Keysmith()` but registers another keysmith), admin middleware scope, metrics from the scrape, config from a YAML file, `WithStore`, and Stop. `dashboard_contract_test.go` boots the real dashboard next to Tether and reads `/capabilities` (the contributor, its 20 intents, `Configured` and `Version`), and runs the contributor against live services.

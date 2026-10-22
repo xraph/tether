@@ -1,0 +1,75 @@
+# tether/extension/contract
+
+Import: github.com/xraph/tether/extension/contract
+
+Tether's admin operations as a Forge dashboard contract contributor. The React plugin (`packages/plugin-tether` in forge-dashboard) is the consumer: it reads these shapes. Forge v1.12.10. The handlers call the same services as the REST API in `api/`, so validation and the broker-down rule are the same.
+
+## Wiring
+
+`Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashcontract.WardenRegistry, deps Deps) error` loads the embedded `manifest.yaml`, runs `loader.Validate`, calls `reg.Register`, then registers one typed handler per intent. `Deps{Services ServicesProvider}` where `ServicesProvider func() *api.Services` is called on every request (nil means Tether has not started). The extension implements `dashboard.ContractContributorAware` and passes `(*Extension).Services`. `ContributorName = "tether"`.
+
+Contributor `tether`, capabilities `tether.read`, `tether.write`, app block `displayName Tether`, `slug tether`, `icon radio-tower`. 20 intents, all version 1: 8 queries (capability read) and 12 commands (capability write, each with `invalidates`).
+
+No intent declares `requires`. Authentication is the dashboard's (`enable_auth`, off by default). Tether's REST admin API refuses to start without admin middleware; this contributor has no such guard.
+
+## Rules every intent follows
+
+- A query takes its input as `params`, a command as `payload`. Both decode into the same input struct. JSON names are camelCase.
+- `tenantId` is the tenant's ID string (`ttnt_...`). Contract principals carry no tenant claims, so there is nothing to scope to without it: a missing or empty `tenantId` is `PERMISSION_DENIED`, never "all tenants". A malformed one is `BAD_REQUEST`; an unknown one is `NOT_FOUND`. A device, role, client or retained topic of another tenant is `NOT_FOUND`.
+- The one exception is `overview.stats`: no `tenantId` is the node total (sums, never rows). `tenants.list` and `tenants.create` take none; `tenants.get`, `tenants.update` and `tenants.delete` name their tenant with `tenantId`.
+- Intents that call the broker (`overview.stats`, `clients.list`, `clients.kick`, `sessions.delete`, `retained.list`, `retained.delete`) are `UNAVAILABLE` while the broker is not running. So is every intent before Tether's Start.
+- Optional update fields are pointers: `tenants.update` changes only the fields it names (`name: ""` sets an empty name). `roles.topics.set` and `devices.roles.set` replace whole lists, so the list is required (`[]` clears; absent is `BAD_REQUEST`).
+- Errors are `*contract.Error`: `tether.ErrInvalidInput` and `warden.ErrRoleNotFound` are `BAD_REQUEST` (with the reason), `ErrNotFound` and `keysmith.ErrKeyNotFound` `NOT_FOUND`, `ErrConflict` and a rotate of a revoked key `CONFLICT`, `ErrTenantDisabled` and `ErrNotAuthorized` `PERMISSION_DENIED`, broker down `UNAVAILABLE` (retryable), anything else `INTERNAL` with the text "internal error" (the cause goes to `Services.Logger`).
+- Lists are `{"items": [...]}`, `[]` and never null. `tenants.list` and `devices.list` page with `limit` (default 100, at most 500) and `offset`, and echo the effective `limit` and `offset`; a full page may have a next one. Negative values or a limit over 500 are `BAD_REQUEST`.
+- Times are RFC 3339 strings. A command that returns nothing answers `{"ok": true}`.
+
+## Shapes
+
+    Tenant      {id, appId, externalId, name, enabled, limits: Limits, createdAt, updatedAt}
+    Limits      {maxConnections, messagesPerSecond, burst, maxSessionExpirySeconds}   (all numbers, 0 = default or unlimited)
+    Device      {id, tenantId, name, keyId, clientId?, roles: string[], metadata?, createdAt, updatedAt}
+    Credentials {device: Device, username, password}                                   (username = keysmith key ID, password = the raw key)
+    Client      {clientId, username?, deviceId?, remote?, connected, protocolVersion (4|5),
+                 subscriptions: string[], connectedAt?, sessionExpirySeconds}
+    Retained    {topic, size, qos}
+    Stats       {scope: "node"|"tenant", tenantId?, tenants?, connected, sessions, subscriptions,
+                 retained, messagesIn, messagesOut}
+    TopicRules  {roleSlug, publish: string[], subscribe: string[]}                     (filters use %c and %u)
+
+`Device` never has a password. `Credentials` is the only shape that does.
+
+## Queries
+
+| Intent | Input | Output |
+|---|---|---|
+| `overview.stats` | `{tenantId?}` | `Stats`. With `tenantId`: `scope "tenant"`, that tenant's counters on this node, no `tenants`. Without: `scope "node"`, `tenants` is the tenant count, every other count is the sum over all tenants. |
+| `tenants.list` | `{limit?, offset?}` | `{items: Tenant[], limit, offset}` |
+| `tenants.get` | `{tenantId}` | `Tenant` |
+| `devices.list` | `{tenantId, limit?, offset?}` | `{items: Device[], limit, offset}` |
+| `devices.get` | `{tenantId, deviceId}` | `Device` |
+| `roles.topics.get` | `{tenantId, roleSlug}` | `TopicRules`. Unknown role is `NOT_FOUND`. |
+| `clients.list` | `{tenantId}` | `{items: Client[]}`: open connections and kept sessions on this node, sorted by client ID |
+| `retained.list` | `{tenantId, filter?}` | `{items: Retained[]}`. `filter` defaults to `#` (everything but `$SYS`); an invalid one is `BAD_REQUEST`. |
+
+## Commands
+
+| Intent | Input | Output | Invalidates |
+|---|---|---|---|
+| `tenants.create` | `{appId, externalId, name?, limits?: Limits}` | `Tenant`. Missing `appId` or `externalId`, or a negative limit, is `BAD_REQUEST`; an `externalId` another tenant uses is `CONFLICT`. | `tenants.list`, `overview.stats` |
+| `tenants.update` | `{tenantId, name?, enabled?, limits?: Limits}` | `Tenant`. `limits` replaces all four. Live connections take the new limits, or are dropped when disabled. | `tenants.list`, `tenants.get`, `clients.list`, `overview.stats` |
+| `tenants.delete` | `{tenantId}` | `Ack`. `CONFLICT` while the tenant has devices, and then nothing changes. | `tenants.list`, `tenants.get`, `clients.list`, `overview.stats` |
+| `devices.provision` | `{tenantId, name, clientId?, roles?: string[], expiresAt?}` | `Credentials`. `SecretResponse`: shown once, never replayed. | `devices.list` |
+| `devices.rotate` | `{tenantId, deviceId, graceSeconds?}` | `Credentials`. `SecretResponse`. The old key works for `graceSeconds` (0 is keysmith's default). A revoked device is `CONFLICT`. | `devices.list`, `devices.get` |
+| `devices.revoke` | `{tenantId, deviceId, reason?}` | `Ack`. The record stays; live connections end through the keysmith plugin events. | `devices.list`, `devices.get`, `clients.list`, `overview.stats` |
+| `devices.delete` | `{tenantId, deviceId}` | `Ack` | `devices.list`, `devices.get`, `clients.list`, `overview.stats` |
+| `devices.roles.set` | `{tenantId, deviceId, roles: string[]}` | `Device`. An unknown role is `BAD_REQUEST`. | `devices.list`, `devices.get` |
+| `roles.topics.set` | `{tenantId, roleSlug, publish: string[], subscribe: string[]}` | `TopicRules` as stored. An invalid filter is `BAD_REQUEST`, an unknown role `NOT_FOUND`. | `roles.topics.get` |
+| `clients.kick` | `{tenantId, clientId}` | `Ack`. Disconnects, keeps the session. | `clients.list`, `overview.stats` |
+| `sessions.delete` | `{tenantId, clientId}` | `Ack`. Disconnects and deletes the session. | `clients.list`, `overview.stats` |
+| `retained.delete` | `{tenantId, topic}` | `Ack`. Nothing retained there is `NOT_FOUND`. | `retained.list`, `overview.stats` |
+
+`devices.provision` and `devices.rotate` take an idempotency key like any command, but because they are `SecretResponse` a retry with the same key (when the dashboard has an idempotency store) answers `CONFLICT` (reason `idempotency.already_ran`), not a second key and not the first one's secret. A client that loses the response rotates the device.
+
+## Tests
+
+`contract_test.go` registers the contract on a real dispatcher over a real stack (memory store, keysmith and warden engines, a broker on a loopback port, paho clients) and dispatches envelopes, so it checks the JSON the plugin receives: the lifecycle of tenants, the single appearance of the password, tenant scope on every device, role and client intent, the `PERMISSION_DENIED` rule over the whole manifest, broker-down answers, the node and tenant stats. `manifest_test.go` loads and validates the manifest (20 intents, every command invalidates real queries, every intent has a handler). `extension/dashboard_contract_test.go` boots Forge with the real dashboard and reads `/capabilities`, because `Registry.Register` rejects manifests that `loader.Validate` accepts and the dashboard only logs it.
