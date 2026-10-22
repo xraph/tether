@@ -191,7 +191,8 @@ func (b *Broker) Start(ctx context.Context) error {
 }
 
 // setup adds the hooks and listeners to srv. The Tether hook goes first so
-// every later hook, storage included, sees namespaced client IDs.
+// every later hook, storage included, sees namespaced client IDs, and
+// lastHook goes last so it sees a connection's end after storage did.
 func (b *Broker) setup(ctx context.Context, srv *mqtt.Server) error {
 	if err := srv.AddHook(&hook{b: b, server: srv}, nil); err != nil {
 		return fmt.Errorf("tether/broker: add hook: %w", err)
@@ -204,6 +205,10 @@ func (b *Broker) setup(ctx context.Context, srv *mqtt.Server) error {
 		}
 
 		b.storage = storage
+	}
+
+	if err := srv.AddHook(&lastHook{b: b}, nil); err != nil {
+		return fmt.Errorf("tether/broker: add last hook: %w", err)
 	}
 
 	lc := &net.ListenConfig{}

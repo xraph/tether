@@ -48,7 +48,6 @@ var provided = []byte{
 	mqtt.OnPacketEncode,
 	mqtt.OnPublish,
 	mqtt.OnWill,
-	mqtt.OnDisconnect,
 }
 
 // Provides implements mqtt.Hook.
@@ -86,6 +85,7 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	}
 
 	st := newClientState(cl, cl.ID, string(pk.Connect.Username), ident, ident.Tenant, g, h.b.deps.Limits, h.b.countersFor(tenantID))
+	st.sessionExpiry = sessionExpiry(cl, h.b.cfg.sessionExpirySeconds())
 	h.b.state.add(st)
 
 	if h.b.changes.Load() != gen && !h.reauthorize(ctx, cl, pk, st, log) {
@@ -482,11 +482,47 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	return pk, nil
 }
 
+// lastHook is added after every other hook, storage included. Mochi runs
+// a hook event on the hooks in the order they were added, so its
+// OnDisconnect is the last hook mochi runs for a connection that ends: when
+// it drops the connection's state, the storage hook has already written the
+// session's final record. DeleteSession relies on that (clientState.gone)
+// before it deletes the record.
+type lastHook struct {
+	mqtt.HookBase
+
+	b *Broker
+}
+
+// ID implements mqtt.Hook.
+func (h *lastHook) ID() string { return "tether-last" }
+
+// Provides implements mqtt.Hook.
+func (h *lastHook) Provides(b byte) bool { return b == mqtt.OnDisconnect }
+
 // OnDisconnect releases the connection slot and drops the state.
-func (h *hook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
+func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
 	if st := h.b.state.remove(cl); st != nil {
 		st.releaseSlot()
 	}
+}
+
+// sessionExpiry is how long, in seconds, mochi keeps cl's session after its
+// connection ends: for 5.0 the interval the CONNECT asked for, capped at
+// maxExpiry as mochi caps it in the CONNACK, and for 3.1.1 none for a clean
+// session and maxExpiry otherwise (mochi expires those after its maximum).
+// Read it only from the client's own goroutine or once the client is closed:
+// mochi changes these properties while the connection is open.
+func sessionExpiry(cl *mqtt.Client, maxExpiry uint32) uint32 {
+	if cl.Properties.ProtocolVersion == 5 {
+		return min(cl.Properties.Props.SessionExpiryInterval, maxExpiry)
+	}
+
+	if cl.Properties.Clean {
+		return 0
+	}
+
+	return maxExpiry
 }
 
 // OnACLCheck decides PUBLISH (write) and SUBSCRIBE or delivery (read) access

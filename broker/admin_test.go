@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/tenant"
@@ -964,4 +965,390 @@ func TestStopDuringPendingReloadRetry(t *testing.T) {
 	require.NoError(t, b.Stop(ctx))
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.Equal(t, int64(0), b.pendingRetries.Load(), "Stop waited for the retry to end")
+}
+
+// Admin operations (Task 12).
+
+// publishRetained5 publishes a retained message at QoS 1.
+func publishRetained5(t *testing.T, c *client5, name, payload string) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	defer cancel()
+
+	_, err := c.Publish(ctx, &paho.Publish{Topic: name, QoS: 1, Retain: true, Payload: []byte(payload)})
+	require.NoError(t, err)
+}
+
+// clientIDs returns the client IDs Clients lists for tenantID.
+func clientIDs(b *Broker, tenantID string) []string {
+	infos := b.Clients(tenantID)
+
+	out := make([]string, 0, len(infos))
+	for _, c := range infos {
+		out = append(out, c.ClientID)
+	}
+
+	return out
+}
+
+func TestClientsListsOnlyTenant(t *testing.T) {
+	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	aDev := ident(ta, "a-dev")
+	aDev.DeviceID = "tdev_a"
+	b := startBroker(t,
+		map[string]*auth.Identity{"a-dev": aDev, "a-away": ident(ta, "a-away"), "b-dev": ident(tb, "b-dev")},
+		map[string]acl.Rules{
+			"a-dev":  {Subscribe: []string{"cmd/#"}},
+			"a-away": {Subscribe: []string{"away/+"}},
+			"b-dev":  {Subscribe: []string{"b/#"}},
+		})
+	addr := b.Addr().String()
+
+	before := time.Now()
+
+	dev, _, err := connect5(t, addr, "dev", "a-dev", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, dev, "cmd/#"))
+
+	away, _, err := connect5(t, addr, "away", "a-away", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, away, "away/+"))
+	require.NoError(t, away.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitStateDropped(t, b, topic.Namespace(ta.ID.String(), "away"))
+
+	// Tenant B uses the same raw client ID.
+	bDev, _, err := connect5(t, addr, "dev", "b-dev", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, bDev, "b/#"))
+
+	got := b.Clients(ta.ID.String())
+	require.Len(t, got, 2)
+
+	off := got[0]
+	assert.Equal(t, "away", off.ClientID)
+	assert.False(t, off.Connected, "a kept session of a disconnected client")
+	assert.Equal(t, "a-away", off.Username)
+	assert.Equal(t, byte(5), off.ProtocolVersion)
+	assert.Equal(t, []string{"away/+"}, off.Subscriptions)
+	assert.Equal(t, uint32(3600), off.SessionExpiry)
+	assert.True(t, off.ConnectedAt.IsZero())
+	assert.Empty(t, off.DeviceID)
+
+	live := got[1]
+	assert.Equal(t, "dev", live.ClientID)
+	assert.True(t, live.Connected)
+	assert.Equal(t, "a-dev", live.Username)
+	assert.Equal(t, "tdev_a", live.DeviceID)
+	assert.NotEmpty(t, live.Remote)
+	assert.Equal(t, byte(5), live.ProtocolVersion)
+	assert.Equal(t, []string{"cmd/#"}, live.Subscriptions)
+	assert.Equal(t, uint32(3600), live.SessionExpiry)
+	assert.False(t, live.ConnectedAt.Before(before))
+	assert.False(t, live.ConnectedAt.After(time.Now()))
+
+	gotB := b.Clients(tb.ID.String())
+	require.Len(t, gotB, 1)
+	assert.Equal(t, "dev", gotB[0].ClientID)
+	assert.Equal(t, "b-dev", gotB[0].Username)
+	assert.True(t, gotB[0].Connected)
+	assert.Equal(t, []string{"b/#"}, gotB[0].Subscriptions)
+	assert.Zero(t, gotB[0].SessionExpiry, "a clean start keeps no session")
+
+	// Never the inline client, never anything for a malformed tenant ID.
+	for _, tid := range []string{"", "inline", "ttnt_nobody", ta.ID.String() + "/dev", "/"} {
+		assert.Empty(t, b.Clients(tid), "tenant %q", tid)
+	}
+}
+
+func TestKick(t *testing.T) {
+	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	b := startBroker(t,
+		map[string]*auth.Identity{"a-dev": ident(ta, "a-dev"), "b-dev": ident(tb, "b-dev")},
+		map[string]acl.Rules{"b-dev": {Subscribe: []string{"x"}}})
+	addr := b.Addr().String()
+	tenantA := ta.ID.String()
+
+	a, _, err := connect5(t, addr, "dev", "a-dev", false)
+	require.NoError(t, err)
+
+	bDev, _, err := connect5(t, addr, "dev", "b-dev", false)
+	require.NoError(t, err)
+
+	require.NoError(t, b.Kick(tenantA, "dev"))
+	assert.Equal(t, byte(0x98), disconnectedWith(t, a))
+	waitStateDropped(t, b, topic.Namespace(tenantA, "dev"))
+
+	// B's client with the same raw ID was not touched: it still answers.
+	require.Equal(t, []byte{1}, subscribe5(t, bDev, "x"))
+	requireConnected(t, bDev)
+
+	// The kicked client's session is kept; kicking it again finds nobody.
+	infos := b.Clients(tenantA)
+	require.Len(t, infos, 1)
+	assert.False(t, infos[0].Connected)
+	require.ErrorIs(t, b.Kick(tenantA, "dev"), tether.ErrNotFound)
+	require.ErrorIs(t, b.Kick(tenantA, "nobody"), tether.ErrNotFound)
+
+	require.ErrorIs(t, b.Kick(tenantA, ""), tether.ErrInvalidInput)
+	require.ErrorIs(t, b.Kick("ttnt_nobody", "dev"), tether.ErrInvalidInput)
+	require.ErrorIs(t, b.Kick(tenantA+"/x", "dev"), tether.ErrInvalidInput)
+}
+
+func TestDeleteSessionSurvivesRestart(t *testing.T) {
+	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	ids := map[string]*auth.Identity{
+		"a-live": ident(ta, "a-live"), "a-away": ident(ta, "a-away"), "a-pub": ident(ta, "a-pub"), "b-live": ident(tb, "b-live"),
+	}
+	rules := map[string]acl.Rules{
+		"a-live": {Subscribe: []string{"t"}},
+		"a-away": {Subscribe: []string{"t"}},
+		"a-pub":  {Publish: []string{"#"}, Subscribe: []string{"self"}},
+		"b-live": {Subscribe: []string{"t"}},
+	}
+	tenantA, tenantB := ta.ID.String(), tb.ID.String()
+	nsA := func(s string) string { return topic.Namespace(tenantA, s) }
+	nsB := func(s string) string { return topic.Namespace(tenantB, s) }
+
+	cfg := testConfig()
+	cfg.DataDir = t.TempDir()
+
+	b1, err := New(cfg, Deps{Auth: auth.NewStatic(ids), Perms: fakePerms{rules: rules}, Logger: testLogger()})
+	require.NoError(t, err)
+	require.NoError(t, b1.Start(t.Context()))
+
+	addr := b1.Addr().String()
+
+	live, _, err := connect5(t, addr, "live", "a-live", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, live, "t"))
+
+	away, _, err := connect5(t, addr, "away", "a-away", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, away, "t"))
+	require.NoError(t, away.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitStateDropped(t, b1, nsA("away"))
+
+	// Tenant B has a persistent session under the same raw client ID.
+	bLive, _, err := connect5(t, addr, "live", "b-live", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, bLive, "t"))
+
+	// Queue a message for the offline session.
+	pub, _, err := connect5(t, addr, "pub", "a-pub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, pub, "self"))
+	require.Equal(t, byte(0), publish5(t, pub, "t", "queued"))
+	require.Equal(t, byte(0), publish5(t, pub, "self", "done"))
+	require.Equal(t, message{Topic: "self", Payload: "done"}, recv(t, pub.msgs))
+	require.Equal(t, message{Topic: "t", Payload: "queued"}, recv(t, live.msgs))
+
+	cl, ok := b1.server.Clients.Get(nsA("away"))
+	require.True(t, ok)
+	require.Equal(t, 1, cl.State.Inflight.Len(), "queued for the offline session")
+
+	// A connected session is disconnected first, an offline one just goes.
+	require.NoError(t, b1.DeleteSession(tenantA, "live"))
+	assert.Equal(t, byte(0x98), disconnectedWith(t, live))
+	require.NoError(t, b1.DeleteSession(tenantA, "away"))
+
+	for _, raw := range []string{"live", "away"} {
+		_, ok := b1.server.Clients.Get(nsA(raw))
+		assert.False(t, ok, "%s is gone from mochi", raw)
+	}
+
+	assert.Equal(t, []string{"pub"}, clientIDs(b1, tenantA))
+	assert.Equal(t, 1, b1.Stats(tenantA).Sessions)
+
+	subs := b1.server.Topics.Subscribers(nsA("t")).Subscriptions
+	assert.Empty(t, subs, "tenant A's subscriptions on t are gone")
+	assert.Equal(t, []string{nsB("t")}, subscriptions(t, b1, nsB("live")), "tenant B's session is untouched")
+
+	require.ErrorIs(t, b1.DeleteSession(tenantA, "live"), tether.ErrNotFound)
+	require.ErrorIs(t, b1.DeleteSession(tenantA, ""), tether.ErrInvalidInput)
+	require.ErrorIs(t, b1.DeleteSession("ttnt_nobody", "live"), tether.ErrInvalidInput)
+
+	// A clean session that is connected goes too.
+	require.NoError(t, b1.DeleteSession(tenantA, "pub"))
+	assert.Equal(t, byte(0x98), disconnectedWith(t, pub))
+	assert.Empty(t, b1.Clients(tenantA))
+
+	require.NoError(t, bLive.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitStateDropped(t, b1, nsB("live"))
+	require.NoError(t, b1.Stop(t.Context()))
+
+	b2 := startBrokerWith(t, cfg, ids, rules, nil)
+
+	assert.Empty(t, b2.Clients(tenantA), "deleted sessions are not restored")
+	assert.Equal(t, []string{"live"}, clientIDs(b2, tenantB))
+
+	// Nothing of A's sessions is left in storage.
+	stored, err := b2.storage.StoredClients()
+	require.NoError(t, err)
+
+	for _, c := range stored {
+		assert.NotContains(t, []string{nsA("live"), nsA("away")}, c.ID)
+	}
+
+	storedSubs, err := b2.storage.StoredSubscriptions()
+	require.NoError(t, err)
+
+	for _, s := range storedSubs {
+		assert.NotContains(t, []string{nsA("live"), nsA("away")}, s.Client)
+	}
+
+	storedMsgs, err := b2.storage.StoredInflightMessages()
+	require.NoError(t, err)
+
+	for _, m := range storedMsgs {
+		assert.NotEqual(t, nsA("away"), m.Client, "the queued message is gone from storage")
+	}
+
+	addr = b2.Addr().String()
+
+	for _, raw := range []string{"live", "away"} {
+		_, ca, cerr := connect5(t, addr, raw, "a-"+raw, false)
+		require.NoError(t, cerr)
+		assert.False(t, ca.SessionPresent, "%s starts a new session", raw)
+	}
+
+	_, ca, err := connect5(t, addr, "live", "b-live", false)
+	require.NoError(t, err)
+	assert.True(t, ca.SessionPresent, "tenant B's session survived")
+}
+
+func TestRetainedListAndDelete(t *testing.T) {
+	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	ids := map[string]*auth.Identity{"a-pub": ident(ta, "a-pub"), "a-sub": ident(ta, "a-sub"), "b-pub": ident(tb, "b-pub")}
+	rules := map[string]acl.Rules{
+		"a-pub": {Publish: []string{"#"}},
+		"a-sub": {Subscribe: []string{"s/#"}},
+		"b-pub": {Publish: []string{"#"}},
+	}
+	tenantA, tenantB := ta.ID.String(), tb.ID.String()
+
+	cfg := testConfig()
+	cfg.DataDir = t.TempDir()
+
+	b1, err := New(cfg, Deps{Auth: auth.NewStatic(ids), Perms: fakePerms{rules: rules}, Logger: testLogger()})
+	require.NoError(t, err)
+	require.NoError(t, b1.Start(t.Context()))
+
+	addr := b1.Addr().String()
+
+	pa, _, err := connect5(t, addr, "pub", "a-pub", true)
+	require.NoError(t, err)
+	publishRetained5(t, pa, "s/1", "hello")
+	publishRetained5(t, pa, "s/2", "hi!")
+
+	pb, _, err := connect5(t, addr, "pub", "b-pub", true)
+	require.NoError(t, err)
+	publishRetained5(t, pb, "s/1", "bee")
+
+	// The tenant's own $SYS, retained (the broker never retains its stats,
+	// so this one is planted).
+	require.NoError(t, b1.server.Publish(topic.Namespace(tenantA, "$SYS/x"), []byte("sys"), true, 0))
+
+	both := []RetainedInfo{{Topic: "s/1", Size: 5, QoS: 1}, {Topic: "s/2", Size: 3, QoS: 1}}
+	assert.Equal(t, both, b1.Retained(tenantA, "s/#"))
+	assert.Equal(t, both, b1.Retained(tenantA, "#"), "# lists no $SYS topic")
+	assert.Equal(t, both[:1], b1.Retained(tenantA, "s/1"))
+	assert.Equal(t, []RetainedInfo{{Topic: "$SYS/x", Size: 3, QoS: 0}}, b1.Retained(tenantA, "$SYS/#"))
+	assert.Equal(t, []RetainedInfo{{Topic: "s/1", Size: 3, QoS: 1}}, b1.Retained(tenantB, "#"))
+
+	for _, f := range []string{"", "s/#/x", "s+", "$share/g/#"} {
+		assert.Empty(t, b1.Retained(tenantA, f), "filter %q", f)
+	}
+
+	assert.Empty(t, b1.Retained("ttnt_nobody", "#"))
+	assert.Empty(t, b1.Retained("", "#"))
+
+	sub, _, err := connect5(t, addr, "sub", "a-sub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, sub, "s/#"))
+	// The retained replay.
+	recv(t, sub.msgs)
+	recv(t, sub.msgs)
+
+	require.NoError(t, b1.DeleteRetained(tenantA, "s/1"))
+	assert.Equal(t, message{Topic: "s/1", Payload: ""}, recv(t, sub.msgs), "clearing reaches subscribers as an empty message")
+
+	assert.Equal(t, both[1:], b1.Retained(tenantA, "#"))
+	assert.Equal(t, []RetainedInfo{{Topic: "s/1", Size: 3, QoS: 1}}, b1.Retained(tenantB, "#"), "tenant B's s/1 stays")
+
+	require.ErrorIs(t, b1.DeleteRetained(tenantA, "s/1"), tether.ErrNotFound)
+
+	for _, name := range []string{"", "s/+", "#", "$SYS/x", "$sys/x"} {
+		require.ErrorIs(t, b1.DeleteRetained(tenantA, name), tether.ErrInvalidInput, "topic %q", name)
+	}
+
+	require.ErrorIs(t, b1.DeleteRetained("ttnt_nobody", "s/2"), tether.ErrInvalidInput)
+
+	require.NoError(t, b1.Stop(t.Context()))
+
+	b2 := startBrokerWith(t, cfg, ids, rules, nil)
+	assert.Equal(t, both[1:], b2.Retained(tenantA, "s/#"), "the deletion reached storage")
+	assert.Equal(t, []RetainedInfo{{Topic: "s/1", Size: 3, QoS: 1}}, b2.Retained(tenantB, "s/#"))
+}
+
+func TestInlinePublishDelivered(t *testing.T) {
+	ta, tb := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	b := startBroker(t,
+		map[string]*auth.Identity{"a-sub": ident(ta, "a-sub"), "b-sub": ident(tb, "b-sub")},
+		map[string]acl.Rules{"a-sub": {Subscribe: []string{"t/#"}}, "b-sub": {Subscribe: []string{"t/#"}}})
+	addr := b.Addr().String()
+	tenantA, tenantB := ta.ID.String(), tb.ID.String()
+	ctx := t.Context()
+
+	sa, _, err := connect5(t, addr, "sub", "a-sub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, sa, "t/#"))
+
+	sb, _, err := connect5(t, addr, "sub", "b-sub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, sb, "t/#"))
+
+	require.NoError(t, b.Publish(ctx, tenantA, "t/1", []byte("hello"), 1, false))
+	assert.Equal(t, message{Topic: "t/1", Payload: "hello"}, recv(t, sa.msgs))
+
+	// Publish fans out before it returns, so B's first message is its own
+	// sentinel: A's publish never reached B's subscriber on the same topic.
+	require.NoError(t, b.Publish(ctx, tenantB, "t/sentinel", []byte("s"), 0, false))
+	assert.Equal(t, message{Topic: "t/sentinel", Payload: "s"}, recv(t, sb.msgs))
+
+	payload := []byte("kept")
+	require.NoError(t, b.Publish(ctx, tenantA, "t/kept", payload, 1, true))
+	copy(payload, "XXXX")
+	assert.Equal(t, message{Topic: "t/kept", Payload: "kept"}, recv(t, sa.msgs))
+	assert.Equal(t, []RetainedInfo{{Topic: "t/kept", Size: 4, QoS: 1}}, b.Retained(tenantA, "#"))
+	assert.Empty(t, b.Retained(tenantB, "#"))
+
+	cl, ok := b.server.Topics.Retained.Get(topic.Namespace(tenantA, "t/kept"))
+	require.True(t, ok)
+	assert.Equal(t, "kept", string(cl.Payload), "the caller's buffer is not retained")
+
+	for _, name := range []string{"", "t/+", "#", "$SYS/x", "$foo/x", "$share/g/t"} {
+		require.ErrorIs(t, b.Publish(ctx, tenantA, name, nil, 0, false), tether.ErrInvalidInput, "topic %q", name)
+	}
+
+	require.ErrorIs(t, b.Publish(ctx, tenantA, "t/1", nil, 2, false), tether.ErrInvalidInput)
+	require.ErrorIs(t, b.Publish(ctx, "ttnt_nobody", "t/1", nil, 0, false), tether.ErrInvalidInput)
+
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.ErrorIs(t, b.Publish(cancelled, tenantA, "t/1", nil, 0, false), context.Canceled)
+}
+
+func TestAdminOperationsBeforeStart(t *testing.T) {
+	b, err := New(testConfig(), Deps{Auth: auth.NewStatic(nil), Perms: fakePerms{}})
+	require.NoError(t, err)
+
+	tenantA := newTenant(tenant.Limits{}).ID.String()
+
+	assert.Empty(t, b.Clients(tenantA))
+	assert.Empty(t, b.Retained(tenantA, "#"))
+	require.ErrorIs(t, b.Kick(tenantA, "dev"), tether.ErrNotFound)
+	require.ErrorIs(t, b.DeleteSession(tenantA, "dev"), tether.ErrNotFound)
+	require.ErrorIs(t, b.DeleteRetained(tenantA, "t"), tether.ErrNotFound)
+	require.ErrorIs(t, b.Publish(t.Context(), tenantA, "t", nil, 0, false), tether.ErrConflict)
 }

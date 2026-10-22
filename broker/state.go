@@ -49,6 +49,19 @@ type clientState struct {
 	limiter  *limits.Limiter
 	counters *tenantCounters
 	release  sync.Once
+
+	// connectedAt is when the connection authenticated. sessionExpiry is
+	// how long, in seconds, mochi keeps the session after the connection
+	// ends, as the CONNECT asked for it and capped by the broker. Both are
+	// set before the state is registered and never change.
+	connectedAt   time.Time
+	sessionExpiry uint32
+
+	// gone is closed once the state is dropped from the registry, which
+	// for a connection that ends normally happens after every mochi hook,
+	// storage included, has run its OnDisconnect (lastHook).
+	gone     chan struct{}
+	goneOnce sync.Once
 }
 
 // grants is one compiled set of topic grants and the roles it came from.
@@ -69,6 +82,9 @@ func newClientState(cl *mqtt.Client, rawID, username string, ident *auth.Identit
 		username: username,
 		limiter:  limiter,
 		counters: counters,
+
+		connectedAt: time.Now(),
+		gone:        make(chan struct{}),
 	}
 	st.ident.Store(ident)
 	st.tenant.Store(tn)
@@ -137,6 +153,13 @@ func (st *clientState) clearRetry(stop chan struct{}) {
 func (st *clientState) stopTimers() {
 	st.stopExpiry()
 	st.stopRetry()
+}
+
+// dropped stops the state's timers and closes gone. Every path that drops
+// a state from the registry calls it. Safe to call more than once.
+func (st *clientState) dropped() {
+	st.stopTimers()
+	st.goneOnce.Do(func() { close(st.gone) })
 }
 
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
@@ -218,6 +241,7 @@ func (r *registry) bind(st *clientState) {
 	}
 
 	if stale {
+		prev.dropped()
 		prev.releaseSlot()
 	}
 }
@@ -240,9 +264,9 @@ func (r *registry) match(keep func(*clientState) bool) []*clientState {
 	return out
 }
 
-// remove drops the state of cl, stops its expiry timer and returns it, or nil
-// when there is none (mochi also calls OnDisconnect for sessions it restores
-// from storage).
+// remove drops the state of cl (stopping its timers and closing gone) and
+// returns it, or nil when there is none (mochi also calls OnDisconnect for
+// sessions it restores from storage).
 func (r *registry) remove(cl *mqtt.Client) *clientState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -258,7 +282,7 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 		delete(r.byID, cl.ID)
 	}
 
-	st.stopTimers()
+	st.dropped()
 
 	return st
 }
@@ -293,7 +317,7 @@ func (r *registry) sweepClosed(tenantID string) int {
 	r.mu.Unlock()
 
 	for _, st := range swept {
-		st.stopTimers()
+		st.dropped()
 		st.releaseSlot()
 	}
 

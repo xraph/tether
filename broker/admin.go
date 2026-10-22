@@ -3,8 +3,10 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,7 +16,9 @@ import (
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/id"
 	"github.com/xraph/tether/tenant"
+	"github.com/xraph/tether/topic"
 )
 
 // Admin reactions. The host calls these when a key, a role or a tenant
@@ -393,12 +397,20 @@ func (b *Broker) pruneSession(srv *mqtt.Server, st *clientState) {
 // pruneSubscriptions removes every subscription of st's client that set no
 // longer allows, as processUnsubscribe would, without an UNSUBACK.
 func (b *Broker) pruneSubscriptions(srv *mqtt.Server, st *clientState, set *acl.Set) {
-	cl := st.cl
+	n := b.unsubscribe(srv, st.cl, func(filter string) bool { return !b.canRead(st.tenantID, set, filter) })
+	if n > 0 {
+		b.log.Info("tether: subscriptions removed, no longer granted", slog.String("client", st.cl.ID), slog.Int("count", n))
+	}
+}
 
+// unsubscribe removes every subscription of cl that drop selects from
+// mochi's topic index, the client's session and the storage hook, and
+// returns how many it removed.
+func (b *Broker) unsubscribe(srv *mqtt.Server, cl *mqtt.Client, drop func(filter string) bool) int {
 	var removed []packets.Subscription
 
 	for filter, sub := range cl.State.Subscriptions.GetAll() {
-		if b.canRead(st.tenantID, set, filter) {
+		if !drop(filter) {
 			continue
 		}
 
@@ -411,13 +423,439 @@ func (b *Broker) pruneSubscriptions(srv *mqtt.Server, st *clientState, set *acl.
 		removed = append(removed, sub)
 	}
 
-	if len(removed) == 0 {
-		return
-	}
-
-	b.log.Info("tether: subscriptions removed, no longer granted", slog.String("client", cl.ID), slog.Int("count", len(removed)))
-
-	if b.storage != nil {
+	if len(removed) > 0 && b.storage != nil {
 		b.storage.OnUnsubscribed(cl, packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Unsubscribe}, Filters: removed})
 	}
+
+	return len(removed)
+}
+
+// Admin operations. The host's admin API calls these for one tenant, after
+// it has checked that the caller may (the broker checks no permissions
+// here). Each takes a Tether tenant ID and client IDs and topics as the
+// tenant's devices see them, namespaces them itself, and never lists or
+// touches another tenant's clients, sessions or retained messages.
+//
+// A tenant ID that is not a canonical tenant TypeID, an empty client ID or a
+// topic that fails topic.Valid is tether.ErrInvalidInput; the two listings
+// return nothing instead. None of them holds the registry lock while it
+// calls into mochi.
+
+// ClientInfo describes one of a tenant's sessions on this node.
+type ClientInfo struct {
+	// ClientID is the client ID the client connected with.
+	ClientID string `json:"client_id"`
+
+	// Username is the CONNECT username (a keysmith key ID for devices).
+	Username string `json:"username,omitempty"`
+
+	// DeviceID is the Tether device the connection authenticated as. Empty
+	// for an offline session.
+	DeviceID string `json:"device_id,omitempty"`
+
+	// Remote is the client's network address as mochi recorded it. Empty
+	// for a session restored from storage.
+	Remote string `json:"remote,omitempty"`
+
+	// Connected is true for an open connection and false for the kept
+	// session of a persistent client that is disconnected.
+	Connected bool `json:"connected"`
+
+	// ProtocolVersion is 4 for MQTT 3.1.1 and 5 for MQTT 5.0.
+	ProtocolVersion byte `json:"protocol_version"`
+
+	// Subscriptions are the session's topic filters, sorted.
+	Subscriptions []string `json:"subscriptions"`
+
+	// ConnectedAt is when the open connection authenticated. Zero for an
+	// offline session.
+	ConnectedAt time.Time `json:"connected_at,omitzero"`
+
+	// SessionExpiry is how many seconds the session is kept after its
+	// connection ends; 0 means it ends with the connection.
+	SessionExpiry uint32 `json:"session_expiry"`
+}
+
+// RetainedInfo describes one retained message.
+type RetainedInfo struct {
+	// Topic is the message's topic as the tenant's devices see it.
+	Topic string `json:"topic"`
+
+	// Size is the payload's length in bytes.
+	Size int `json:"size"`
+
+	// QoS is the QoS the message was published with.
+	QoS byte `json:"qos"`
+}
+
+// Clients lists tenantID's sessions on this node, sorted by client ID: open
+// connections and the sessions mochi keeps for disconnected persistent
+// clients. Mochi's inline client is never listed. Username, DeviceID and
+// ConnectedAt of an open connection come from its authentication; for an
+// offline session only what mochi kept is known. Before Start, after Stop
+// and for a malformed tenant ID it returns nil.
+func (b *Broker) Clients(tenantID string) []ClientInfo {
+	if !validTenant(tenantID) {
+		return nil
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return nil
+	}
+
+	states := make(map[*mqtt.Client]*clientState)
+	for _, st := range b.state.match(func(st *clientState) bool { return st.tenantID == tenantID }) {
+		states[st.cl] = st
+	}
+
+	maxExpiry := b.cfg.sessionExpirySeconds()
+	prefix := tenantID + "/"
+
+	var out []ClientInfo
+
+	for nsID, cl := range srv.Clients.GetAll() {
+		if cl.Net.Inline {
+			continue
+		}
+
+		raw, ok := strings.CutPrefix(nsID, prefix)
+		if !ok || raw == "" {
+			continue
+		}
+
+		out = append(out, clientInfo(tenantID, raw, cl, states[cl], maxExpiry))
+	}
+
+	slices.SortFunc(out, func(x, y ClientInfo) int { return strings.Compare(x.ClientID, y.ClientID) })
+
+	return out
+}
+
+// clientInfo describes cl, whose state is st (nil once the connection has
+// ended). Mochi changes a client's properties while its connection is open,
+// so they are read only from a closed client.
+func clientInfo(tenantID, raw string, cl *mqtt.Client, st *clientState, maxExpiry uint32) ClientInfo {
+	info := ClientInfo{
+		ClientID:        raw,
+		Remote:          cl.Net.Remote,
+		Connected:       !cl.Closed(),
+		ProtocolVersion: cl.Properties.ProtocolVersion,
+		Subscriptions:   filtersOf(tenantID, cl),
+	}
+
+	switch {
+	case st != nil:
+		info.Username = st.username
+		info.DeviceID = st.ident.Load().DeviceID
+		info.ConnectedAt = st.connectedAt
+		info.SessionExpiry = st.sessionExpiry
+	case !info.Connected:
+		info.Username = string(cl.Properties.Username)
+		info.SessionExpiry = sessionExpiry(cl, maxExpiry)
+	}
+
+	return info
+}
+
+// filtersOf returns cl's subscriptions without the tenant, sorted.
+func filtersOf(tenantID string, cl *mqtt.Client) []string {
+	subs := cl.State.Subscriptions.GetAll()
+	out := make([]string, 0, len(subs))
+
+	for filter := range subs {
+		if rel, ok := topic.Strip(tenantID, filter); ok {
+			out = append(out, rel)
+		}
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// Kick disconnects tenantID's open connection with clientID, with 0x98
+// administrative action (a 5.0 client gets a DISCONNECT first), within about
+// a second whatever the client does. A persistent session stays, offline;
+// use DeleteSession to remove it. It returns tether.ErrNotFound when no
+// connection with that client ID is open, an offline session included.
+func (b *Broker) Kick(tenantID, clientID string) error {
+	nsID, err := sessionID(tenantID, clientID)
+	if err != nil {
+		return err
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return notConnected(clientID)
+	}
+
+	cl, ok := srv.Clients.Get(nsID)
+	if !ok || cl.Closed() {
+		return notConnected(clientID)
+	}
+
+	b.log.Info("tether: kicking client", slog.String("client", nsID), slog.String("tenant", tenantID))
+	disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+
+	return nil
+}
+
+// sessionEndWait bounds how long DeleteSession waits, after disconnecting a
+// client, for mochi to finish with the connection.
+const sessionEndWait = 2 * time.Second
+
+// DeleteSession removes tenantID's session with clientID, open or offline.
+// An open connection is disconnected first (as Kick does) and DeleteSession
+// waits until mochi and its storage hook are done with it. Then the
+// session's subscriptions are removed (topic index, session, storage), its
+// queued messages dropped (mochi's ClearInflights, which tells storage),
+// and the session deleted from mochi's clients and from storage
+// (OnClientExpired), so it does not come back after a restart. A client
+// that connects again later starts a new session.
+//
+// It returns tether.ErrNotFound when there is no such session, and
+// tether.ErrConflict when the connection did not finish closing in time or
+// the client connected again and took the session over meanwhile; the
+// session is then left alone and the call can be repeated. A delayed will
+// (5.0 Will Delay Interval) already queued by mochi is still sent.
+func (b *Broker) DeleteSession(tenantID, clientID string) error {
+	nsID, err := sessionID(tenantID, clientID)
+	if err != nil {
+		return err
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return noSession(clientID)
+	}
+
+	cl, ok := srv.Clients.Get(nsID)
+	if !ok {
+		return noSession(clientID)
+	}
+
+	log := b.log.With(slog.String("client", nsID), slog.String("tenant", tenantID))
+
+	switch st := b.state.get(cl); {
+	case st != nil:
+		if !cl.Closed() {
+			log.Info("tether: disconnecting client to delete its session")
+			disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+		}
+
+		// The storage hook writes the session's record in its OnDisconnect;
+		// the state is dropped after that (lastHook).
+		if !waitGone(st, sessionEndWait) {
+			return fmt.Errorf("tether/broker: delete session %q: %w: the connection is still closing", clientID, tether.ErrConflict)
+		}
+	case !cl.Closed():
+		// Every open connection mochi lists has state; this one is not a
+		// tenant's (see hook.OnSessionEstablish). Close it all the same.
+		disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+	}
+
+	cur, ok := srv.Clients.Get(nsID)
+	if !ok {
+		// A session that ended with its connection: mochi removed it.
+		return nil
+	}
+
+	if cur != cl {
+		return fmt.Errorf("tether/broker: delete session %q: %w: the client connected again", clientID, tether.ErrConflict)
+	}
+
+	b.purgeSession(srv, cl)
+	log.Info("tether: session deleted")
+
+	return nil
+}
+
+// waitGone waits up to d for st to be dropped from the registry.
+func waitGone(st *clientState, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-st.gone:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// purgeSession deletes the session of cl, whose connection has ended: its
+// subscriptions, its queued messages, mochi's record and the storage
+// hook's. Mochi's own expiry (clearExpiredClients) deletes the record only.
+func (b *Broker) purgeSession(srv *mqtt.Server, cl *mqtt.Client) {
+	b.unsubscribe(srv, cl, func(string) bool { return true })
+
+	// Fires OnQosDropped on every hook, so storage forgets them too.
+	cl.ClearInflights()
+
+	if cur, ok := srv.Clients.Get(cl.ID); ok && cur == cl {
+		srv.Clients.Delete(cl.ID)
+	}
+
+	if b.storage != nil {
+		b.storage.OnClientExpired(cl)
+	}
+}
+
+// Retained lists tenantID's retained messages whose topics match filter,
+// sorted by topic. As in MQTT, a filter starting with a wildcard matches no
+// topic starting with "$" (so "#" does not list the tenant's $SYS).
+// Shared filters ("$share/...") match nothing. Before Start, after Stop and
+// for a malformed tenant ID or filter it returns nil.
+func (b *Broker) Retained(tenantID, filter string) []RetainedInfo {
+	if !validTenant(tenantID) || topic.Valid(filter, true, b.cfg.MaxTopicLength) != nil || withoutShare(filter) != filter {
+		return nil
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return nil
+	}
+
+	var out []RetainedInfo
+
+	for _, pk := range srv.Topics.Messages(topic.Namespace(tenantID, filter)) {
+		name, ok := topic.Strip(tenantID, pk.TopicName)
+		if !ok || !topic.Match(filter, name) {
+			continue
+		}
+
+		out = append(out, RetainedInfo{Topic: name, Size: len(pk.Payload), QoS: pk.FixedHeader.Qos})
+	}
+
+	slices.SortFunc(out, func(x, y RetainedInfo) int { return strings.Compare(x.Topic, y.Topic) })
+
+	return out
+}
+
+// DeleteRetained deletes tenantID's retained message on topicName by
+// publishing an empty retained message there through mochi's inline client,
+// which also deletes it from storage. As with any MQTT clearing, the
+// topic's current subscribers receive that empty message. Topics under
+// "$SYS" (in any casing) are refused like a client's publish would be.
+// It returns tether.ErrNotFound when nothing is retained on the topic.
+func (b *Broker) DeleteRetained(tenantID, topicName string) error {
+	ns, err := b.namespaceName(tenantID, topicName)
+	if err != nil {
+		return err
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return noRetained(topicName)
+	}
+
+	if _, ok := srv.Topics.Retained.Get(ns); !ok {
+		return noRetained(topicName)
+	}
+
+	if err := srv.Publish(ns, nil, true, 0); err != nil {
+		return fmt.Errorf("tether/broker: delete retained %q: %w", topicName, err)
+	}
+
+	return nil
+}
+
+// Publish publishes payload on tenantID's topicName through mochi's inline
+// client, as the host rather than a device: no ACL check, no rate limit and
+// no message counted in (the deliveries count as messages out). Callers
+// check the caller's permissions and limits first.
+//
+// The topic must be a valid topic name and may not start with "$" (tenants
+// cannot publish to $SYS). qos is 0 or 1. Mochi treats an inline publish
+// as received at QoS 0 and delivers it to each subscriber at the lower of
+// qos and the subscription's QoS. With retain, the message is retained
+// (an empty payload clears the retained message instead, as in MQTT).
+// The payload is copied. Before Start or after Stop it fails with
+// tether.ErrConflict.
+func (b *Broker) Publish(ctx context.Context, tenantID, topicName string, payload []byte, qos byte, retain bool) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("tether/broker: publish: %w", err)
+	}
+
+	ns, err := b.namespaceName(tenantID, topicName)
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case strings.HasPrefix(topicName, "$"):
+		return invalid(fmt.Sprintf("publish topic %q starts with $", topicName))
+	case qos > 1:
+		return invalid(fmt.Sprintf("publish qos %d, want 0 or 1", qos))
+	}
+
+	srv := b.running()
+	if srv == nil {
+		return fmt.Errorf("tether/broker: publish: %w: broker not running", tether.ErrConflict)
+	}
+
+	if err := srv.Publish(ns, slices.Clone(payload), retain, qos); err != nil {
+		return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+	}
+
+	return nil
+}
+
+// namespaceName validates tenantID and the topic name and returns the name
+// namespaced. Names under "$SYS", in any casing, are refused, as they are
+// for a client's PUBLISH.
+func (b *Broker) namespaceName(tenantID, name string) (string, error) {
+	if !validTenant(tenantID) {
+		return "", invalidTenant(tenantID)
+	}
+
+	if err := topic.Valid(name, false, b.cfg.MaxTopicLength); err != nil {
+		return "", fmt.Errorf("tether/broker: topic %q: %w", name, err)
+	}
+
+	if len(name) >= len(sysPrefix) && strings.EqualFold(name[:len(sysPrefix)], sysPrefix) {
+		return "", invalid(fmt.Sprintf("topic %q is under $SYS", name))
+	}
+
+	return topic.Namespace(tenantID, name), nil
+}
+
+// sessionID validates tenantID and clientID and returns the namespaced
+// client ID mochi knows the session by.
+func sessionID(tenantID, clientID string) (string, error) {
+	if !validTenant(tenantID) {
+		return "", invalidTenant(tenantID)
+	}
+
+	if clientID == "" || strings.IndexByte(clientID, 0) >= 0 {
+		return "", invalid(fmt.Sprintf("client ID %q", clientID))
+	}
+
+	return namespacedID(tenantID, clientID), nil
+}
+
+// validTenant reports whether tenantID is a tenant TypeID in its canonical
+// form, the only form the broker namespaces with. Anything else could reach
+// past the tenant's prefix (a "/" in it, for one).
+func validTenant(tenantID string) bool {
+	tid, err := id.ParseTenantID(tenantID)
+
+	return err == nil && tid.String() == tenantID
+}
+
+func invalidTenant(tenantID string) error {
+	return invalid(fmt.Sprintf("tenant ID %q", tenantID))
+}
+
+func notConnected(clientID string) error {
+	return fmt.Errorf("tether/broker: client %q: %w: not connected", clientID, tether.ErrNotFound)
+}
+
+func noSession(clientID string) error {
+	return fmt.Errorf("tether/broker: session %q: %w", clientID, tether.ErrNotFound)
+}
+
+func noRetained(topicName string) error {
+	return fmt.Errorf("tether/broker: retained message on %q: %w", topicName, tether.ErrNotFound)
 }
