@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -85,17 +86,54 @@ type Credentials struct {
 // Delete or Rotate with a zero grace, call (*auth.Keysmith).Evict with the
 // device's KeyID so the change takes effect at once.
 type Devices struct {
-	store   device.Store
-	tenants *Tenants
-	keys    KeyManager
-	roles   RoleAssigner
+	store    device.Store
+	tenants  *Tenants
+	keys     KeyManager
+	roles    RoleAssigner
+	sessions SessionDeleter
+	log      *slog.Logger
+}
+
+// SessionDeleter deletes an MQTT session: the client's subscriptions and
+// queued messages. It is satisfied by *broker.Broker. tenantID is the Tether
+// tenant ID and clientID the raw client ID the device connects with.
+type SessionDeleter interface {
+	DeleteSession(tenantID, clientID string) error
+}
+
+// DevicesOption configures a Devices service.
+type DevicesOption func(*Devices)
+
+// WithSessions makes Revoke and Delete delete the session of a device pinned
+// to a client ID, through d. Without it, or for an unpinned device (whose
+// client IDs Tether does not know), the session stays until its expiry runs
+// out.
+func WithSessions(d SessionDeleter) DevicesOption {
+	return func(s *Devices) { s.sessions = d }
+}
+
+// WithLogger is where Devices logs what it cannot report as an error: a
+// session it could not delete after the device's key was already revoked.
+// Nil discards.
+func WithLogger(l *slog.Logger) DevicesOption {
+	return func(s *Devices) {
+		if l != nil {
+			s.log = l
+		}
+	}
 }
 
 // NewDevices returns a device service. s holds the records, t resolves a
 // tenant ID to the scope for keysmith and warden, k issues keys and r assigns
 // roles.
-func NewDevices(s device.Store, t *Tenants, k KeyManager, r RoleAssigner) *Devices {
-	return &Devices{store: s, tenants: t, keys: k, roles: r}
+func NewDevices(s device.Store, t *Tenants, k KeyManager, r RoleAssigner, opts ...DevicesOption) *Devices {
+	d := &Devices{store: s, tenants: t, keys: k, roles: r, log: slog.New(slog.DiscardHandler)}
+
+	for _, opt := range opts {
+		opt(d)
+	}
+
+	return d
 }
 
 // Provision creates a device: a keysmith key (prefix "tdk", environment
@@ -216,19 +254,48 @@ func (s *Devices) Rotate(ctx context.Context, tenantID id.TenantID, deviceID id.
 
 // Revoke permanently disables the device's key. The record stays, so an
 // operator still sees the device, but it can no longer connect. Revoking a
-// device whose key is already revoked, or gone, succeeds.
+// device whose key is already revoked, or gone, succeeds. With WithSessions,
+// the session of a device pinned to a client ID is deleted too.
 func (s *Devices) Revoke(ctx context.Context, tenantID id.TenantID, deviceID id.DeviceID, reason string) error {
 	d, t, err := s.load(ctx, tenantID, deviceID)
 	if err != nil {
 		return err
 	}
 
-	return s.revokeKey(scope.With(ctx, t.AppID, t.ExternalID), d, reason)
+	if err := s.revokeKey(scope.With(ctx, t.AppID, t.ExternalID), d, reason); err != nil {
+		return err
+	}
+
+	s.endSession(t, d)
+
+	return nil
+}
+
+// endSession deletes the session of a device pinned to a client ID, once
+// its key can no longer connect. It cannot fail the revoke or delete that
+// called it, which has already happened: no session is fine, and any other
+// failure (a CONNECT or another delete of the same client ID in flight) is
+// logged and the session is left to expire.
+func (s *Devices) endSession(t *tenant.Tenant, d *device.Device) {
+	if s.sessions == nil || d.ClientID == "" {
+		return
+	}
+
+	err := s.sessions.DeleteSession(t.ID.String(), d.ClientID)
+	if err == nil || errors.Is(err, tether.ErrNotFound) {
+		return
+	}
+
+	s.log.Warn("tether: could not delete the session of a revoked device; it ends when its expiry runs out",
+		slog.String("tenant", t.ID.String()), slog.String("device", d.ID.String()),
+		slog.String("client", d.ClientID), slog.Any("error", err))
 }
 
 // Delete revokes the device's key, removes its role assignments and deletes
 // the record. A key that is already revoked or gone does not stop it. If a
 // step fails the record is kept, so calling Delete again finishes the job.
+// With WithSessions, the session of a device pinned to a client ID is
+// deleted once the record is.
 func (s *Devices) Delete(ctx context.Context, tenantID id.TenantID, deviceID id.DeviceID) error {
 	d, t, err := s.load(ctx, tenantID, deviceID)
 	if err != nil {
@@ -245,7 +312,13 @@ func (s *Devices) Delete(ctx context.Context, tenantID id.TenantID, deviceID id.
 		return fmt.Errorf("tether: unassign device roles: %w", err)
 	}
 
-	return s.store.DeleteDevice(ctx, t.ID, d.ID)
+	if err := s.store.DeleteDevice(ctx, t.ID, d.ID); err != nil {
+		return err
+	}
+
+	s.endSession(t, d)
+
+	return nil
 }
 
 // SetRoles replaces the device's roles with the given slugs and stores them on

@@ -248,8 +248,9 @@ func (e *Extension) Start(ctx context.Context) error {
 	e.wdPlugin.Bind(reactor)
 
 	services := &api.Services{
-		Tenants:           tenants,
-		Devices:           service.NewDevices(st, tenants, ks, service.NewWardenRoles(wd)),
+		Tenants: tenants,
+		Devices: service.NewDevices(st, tenants, ks, service.NewWardenRoles(wd),
+			service.WithSessions(b), service.WithLogger(slogger)),
 		Roles:             perm.NewRoles(wd),
 		Broker:            b,
 		Auth:              authn,

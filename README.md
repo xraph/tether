@@ -61,7 +61,7 @@ mosquitto_pub -h localhost -p 1883 -i pump-1 \
 
 Topics are yours to name. Tether adds the tenant prefix on the way in and takes it off on the way out, so two tenants can both use `sensors/pump-1/up` and never see each other. Devices that can't speak MQTT can post to `POST /tether/v1/publish` with HTTP Basic auth, using the same username and password.
 
-Revoke a device with `POST .../devices/$DEVICE_ID/revoke` and its live connection drops within moments. Narrow a role's topics and any subscription the device no longer has the right to is removed on the spot.
+Revoke a device with `POST .../devices/$DEVICE_ID/revoke` and its live connection drops within moments. For a device pinned to a client ID, revoking or deleting it also deletes its session. An unpinned device's sessions just run out on their expiry, since Tether doesn't know which client IDs it used. Narrow a role's topics and any subscription the device no longer has the right to is removed on the spot.
 
 ## Use Tether as a Forge extension
 
@@ -170,6 +170,7 @@ tether:
     max_session_expiry: 168h
     max_packet_size: 1048576
     max_topic_length: 1024
+    max_inflight: 1024
 ```
 
 | Key | Default | What it does |
@@ -187,11 +188,12 @@ tether:
 | `tether.broker.max_session_expiry` | `168h` | The longest session a client may ask for |
 | `tether.broker.max_packet_size` | `1048576` | Largest MQTT packet, and the largest HTTP publish payload |
 | `tether.broker.max_topic_length` | `1024` | A longer topic is refused with reason code 0x90 |
+| `tether.broker.max_inflight` | `1024` | QoS 1 and 2 messages in flight per client, an offline session's queue included. Past it, messages for that client are dropped |
 | `tether.jwt` | off | authsome JWT clients: `jwks_url`, `issuer`, `audience`, `algorithms`, `refresh_interval`, `leeway`. See above |
 
 Environment variables are not a config source here. The one exception is `TETHER_ADMIN_TOKEN`, which is read from the environment and never from the file, so the secret stays out of anything you commit. The `dashboard:` section is the Forge dashboard's own, and it's read from the same file.
 
-Per-tenant limits go in the tenant itself, under `limits`: `max_connections`, `messages_per_second`, `burst` and `max_session_expiry`. Zero means unlimited, or the broker default for the session expiry, and the session expiry is a duration in nanoseconds in the JSON. The message rate is per tenant per node. A tenant's `max_session_expiry` can only lower the broker's cap: a 5.0 client that asks for more is told the shorter value in its CONNACK, and a 3.1.1 persistent session simply gets the cap as its expiry.
+Per-tenant limits go in the tenant itself, under `limits`: `max_connections`, `messages_per_second`, `burst`, `max_session_expiry` and `max_sessions`. Zero means unlimited, or the broker default for the session expiry, and the session expiry is a duration in nanoseconds in the JSON. `max_sessions` counts open connections plus the sessions persistent clients left behind, so a tenant can't fill the node with offline sessions; a device coming back to its own session is never refused by it. The message rate is per tenant per node. A tenant's `max_session_expiry` can only lower the broker's cap: a 5.0 client that asks for more is told the shorter value in its CONNACK, and a 3.1.1 persistent session simply gets the cap as its expiry.
 
 In your own app the same `tether:` block goes under `extensions.tether` (or a top-level `tether`) in the Forge config, and the options `WithConfig` and `WithBrokerConfig` layer over it. The grove database can be PostgreSQL there: the extension looks at the driver name and picks the SQLite or PostgreSQL store.
 
@@ -201,12 +203,13 @@ In your own app the same `tether:` block goes under `extensions.tether` (or a to
 - Devices authenticate with keysmith keys, users and service accounts can use authsome JWTs, and warden roles with `%c` and `%u` placeholders decide publish and subscribe rights. Topic aliases are off, so an ACL check always sees the real topic.
 - Revoking a key, changing a role or disabling a tenant reaches connections that are already open.
 - Sessions, subscriptions, in-flight messages and retained messages persist in Badger and survive a restart.
-- Per-tenant connection caps and publish rate limits, a 1 MiB packet limit, and a 1 KiB topic limit.
+- Per-tenant caps on connections, sessions and session expiry, publish rate limits, a 1 MiB packet limit, a 1 KiB topic limit, and 1024 in-flight messages per client.
 - An admin REST API (tenants, devices, roles and their topics, live clients, sessions, retained messages, stats), an HTTP publish endpoint for devices, and the dashboard contract.
 
 ## What it doesn't do yet
 
 - Clustering. There is one node. NATS-backed routing, shared durable sessions, takeover and cells are Phase 2, and the design lives in [`_project_files/TETHER-DESIGN.md`](_project_files/TETHER-DESIGN.md).
+- Per-tenant caps on retained messages and on subscriptions. A tenant can hold as many of either as its devices' grants allow, bounded only by the packet and topic limits.
 - Metering, entitlements and audit trails (Phase 3), webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication (Phase 4).
 
 ## Development

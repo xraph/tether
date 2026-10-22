@@ -360,6 +360,49 @@ func TestRevokeDisconnectsLiveClient(t *testing.T) {
 	require.Error(t, err, "a revoked key cannot connect again")
 }
 
+// Revoking a device pinned to a client ID also deletes its kept session, so
+// the subscriptions of a device that can never come back stop queueing.
+func TestRevokeDeletesThePinnedSession(t *testing.T) {
+	e := start(t, false)
+
+	tid := e.tenant()
+	e.role(tid, "sensor", []string{"up"}, []string{"down/#"})
+
+	m := e.do(http.MethodPost, e.base+"/v1/tenants/"+tid+"/devices",
+		map[string]any{"name": "pump", "client_id": "pump-1", "roles": []string{"sensor"}}, http.StatusCreated)
+
+	opts := pahov3.NewClientOptions().
+		AddBroker("tcp://" + e.ext.Broker().Addr().String()).
+		SetClientID("pump-1").
+		SetUsername(m["username"].(string)).
+		SetPassword(m["password"].(string)).
+		SetProtocolVersion(4).
+		SetCleanSession(false).
+		SetAutoReconnect(false).
+		SetConnectTimeout(waitTimeout)
+
+	c := pahov3.NewClient(opts)
+	tok := c.Connect()
+	require.True(t, tok.WaitTimeout(waitTimeout))
+	require.NoError(t, tok.Error())
+
+	sub := c.Subscribe("down/#", 1, nil)
+	require.True(t, sub.WaitTimeout(waitTimeout))
+	require.NoError(t, sub.Error())
+	c.Disconnect(0)
+
+	require.Eventually(t, func() bool {
+		cs := e.ext.Broker().Clients(tid)
+
+		return len(cs) == 1 && !cs[0].Connected
+	}, waitTimeout, 10*time.Millisecond, "the persistent session is kept offline")
+
+	id := m["device"].(map[string]any)["id"].(string)
+	e.do(http.MethodPost, e.base+"/v1/tenants/"+tid+"/devices/"+id+"/revoke", map[string]any{"reason": "lost"}, http.StatusNoContent)
+
+	assert.Empty(t, e.ext.Broker().Clients(tid), "the revoked device's session is gone")
+}
+
 // Narrowing a role's topics through REST fires the warden plugin, whose
 // reactor reloads the device's grants and drops the subscription they no
 // longer allow. Both run inside the PUT, so there is nothing to wait for.
