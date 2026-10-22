@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/xraph/warden/role"
 	wmemory "github.com/xraph/warden/store/memory"
 
+	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/api"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
@@ -1226,4 +1228,84 @@ func TestRolesSameSlugInTwoTenants(t *testing.T) {
 
 	expect(t, e.do(http.MethodDelete, tenantPath(a)+"/roles/sensor", nil), http.StatusNoContent)
 	expect(t, e.do(http.MethodGet, tenantPath(b)+"/roles/sensor/topics", nil), http.StatusOK)
+}
+
+// countingPerms counts the grant lookups that reach the loader.
+type countingPerms struct {
+	broker.PermLoader
+
+	n atomic.Int64
+}
+
+func (c *countingPerms) Load(ctx context.Context, ident *auth.Identity) (acl.Rules, []string, error) {
+	c.n.Add(1)
+
+	return c.PermLoader.Load(ctx, ident)
+}
+
+// The tenant's message rate is spent before the grants are loaded, so a
+// device over its budget costs warden nothing: the rate bounds the load.
+func TestPublishRateLimitComesBeforeTheGrantLookup(t *testing.T) {
+	var perms *countingPerms
+
+	e := newEnvWith(t, func(s *api.Services) {
+		perms = &countingPerms{PermLoader: s.Perms}
+		s.Perms = perms
+	})
+	d, _, _ := publisher(t, e, map[string]any{"messages_per_second": 0.001, "burst": 1})
+
+	body := map[string]any{"topic": "up/open/x", "payload": b64("1")}
+	expect(t, e.publish(d.username, d.password, body), http.StatusOK)
+	require.Equal(t, int64(1), perms.n.Load())
+
+	for range 5 {
+		expect(t, e.publish(d.username, d.password, body), http.StatusTooManyRequests)
+	}
+
+	assert.Equal(t, int64(1), perms.n.Load(), "a refused publish must not load grants")
+}
+
+// An HTTP publish counts as a message in for the tenant, like an MQTT one.
+func TestPublishCountsAsMessageIn(t *testing.T) {
+	e := newEnv(t)
+	d, listener, tid := publisher(t, e, nil)
+
+	before := e.broker.Stats(tid).MessagesIn
+
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/x", "payload": b64("1")}), http.StatusOK)
+	listener.next(t)
+
+	assert.Equal(t, before+1, e.broker.Stats(tid).MessagesIn)
+
+	stats := expect(t, e.do(http.MethodGet, tenantPath(tid)+"/stats", nil), http.StatusOK).json()
+	assert.Equal(t, float64(before+1), stats["messages_in"])
+}
+
+// "$" topics follow MQTT: $SYS (any casing) and $share are refused, any
+// other "$" name is a topic that needs a grant naming it.
+func TestPublishDollarTopicsFollowMQTT(t *testing.T) {
+	e := newEnv(t)
+	tid := e.createTenant("aorg_1", nil)
+
+	d := e.provision(tid, "pump", nil)
+	e.grant(tid, "aorg_1", d, "dollar", []string{"$dev/#", "up/#"}, nil)
+
+	sub := e.provision(tid, "sub", nil)
+	e.grant(tid, "aorg_1", sub, "listen", nil, []string{"$dev/#"})
+
+	c := e.connect(sub, "listener")
+	c.subscribe(t, "$dev/#")
+
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "$dev/x", "payload": b64("d")}), http.StatusOK)
+	assert.Equal(t, msg{Topic: "$dev/x", Payload: "d"}, c.next(t))
+
+	for _, name := range []string{"$SYS/x", "$sys/x", "$Sys", "$share/g/up/x", "$SHARE/g/up/x"} {
+		r := e.publish(d.username, d.password, map[string]any{"topic": name, "payload": ""})
+		assert.GreaterOrEqual(t, r.StatusCode, 400, name)
+		assert.Less(t, r.StatusCode, 500, name)
+	}
+
+	// up/# does not reach "$" names.
+	e.grant(tid, "aorg_1", d, "plain", []string{"#"}, nil)
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "$other/x", "payload": ""}), http.StatusForbidden)
 }

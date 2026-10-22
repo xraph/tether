@@ -1342,9 +1342,15 @@ func TestInlinePublishDelivered(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, "kept", string(cl.Payload), "the caller's buffer is not retained")
 
-	for _, name := range []string{"", "t/+", "#", "$SYS/x", "$foo/x", "$share/g/t"} {
+	for _, name := range []string{"", "t/+", "#", "$SYS/x", "$sys/x", "$SYS", "$share/g/t", "$SHARE/g/t"} {
 		require.ErrorIs(t, b.Publish(ctx, tenantA, name, nil, 0, false), tether.ErrInvalidInput, "topic %q", name)
 	}
+
+	// Any other "$" name is a topic like the rest, as it is over MQTT: it
+	// lands in the tenant's space, and only a filter naming it matches it.
+	dollar := inlineSub(t, b, topic.Namespace(tenantA, "$dev/#"), 7)
+	require.NoError(t, b.Publish(ctx, tenantA, "$dev/x", []byte("d"), 0, false))
+	assert.Equal(t, message{Topic: topic.Namespace(tenantA, "$dev/x"), Payload: "d"}, recv(t, dollar))
 
 	require.ErrorIs(t, b.Publish(ctx, tenantA, "t/1", nil, 2, false), tether.ErrInvalidInput)
 	require.ErrorIs(t, b.Publish(ctx, "ttnt_nobody", "t/1", nil, 0, false), tether.ErrInvalidInput)

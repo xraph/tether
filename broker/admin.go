@@ -783,14 +783,28 @@ func (b *Broker) DeleteRetained(tenantID, topicName string) error {
 // no message counted in (the deliveries count as messages out). Callers
 // check the caller's permissions and limits first.
 //
-// The topic must be a valid topic name and may not start with "$" (tenants
-// cannot publish to $SYS). qos is 0 or 1. Mochi treats an inline publish
-// as received at QoS 0 and delivers it to each subscriber at the lower of
-// qos and the subscription's QoS. With retain, the message is retained
-// (an empty payload clears the retained message instead, as in MQTT).
-// The payload is copied. Before Start or after Stop it fails with
+// The topic must be a valid topic name. As for a client's PUBLISH, names
+// under "$SYS" and "$share" are refused in any casing; any other "$" name is
+// a topic of the tenant like the rest. qos is 0 or 1. Mochi treats an inline
+// publish as received at QoS 0 and delivers it to each subscriber at the
+// lower of qos and the subscription's QoS. With retain, the message is
+// retained (an empty payload clears the retained message instead, as in
+// MQTT). The payload is copied. Before Start or after Stop it fails with
 // tether.ErrConflict.
 func (b *Broker) Publish(ctx context.Context, tenantID, topicName string, payload []byte, qos byte, retain bool) error {
+	return b.publish(ctx, tenantID, topicName, payload, qos, retain, false)
+}
+
+// DevicePublish is Publish for a message a device sent some other way than
+// MQTT (the HTTP publish endpoint): it also counts as a message in for the
+// tenant, in Stats, the tenant's $SYS and Metrics.MessageIn, as the device's
+// MQTT PUBLISH would. The caller has checked the device's grants and spent
+// its rate budget; a refused publish counts nothing.
+func (b *Broker) DevicePublish(ctx context.Context, tenantID, topicName string, payload []byte, qos byte, retain bool) error {
+	return b.publish(ctx, tenantID, topicName, payload, qos, retain, true)
+}
+
+func (b *Broker) publish(ctx context.Context, tenantID, topicName string, payload []byte, qos byte, retain, countIn bool) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("tether/broker: publish: %w", err)
 	}
@@ -800,10 +814,7 @@ func (b *Broker) Publish(ctx context.Context, tenantID, topicName string, payloa
 		return err
 	}
 
-	switch {
-	case strings.HasPrefix(topicName, "$"):
-		return invalid(fmt.Sprintf("publish topic %q starts with $", topicName))
-	case qos > 1:
+	if qos > 1 {
 		return invalid(fmt.Sprintf("publish qos %d, want 0 or 1", qos))
 	}
 
@@ -814,6 +825,11 @@ func (b *Broker) Publish(ctx context.Context, tenantID, topicName string, payloa
 
 	if err := srv.Publish(ns, slices.Clone(payload), retain, qos); err != nil {
 		return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+	}
+
+	if countIn {
+		b.countersFor(tenantID).in.Add(1)
+		b.deps.Metrics.MessageIn()
 	}
 
 	return nil

@@ -175,3 +175,33 @@ func TestMetricsTakeoverKeepsOneConnection(t *testing.T) {
 	got := m.snapshot()
 	assert.Equal(t, 1, got.opened-got.closed, "one live connection")
 }
+
+// A publish a device makes over HTTP counts as a message in, the way its
+// MQTT PUBLISH would; one the host makes does not.
+func TestDevicePublishCountsIn(t *testing.T) {
+	tn := newTenant(tenant.Limits{})
+	m := newFakeMetrics()
+
+	b, err := New(testConfig(), Deps{Auth: auth.NewStatic(nil), Perms: fakePerms{}, Metrics: m})
+	require.NoError(t, err)
+	require.NoError(t, b.Start(t.Context()))
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), waitTimeout)
+		defer cancel()
+
+		_ = b.Stop(ctx)
+	})
+
+	tid := tn.ID.String()
+
+	require.NoError(t, b.Publish(t.Context(), tid, "up/1", []byte("host"), 0, false))
+	assert.Equal(t, uint64(0), b.Stats(tid).MessagesIn)
+
+	require.NoError(t, b.DevicePublish(t.Context(), tid, "up/1", []byte("dev"), 0, false))
+	assert.Equal(t, uint64(1), b.Stats(tid).MessagesIn)
+	assert.Equal(t, 1, m.snapshot().in)
+
+	// A refused one counts nothing.
+	require.Error(t, b.DevicePublish(t.Context(), tid, "$SYS/x", nil, 0, false))
+	assert.Equal(t, uint64(1), b.Stats(tid).MessagesIn)
+}

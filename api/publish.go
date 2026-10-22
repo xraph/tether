@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/xraph/forge"
@@ -122,12 +123,21 @@ func (a *API) unauthorized(c forge.Context, err error) error {
 	return a.fail("publish authenticate", err)
 }
 
-// publish runs the checks a device's MQTT PUBLISH goes through, in order:
-// grants, then the tenant's message rate, then the broker.
+// publish runs the checks a device's MQTT PUBLISH goes through: the topic,
+// the tenant's message rate, then the grants, then the broker. The rate comes
+// before the grants on purpose: loading them asks warden, and a device over
+// its budget must not be able to make it do that at will. So the tenant's
+// budget bounds the load, and a publish refused by its grants has still
+// spent a token, as an MQTT PUBLISH refused by the ACL has used the network.
+//
+// "$" topics follow MQTT: "$SYS" and "$share" (any casing) are refused, any
+// other "$" name needs a grant that names it, since a filter that starts
+// with a wildcard never matches one.
 //
 // The grants expand "%u" to the username and "%c" to the device's pinned
 // client ID. An unpinned device has no client ID over HTTP, so a grant that
-// uses "%c" is dropped for it.
+// uses "%c" is dropped for it. An accepted publish counts as a message in
+// for the tenant (broker.DevicePublish).
 func (a *API) publish(c forge.Context) error {
 	ident, ok := c.Get(ctxIdentity).(*auth.Identity)
 	if !ok {
@@ -141,18 +151,12 @@ func (a *API) publish(c forge.Context) error {
 		return err
 	}
 
-	rules, _, err := a.Perms.Load(c.Context(), ident)
-	if err != nil {
-		return a.loadFailed(err)
-	}
-
-	if err := topic.Valid(req.Topic, false, 0); err != nil {
+	if err = topic.Valid(req.Topic, false, 0); err != nil {
 		return mapError(err)
 	}
 
-	set := acl.Compile(rules, acl.Vars{ClientID: ident.ClientID, Username: ident.Username})
-	if !set.CanPublish(req.Topic) {
-		return mapError(fmt.Errorf("%w: publishing to this topic is not granted", tether.ErrNotAuthorized))
+	if isSys(req.Topic) {
+		return mapError(fmt.Errorf("%w: $SYS topics are the broker's", tether.ErrNotAuthorized))
 	}
 
 	tn := ident.Tenant
@@ -162,17 +166,35 @@ func (a *API) publish(c forge.Context) error {
 		return mapError(fmt.Errorf("%w: tenant message rate exceeded", auth.ErrRateLimited))
 	}
 
+	rules, _, err := a.Perms.Load(c.Context(), ident)
+	if err != nil {
+		return a.loadFailed(err)
+	}
+
+	set := acl.Compile(rules, acl.Vars{ClientID: ident.ClientID, Username: ident.Username})
+	if !set.CanPublish(req.Topic) {
+		return mapError(fmt.Errorf("%w: publishing to this topic is not granted", tether.ErrNotAuthorized))
+	}
+
 	var qos byte
 	if req.QoS == 1 {
 		qos = 1
 	}
 
-	if err := a.Broker.Publish(c.Context(), tn.ID.String(), req.Topic, payload, qos, req.Retain); err != nil {
+	if err := a.Broker.DevicePublish(c.Context(), tn.ID.String(), req.Topic, payload, qos, req.Retain); err != nil {
 		return a.brokerFail("publish", err)
 	}
 
 	return c.JSON(http.StatusOK, publishResponse{Published: true})
 }
+
+// isSys reports whether name is under "$SYS" in any casing, which a client
+// may never publish to (mochi drops those, and the broker refuses them).
+func isSys(name string) bool {
+	return len(name) >= len(sysPrefix) && strings.EqualFold(name[:len(sysPrefix)], sysPrefix)
+}
+
+const sysPrefix = "$SYS"
 
 // loadFailed maps a failed grant lookup the way the broker treats one at
 // CONNECT: a refused principal is 403, anything else is an outage (503) and
