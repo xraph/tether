@@ -17,7 +17,8 @@ import (
 	"github.com/xraph/keysmith/rotation"
 	kmemory "github.com/xraph/keysmith/store/memory"
 	"github.com/xraph/warden"
-	"github.com/xraph/warden/keysmithbridge"
+	"github.com/xraph/warden/assignment"
+	wid "github.com/xraph/warden/id"
 	"github.com/xraph/warden/role"
 	wmemory "github.com/xraph/warden/store/memory"
 
@@ -79,14 +80,24 @@ func (r *recordingKeys) RevokeKey(ctx context.Context, keyID kid.ID, reason stri
 	return r.KeyManager.RevokeKey(ctx, keyID, reason)
 }
 
-// failingRoles fails AssignRoleToAPIKey for one slug or UnassignRoleFromAPIKey
-// when failUnassign is set.
+// failingRoles fails AssignRoleToAPIKey for one slug, UnassignRoleFromAPIKey
+// when failUnassign is set and UnassignOtherRolesFromAPIKey when
+// failUnassignOthers is set.
 type failingRoles struct {
 	service.RoleAssigner
 
-	failSlug     string
-	failUnassign bool
-	unassigned   int
+	failSlug           string
+	failUnassign       bool
+	failUnassignOthers bool
+	unassigned         int
+}
+
+func (f *failingRoles) UnassignOtherRolesFromAPIKey(ctx context.Context, tenantID, keyID string, keep []string) error {
+	if f.failUnassignOthers {
+		return errors.New("unassign others boom")
+	}
+
+	return f.RoleAssigner.UnassignOtherRolesFromAPIKey(ctx, tenantID, keyID, keep)
 }
 
 func (f *failingRoles) AssignRoleToAPIKey(ctx context.Context, tenantID, keyID, slug string) error {
@@ -107,6 +118,48 @@ func (f *failingRoles) UnassignRoleFromAPIKey(ctx context.Context, tenantID, key
 	return f.RoleAssigner.UnassignRoleFromAPIKey(ctx, tenantID, keyID)
 }
 
+// assignRecorder is a warden plugin that records role assignments and
+// unassignments.
+type assignRecorder struct {
+	mu         sync.Mutex
+	assigned   []*assignment.Assignment
+	unassigned []*assignment.Assignment
+}
+
+func (*assignRecorder) Name() string { return "assign-recorder" }
+
+func (a *assignRecorder) OnRoleAssigned(_ context.Context, x *assignment.Assignment) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.assigned = append(a.assigned, x)
+
+	return nil
+}
+
+func (a *assignRecorder) OnRoleUnassigned(_ context.Context, x *assignment.Assignment) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.unassigned = append(a.unassigned, x)
+
+	return nil
+}
+
+func (a *assignRecorder) reset() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.assigned, a.unassigned = nil, nil
+}
+
+func (a *assignRecorder) counts() (assigned, unassigned []*assignment.Assignment) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	return append([]*assignment.Assignment(nil), a.assigned...), append([]*assignment.Assignment(nil), a.unassigned...)
+}
+
 type devEnv struct {
 	st      store.Store
 	tenants *service.Tenants
@@ -117,6 +170,7 @@ type devEnv struct {
 	roles   *failingRoles
 	devices *service.Devices
 	wctx    context.Context
+	events  *assignRecorder
 }
 
 func newDevEnv(t *testing.T) *devEnv {
@@ -133,16 +187,19 @@ func newDevEnv(t *testing.T) *devEnv {
 	km, err := keysmith.NewEngine(keysmith.WithStore(kmemory.New()))
 	require.NoError(t, err)
 
-	wd, err := warden.NewEngine(warden.WithStore(wmemory.New()))
+	rec := &assignRecorder{}
+
+	wd, err := warden.NewEngine(warden.WithStore(wmemory.New()), warden.WithPlugin(rec))
 	require.NoError(t, err)
 
 	keys := &recordingKeys{KeyManager: km}
-	roles := &failingRoles{RoleAssigner: keysmithbridge.New(wd)}
+	roles := &failingRoles{RoleAssigner: service.NewWardenRoles(wd)}
 
 	e := &devEnv{
 		st: st, tenants: tenants, tenant: tn, km: km, keys: keys, wd: wd, roles: roles,
 		devices: service.NewDevices(st, tenants, keys, roles),
 		wctx:    scope.With(t.Context(), devApp, devOrg),
+		events:  rec,
 	}
 
 	return e
@@ -168,6 +225,15 @@ func (e *devEnv) roleSlugs(t *testing.T, keyID string) []string {
 	}
 
 	return out
+}
+
+func (e *devEnv) roleID(t *testing.T, slug string) wid.RoleID {
+	t.Helper()
+
+	r, err := e.wd.Store().GetRoleBySlug(e.wctx, devOrg, "", slug)
+	require.NoError(t, err)
+
+	return r.ID
 }
 
 func (e *devEnv) validate(t *testing.T, raw string) (*keysmith.ValidationResult, error) {
@@ -289,6 +355,10 @@ func (c cancellingRoles) AssignRoleToAPIKey(context.Context, string, string, str
 }
 
 func (cancellingRoles) UnassignRoleFromAPIKey(context.Context, string, string) error { return nil }
+
+func (cancellingRoles) UnassignOtherRolesFromAPIKey(context.Context, string, string, []string) error {
+	return nil
+}
 
 func TestProvisionValidatesInput(t *testing.T) {
 	e := newDevEnv(t)
@@ -550,14 +620,101 @@ func TestSetRolesRestoresPreviousRolesOnFailure(t *testing.T) {
 
 	c := e.provision(t, service.ProvisionInput{Name: "pump", Roles: []string{"sensor"}})
 
+	e.events.reset()
+
 	err := e.devices.SetRoles(t.Context(), e.tenant.ID, c.Device.ID, []string{"nope"})
 	require.Error(t, err)
 
 	assert.Equal(t, []string{"sensor"}, e.roleSlugs(t, c.Username), "the old roles are back")
 
+	_, unassigned := e.events.counts()
+	assert.Empty(t, unassigned, "the role the device kept was never unassigned, not even by the restore")
+
 	got, err := e.devices.Get(t.Context(), e.tenant.ID, c.Device.ID)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"sensor"}, got.Roles)
+}
+
+// Controller ruling R12: SetRoles applies only the difference, so a role the
+// device keeps is never unassigned (a live device would lose its
+// subscriptions in the gap).
+func TestSetRolesAppliesOnlyTheDiff(t *testing.T) {
+	e := newDevEnv(t)
+	e.createRole(t, "a")
+	e.createRole(t, "b")
+
+	c := e.provision(t, service.ProvisionInput{Name: "pump", Roles: []string{"a"}})
+
+	e.events.reset()
+	require.NoError(t, e.devices.SetRoles(t.Context(), e.tenant.ID, c.Device.ID, []string{"a", "b"}))
+
+	assigned, unassigned := e.events.counts()
+	assert.ElementsMatch(t, []string{"a", "b"}, e.roleSlugs(t, c.Username))
+	require.Len(t, assigned, 1, "only b is new")
+	assert.Equal(t, e.roleID(t, "b"), assigned[0].RoleID)
+	assert.Empty(t, unassigned, "a stays assigned throughout")
+
+	e.events.reset()
+	require.NoError(t, e.devices.SetRoles(t.Context(), e.tenant.ID, c.Device.ID, []string{"b"}))
+
+	assigned, unassigned = e.events.counts()
+	assert.Equal(t, []string{"b"}, e.roleSlugs(t, c.Username))
+	assert.Empty(t, assigned)
+	require.Len(t, unassigned, 1, "exactly one RoleUnassigned, for a")
+	assert.Equal(t, e.roleID(t, "a"), unassigned[0].RoleID)
+	assert.Equal(t, "api_key", unassigned[0].SubjectKind)
+	assert.Equal(t, c.Username, unassigned[0].SubjectID)
+
+	got, err := e.devices.Get(t.Context(), e.tenant.ID, c.Device.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, got.Roles)
+}
+
+// A failed unassign of a dropped role restores the stored roles without
+// touching the ones that stay.
+func TestSetRolesRestoresWhenUnassignFails(t *testing.T) {
+	e := newDevEnv(t)
+	e.createRole(t, "a")
+	e.createRole(t, "b")
+
+	c := e.provision(t, service.ProvisionInput{Name: "pump", Roles: []string{"a", "b"}})
+
+	e.roles.failUnassignOthers = true
+	err := e.devices.SetRoles(t.Context(), e.tenant.ID, c.Device.ID, []string{"b"})
+	require.Error(t, err)
+
+	e.roles.failUnassignOthers = false
+
+	assert.ElementsMatch(t, []string{"a", "b"}, e.roleSlugs(t, c.Username))
+
+	got, err := e.devices.Get(t.Context(), e.tenant.ID, c.Device.ID)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, got.Roles)
+}
+
+// Unassignment through WardenRoles keeps the bridge's side effects: the
+// key's cached warden decisions are dropped, so a check right after sees the
+// role gone.
+func TestWardenRolesUnassignOthers(t *testing.T) {
+	e := newDevEnv(t)
+	e.createRole(t, "a")
+	e.createRole(t, "b")
+
+	wr := service.NewWardenRoles(e.wd)
+	require.NoError(t, wr.AssignRoleToAPIKey(e.wctx, devOrg, "akey_x", "a"))
+	require.NoError(t, wr.AssignRoleToAPIKey(e.wctx, devOrg, "akey_x", "b"))
+	require.NoError(t, wr.AssignRoleToAPIKey(e.wctx, devOrg, "akey_y", "a"))
+
+	require.NoError(t, wr.UnassignOtherRolesFromAPIKey(e.wctx, devOrg, "akey_x", []string{"b", "missing"}))
+
+	assert.Equal(t, []string{"b"}, e.roleSlugs(t, "akey_x"))
+	assert.Equal(t, []string{"a"}, e.roleSlugs(t, "akey_y"), "another key is untouched")
+
+	require.NoError(t, wr.UnassignOtherRolesFromAPIKey(e.wctx, devOrg, "akey_x", nil))
+	assert.Empty(t, e.roleSlugs(t, "akey_x"))
+
+	require.ErrorIs(t, wr.UnassignOtherRolesFromAPIKey(e.wctx, "", "akey_x", nil), warden.ErrTenantRequired)
+	require.Error(t, wr.UnassignOtherRolesFromAPIKey(e.wctx, devOrg, "", nil))
 }
 
 func TestSetRolesValidatesSlugs(t *testing.T) {

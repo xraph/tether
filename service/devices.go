@@ -39,12 +39,18 @@ type KeyManager interface {
 	RevokeKey(ctx context.Context, keyID kid.KeyID, reason string) error
 }
 
-// RoleAssigner assigns warden roles to API keys. It is satisfied by warden's
-// keysmithbridge.Bridge. tenantID is the warden tenant, which is the Tether
-// tenant's ExternalID.
+// RoleAssigner assigns warden roles to API keys. It is satisfied by
+// *WardenRoles (NewWardenRoles). tenantID is the warden tenant, which is the
+// Tether tenant's ExternalID.
+//
+// AssignRoleToAPIKey must be a no-op for a role the key already holds, and
+// UnassignOtherRolesFromAPIKey must leave the roles in keep assigned: SetRoles
+// relies on both so a role a device keeps is never unassigned, not even for a
+// moment.
 type RoleAssigner interface {
 	AssignRoleToAPIKey(ctx context.Context, tenantID, keyID, roleSlug string) error
 	UnassignRoleFromAPIKey(ctx context.Context, tenantID, keyID string) error
+	UnassignOtherRolesFromAPIKey(ctx context.Context, tenantID, keyID string, keep []string) error
 }
 
 // ProvisionInput describes a device to create. Name is required. ClientID, if
@@ -243,8 +249,15 @@ func (s *Devices) Delete(ctx context.Context, tenantID id.TenantID, deviceID id.
 }
 
 // SetRoles replaces the device's roles with the given slugs and stores them on
-// the device record. If a role cannot be assigned, the previous roles are put
-// back and the error is returned.
+// the device record. It applies only the difference: every new role is
+// assigned first (a role the key already holds is a no-op), then every other
+// role the key holds in the tenant's root namespace is unassigned. A role in
+// both lists is never unassigned, so a connected device keeps its grants and
+// subscriptions for it throughout (Broker.ReloadPrincipal runs on every
+// assignment event and prunes what the grants no longer allow).
+//
+// If a step fails, the previous roles are put back the same way and the
+// error is returned.
 func (s *Devices) SetRoles(ctx context.Context, tenantID id.TenantID, deviceID id.DeviceID, roles []string) error {
 	roles, err := cleanRoles(roles)
 	if err != nil {
@@ -258,11 +271,7 @@ func (s *Devices) SetRoles(ctx context.Context, tenantID id.TenantID, deviceID i
 
 	sctx := scope.With(ctx, t.AppID, t.ExternalID)
 
-	if err := s.roles.UnassignRoleFromAPIKey(sctx, t.ExternalID, d.KeyID); err != nil {
-		return fmt.Errorf("tether: unassign device roles: %w", err)
-	}
-
-	if err := s.assignAll(sctx, t, d.KeyID, roles); err != nil {
+	if err := s.applyRoles(sctx, t, d.KeyID, roles); err != nil {
 		return errors.Join(err, s.restoreRoles(sctx, t, d))
 	}
 
@@ -356,16 +365,28 @@ func (s *Devices) compensate(sctx context.Context, t *tenant.Tenant, keyID kid.K
 	return errors.Join(errs...)
 }
 
-// restoreRoles puts d's stored roles back on its key after a failed SetRoles.
+// applyRoles makes roles the key's exact set of root namespace roles: it
+// assigns them all (no-ops for held ones), then unassigns every other one.
+func (s *Devices) applyRoles(sctx context.Context, t *tenant.Tenant, keyID string, roles []string) error {
+	if err := s.assignAll(sctx, t, keyID, roles); err != nil {
+		return err
+	}
+
+	if err := s.roles.UnassignOtherRolesFromAPIKey(sctx, t.ExternalID, keyID, roles); err != nil {
+		return fmt.Errorf("tether: unassign dropped roles: %w", err)
+	}
+
+	return nil
+}
+
+// restoreRoles puts d's stored roles back on its key after a failed SetRoles,
+// the same way SetRoles applies them, so a role in both sets stays assigned.
+// It runs on a context that survives the caller's cancellation.
 func (s *Devices) restoreRoles(sctx context.Context, t *tenant.Tenant, d *device.Device) error {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(sctx), cleanupTimeout)
 	defer cancel()
 
-	if err := s.roles.UnassignRoleFromAPIKey(cctx, t.ExternalID, d.KeyID); err != nil {
-		return fmt.Errorf("tether: restore roles: %w", err)
-	}
-
-	if err := s.assignAll(cctx, t, d.KeyID, d.Roles); err != nil {
+	if err := s.applyRoles(cctx, t, d.KeyID, d.Roles); err != nil {
 		return fmt.Errorf("tether: restore roles: %w", err)
 	}
 

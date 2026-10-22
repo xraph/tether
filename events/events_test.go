@@ -13,7 +13,6 @@ import (
 	"github.com/xraph/keysmith"
 	kmemory "github.com/xraph/keysmith/store/memory"
 	"github.com/xraph/warden"
-	"github.com/xraph/warden/keysmithbridge"
 	"github.com/xraph/warden/role"
 	wmemory "github.com/xraph/warden/store/memory"
 
@@ -45,7 +44,7 @@ type env struct {
 	tenant  *tenant.Tenant
 	devices *service.Devices
 	roles   *perm.Roles
-	bridge  *keysmithbridge.Bridge
+	bridge  *service.WardenRoles
 	wd      *warden.Engine
 	wctx    context.Context
 }
@@ -92,7 +91,7 @@ func newEnv(t *testing.T) *env {
 	ks.Bind(reactor)
 	wp.Bind(reactor)
 
-	bridge := keysmithbridge.New(wd)
+	bridge := service.NewWardenRoles(wd)
 
 	return &env{
 		b:       b,
@@ -383,6 +382,34 @@ func TestRoleUnassignmentDropsSubscription(t *testing.T) {
 
 	assert.Equal(t, 0, e.b.Stats(e.tenant.ID.String()).Subscriptions)
 	assert.Equal(t, []byte{0x87}, subscribe(t, c, "cmd/#"))
+	assertConnected(t, c)
+}
+
+// Controller ruling R12: adding a role must not take away the subscriptions
+// of a role the device keeps. SetRoles applies only the difference, so no
+// reload ever sees the device without role a.
+func TestSetRolesKeepsSubscriptionOfKeptRole(t *testing.T) {
+	e := newEnv(t)
+	e.role(t, "a", acl.Rules{Subscribe: []string{"cmd/#"}})
+	e.role(t, "b", acl.Rules{Subscribe: []string{"extra/#"}})
+	e.role(t, "pub", acl.Rules{Publish: []string{"#"}})
+
+	creds := e.provision(t, service.ProvisionInput{Roles: []string{"a"}})
+	pubCreds := e.provision(t, service.ProvisionInput{Roles: []string{"pub"}})
+
+	c := mustConnect(t, e.addr, "dev-1", creds)
+	require.Equal(t, []byte{1}, subscribe(t, c, "cmd/#"))
+
+	p := mustConnect(t, e.addr, "pub-1", pubCreds)
+
+	require.NoError(t, e.devices.SetRoles(t.Context(), e.tenant.ID, creds.Device.ID, []string{"a", "b"}))
+
+	assert.Equal(t, 1, e.b.Stats(e.tenant.ID.String()).Subscriptions, "cmd/# survived")
+
+	require.Equal(t, byte(0), publish(t, p, "cmd/x", "still"))
+	assert.Equal(t, message{Topic: "cmd/x", Payload: "still"}, recv(t, c.msgs))
+
+	assert.Equal(t, []byte{1}, subscribe(t, c, "extra/#"), "b's grant is live")
 	assertConnected(t, c)
 }
 

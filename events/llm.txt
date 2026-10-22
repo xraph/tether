@@ -28,6 +28,6 @@ Called synchronously from inside the engine call that made the change (and from 
 - `SubjectChanged("api_key", id)`: `ReloadPrincipal`. Other kinds are ignored.
 - Empty IDs are ignored.
 
-Wiring (what the extension does, and what `events_test.go` does): build the keysmith plugin and the warden plugin unbound, pass them to the engines at construction, build `auth.NewKeysmith`, `perm.NewLoader` and the broker, then `r := events.NewReactor(authn.Evict, b)` and `Bind(r)` on both plugins.
+Wiring (what the extension does, and what `events_test.go` does): build the keysmith plugin and the warden plugin unbound, pass them to the engines at construction, build `auth.NewKeysmith`, `perm.NewLoader` and the broker, then `r := events.NewReactor(authn.Evict, b)` and `Bind(r)` on both plugins. Device roles go through `service.NewDevices(store, tenants, keysmithEngine, service.NewWardenRoles(wardenEngine))`.
 
-Known interaction: `service.Devices.SetRoles` unassigns every role, then assigns the new list, and each step emits an event. A live device's reload in between sees no roles, so its subscriptions are pruned even for roles it keeps; the device must subscribe again.
+`service.Devices.SetRoles` applies only the role difference (assign added, then unassign dropped one by one through `service.WardenRoles`), so the reload after each event never sees a device without a role it keeps, and that role's subscriptions survive (`TestSetRolesKeepsSubscriptionOfKeptRole`).
