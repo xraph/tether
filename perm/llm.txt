@@ -1,0 +1,14 @@
+# tether/perm
+
+Import: github.com/xraph/tether/perm
+
+Reads and writes a role's MQTT topic grants in warden role metadata. Imports warden, acl, auth, scope, tenant, topic and the root package; it does not import broker (a test asserts `*Loader` satisfies `broker.PermLoader`).
+
+Metadata shape, under `perm.MetadataKey` ("tether"): `{"publish": [...], "subscribe": [...]}`, with the `%c` and `%u` placeholders that `acl.Compile` expands.
+
+- `RulesFromMetadata(roleSlug string, md map[string]any) (acl.Rules, error)`: missing `tether` key, or a missing or null `publish`/`subscribe`, is empty with no error. Lists are accepted as `[]string`, `[]any` of strings (sqlite/postgres JSON), or any slice or array of strings by reflection (mongo `bson.A`); the `tether` value may be any string-keyed map type. Anything else is an error wrapping `tether.ErrInvalidInput` that names the role. The result never aliases `md`. The slug argument is an addition to the plan's one-argument form, so the error can name the role.
+- `NewLoader(eng *warden.Engine, opts ...LoaderOption) *Loader`; `WithLogger(*slog.Logger)` (default discards).
+- `(*Loader).Load(ctx, *auth.Identity) (acl.Rules, []string, error)`: the broker's `PermLoader`. Runs `eng.SubjectRoles(scope.With(ctx, AppID, ExternalID), warden.SubjectAPIKey, PrincipalID)`, merges the `all` roles' grants with `acl.Merge`, returns the ID of every role in `all`. A role with malformed grants is skipped (slug logged at warn) but its ID is still returned, so one bad role cannot lock a device out of the others. A nil identity, no tenant, a non-"api_key" kind or an empty principal ID wraps `tether.ErrInvalidInput`.
+- `NewRoles(eng) *Roles`; `GetRules(ctx, t, slug)` and `SetRules(ctx, t, slug, rules)`: roles are looked up by slug in the tenant root namespace ("") with warden tenant ID `t.ExternalID`. A missing role is `tether.ErrNotFound`. `SetRules` checks every filter with `topic.Valid(f, true, 0)` first (error names the filter, wraps `tether.ErrInvalidInput`, nothing written), copies the metadata map (stores may return the one they hold), keeps other keys, replaces `tether`, calls `UpdateRole`, then `eng.Plugins().EmitRoleUpdated` (nil-guarded) and `eng.InvalidateTenant`, because warden store writes fire no hooks and leave its cache alone.
+
+Limits: `SetRules` is read-modify-write with no lock, so concurrent writes to one role can lose one. It does not reject `$share/...` grants; `acl.Compile` drops them.
