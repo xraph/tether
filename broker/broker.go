@@ -392,6 +392,15 @@ func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, code packet
 	cl.Stop(code)
 }
 
+// Running reports whether the broker is started and not yet stopped. The
+// admin operations that need mochi (Clients, Kick, DeleteSession, Retained,
+// DeleteRetained, Publish) fail with tether.ErrNotFound or tether.ErrConflict
+// when it is false; callers that must tell "stopped" from "no such thing"
+// check Running first.
+func (b *Broker) Running() bool {
+	return b.running() != nil
+}
+
 // Addr returns the TCP listener's address, or nil when there is none or the
 // broker has not started.
 func (b *Broker) Addr() net.Addr {

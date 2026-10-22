@@ -1,0 +1,61 @@
+# tether/api
+
+Import: github.com/xraph/tether/api
+
+Tether's REST layer on Forge routers: an admin API and one public endpoint, POST /v1/publish. Typed Forge handlers over `service`, `perm`, `broker`, `auth`, `acl` and `limits`.
+
+## Wiring
+
+`Register(admin, public forge.Router, s Services) error` mounts the admin routes on `admin` and `POST /v1/publish` on `public`, both relative to whatever base path (default `/tether`) those routers carry. It adds no admin authentication: the caller wraps `admin` in its own auth middleware (a group with `forge.WithGroupMiddleware`). The error is a missing required service or a failed route registration (joined; earlier routes stay mounted).
+
+`Services{Tenants *service.Tenants; Devices *service.Devices; Roles *perm.Roles; Broker *broker.Broker; Auth auth.Authenticator; Perms broker.PermLoader; Limits *limits.Limiter; Logger *slog.Logger}`. All but Logger are required. Logger gets the internal errors the API hides from clients (nil discards them). `Auth`, `Perms` and `Limits` should be the very ones the broker runs with, so an HTTP publish meets the same checks and shares the tenant's rate bucket.
+
+## Admin routes
+
+All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged with `?limit=&offset=` for tenants and devices (default 100, at most 500, negative is 400).
+
+| Route | Does |
+|---|---|
+| `POST /v1/tenants` | body `{app_id, external_id, name, limits}`; 201 with the tenant. Limits are `tenant.Limits` JSON, so `max_session_expiry` is nanoseconds. Negative limits are 400. A reused external ID is 409. |
+| `GET /v1/tenants`, `GET /:tenantId` | list, get |
+| `PATCH /:tenantId` | body `{name, enabled, limits}`, absent fields untouched; then `Broker.UpdateTenant` (live connections take the new limits, or are disconnected when disabled) |
+| `DELETE /:tenantId` | 204. `Delete` first (409 while devices exist, and then nothing changes); on success `Broker.UpdateTenant` with a disabled copy so live connections end |
+| `POST /:tenantId/devices` | body `{name, client_id, roles, expires_at}`; 201 `{device, username, password}` with `Cache-Control: no-store` |
+| `GET /:tenantId/devices`, `GET .../devices/:deviceId` | never a password |
+| `DELETE .../devices/:deviceId` | 204 |
+| `POST .../devices/:deviceId/rotate` | optional body `{grace_seconds}`; 200 `{device, username, password}`, `no-store`. A revoked device is 409. |
+| `POST .../devices/:deviceId/revoke` | optional body `{reason}`; 204, the record stays |
+| `PUT .../devices/:deviceId/roles` | body `{roles: [slugs]}` (required, `[]` clears); 200 with the device. An unknown role is 400. |
+| `GET\|PUT /:tenantId/roles/:roleSlug/topics` | `{publish: [...], subscribe: [...]}`; PUT replaces both lists. Invalid filter 400, unknown role 404. |
+| `GET /:tenantId/clients` | `broker.ClientInfo` list |
+| `POST /:tenantId/clients/:clientId/kick`, `DELETE /:tenantId/sessions/:clientId` | 204 |
+| `GET /:tenantId/retained?filter=` | default filter `#`; invalid filter 400 |
+| `DELETE /:tenantId/retained?topic=` | 204; nothing retained there is 404 |
+| `GET /:tenantId/stats` | `{connected, sessions, subscriptions, retained, messages_in, messages_out}` on this node |
+
+Revoke, delete and rotate do not touch the broker: the keysmith plugin events (`events/`) disconnect and evict. The API does not duplicate that.
+
+Every route that calls the broker (clients, kick, sessions, retained, stats, publish) is 503 while `Broker.Running()` is false. Tenant PATCH and DELETE are not gated: `UpdateTenant` is a no-op on a stopped broker, and the store write is the point.
+
+## Tenant scope
+
+The tenant in the path is parsed (malformed is 400) and loaded (unknown is 404); devices, roles and broker calls then take that tenant's ID or external ID. A device, client, session, retained topic or role that belongs to another tenant is a 404 (or an empty list), never a read or a change. `TestTenantScopeInPath` pins it for every route.
+
+## POST /v1/publish
+
+Public. HTTP Basic: username is the key ID, password the raw key. Body `{"topic": string, "payload": base64, "qos": 0|1, "retain": bool}`; `payload` may be empty. Success is 200 `{"published": true}`. Order: running check, `Authenticate` (ClientID empty, Remote from the request), body checks, `Perms.Load`, `acl.Compile` with the username, `topic.Valid`, `CanPublish`, `Limits.AllowMessage` with the tenant's limits, `Broker.Publish` (inline, so no second ACL or rate check).
+
+- No client ID exists over HTTP, so a grant that uses `%c` never matches. A device pinned to a client ID is refused (403), because the authenticator checks the pin against the empty ID.
+- Failures: missing or bad credentials 401 with `WWW-Authenticate: Basic`; wrong tenant state or an unauthorized key 403; keysmith's rate limit and the tenant's message rate 429 with `Retry-After: 1`; a grant lookup that fails for any reason but a refused principal 503; invalid JSON, base64, qos or topic 400; a decoded payload over `MaxPublishPayload` (1 MiB) or a body far over its base64 size 413; ACL denial 403 with a reason. Authentication failures all read "invalid credentials" or "not authorized", so a caller cannot tell a wrong key from a revoked one.
+- `forge.WithIdempotency` is on the route. The authentication middleware runs before it and sets the principal (`<tenant ID>/<key ID>`), so a replay needs the right password and a revoked key never replays. The default process-wide in-memory store applies: with several nodes behind a balancer, give Forge a shared store. The idempotency body cap is raised to fit a 1 MiB payload in base64.
+- Rate limiting happens after the idempotency lookup, so a replay costs no token.
+
+## Errors
+
+`mapError` is the one place errors become HTTP: `ErrInvalidInput` 400 (with the reason), `auth.ErrBadCredentials` 401, `auth.ErrNotAuthorized` and `ErrTenantDisabled` 403, `tether.ErrNotAuthorized` 403 (with the reason, the ACL denial), `ErrNotFound` 404, `ErrConflict` 409 (with the reason), `auth.ErrRateLimited` 429, `auth.ErrUnavailable` 503, `warden.ErrRoleNotFound` 400, `keysmith.ErrKeyNotFound` 404, a rotate of a revoked key 409, anything else 500. 404, 401 and 403 texts are fixed; an unmapped error never reaches the body (and Forge redacts 5xx bodies) but is logged through `Services.Logger`. A broker that is not running makes `ErrNotFound` and `ErrConflict` mean nothing, so those become 503.
+
+Forge's binder treats a non-pointer field without `omitempty` or `optional:"true"` as required (400 "invalid request: ..."); the request structs rely on that for `name`, `app_id`, `external_id` and `roles`.
+
+## Tests
+
+`api_test.go` runs the whole stack (memory store, keysmith and warden engines, the broker on a loopback port, paho clients) behind a Forge test app and `httptest`. `errors_internal_test.go` has the `mapError` table. `spec_test.go` checks the route list.

@@ -391,6 +391,20 @@ func TestAdminBeforeStart(t *testing.T) {
 	b.UpdateTenant(nil)
 }
 
+func TestRunning(t *testing.T) {
+	b, err := New(testConfig(), Deps{Auth: auth.NewStatic(nil), Perms: fakePerms{}})
+	require.NoError(t, err)
+	assert.False(t, b.Running(), "before Start")
+
+	require.NoError(t, b.Start(t.Context()))
+	assert.True(t, b.Running(), "after Start")
+
+	require.NoError(t, b.Stop(t.Context()))
+	assert.False(t, b.Running(), "after Stop")
+
+	assert.False(t, (&Broker{}).Running(), "zero value")
+}
+
 // Controller ruling R8 follow-through. An offline session receives anything
 // in its tenant, so a grant revoked while the device is away is enforced
 // when the session is inherited: the subscription goes, and so do the

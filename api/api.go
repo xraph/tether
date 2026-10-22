@@ -1,0 +1,132 @@
+// Package api is Tether's REST layer: an admin API for tenants, devices,
+// roles, live clients, retained messages and stats, and a public HTTP publish
+// endpoint for devices.
+//
+// Register mounts both on Forge routers. The caller owns authentication of
+// the admin group: Register adds no admin auth of its own.
+package api
+
+import (
+	"errors"
+	"log/slog"
+
+	"github.com/xraph/forge"
+
+	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/broker"
+	"github.com/xraph/tether/limits"
+	"github.com/xraph/tether/perm"
+	"github.com/xraph/tether/service"
+)
+
+const (
+	// DefaultPageSize is how many tenants or devices a list returns when the
+	// request gives no limit.
+	DefaultPageSize = 100
+
+	// MaxPageSize caps the limit a list request may ask for.
+	MaxPageSize = 500
+
+	// MaxPublishPayload is the largest decoded payload POST /v1/publish takes,
+	// the broker's default MaxPacketSize. A larger one is 413.
+	MaxPublishPayload = 1 << 20
+)
+
+// Services are what the handlers call. Everything but Logger is required.
+type Services struct {
+	Tenants *service.Tenants
+	Devices *service.Devices
+	Roles   *perm.Roles
+	Broker  *broker.Broker
+
+	// Auth, Perms and Limits serve POST /v1/publish: the same authenticator,
+	// grant loader and rate limiter the broker runs MQTT connections through.
+	Auth   auth.Authenticator
+	Perms  broker.PermLoader
+	Limits *limits.Limiter
+
+	// Logger receives the internal errors the API hides from clients. Nil
+	// discards them.
+	Logger *slog.Logger
+}
+
+// API holds the services the handlers share.
+type API struct {
+	Services
+}
+
+// Register mounts the admin routes on admin and POST /v1/publish on public,
+// all relative to those routers' base path. It does not authenticate the
+// admin group: wrap admin in your own auth middleware first. The publish
+// route authenticates itself with HTTP Basic (key ID and raw key).
+//
+// It returns an error when a required service is missing or a route cannot
+// be registered; routes registered before the failure stay mounted.
+func Register(admin, public forge.Router, s Services) error {
+	if err := s.check(); err != nil {
+		return err
+	}
+
+	if s.Logger == nil {
+		s.Logger = slog.New(slog.DiscardHandler)
+	}
+
+	a := &API{Services: s}
+
+	return errors.Join(
+		a.registerTenants(admin),
+		a.registerDevices(admin),
+		a.registerRoles(admin),
+		a.registerClients(admin),
+		a.registerPublish(public),
+	)
+}
+
+// check reports the first missing required service.
+func (s Services) check() error {
+	switch {
+	case s.Tenants == nil:
+		return errors.New("tether/api: Services.Tenants is required")
+	case s.Devices == nil:
+		return errors.New("tether/api: Services.Devices is required")
+	case s.Roles == nil:
+		return errors.New("tether/api: Services.Roles is required")
+	case s.Broker == nil:
+		return errors.New("tether/api: Services.Broker is required")
+	case s.Auth == nil:
+		return errors.New("tether/api: Services.Auth is required")
+	case s.Perms == nil:
+		return errors.New("tether/api: Services.Perms is required")
+	case s.Limits == nil:
+		return errors.New("tether/api: Services.Limits is required")
+	}
+
+	return nil
+}
+
+// empty is the response type of handlers that write their own response.
+type empty struct{}
+
+// list is the body of every list response.
+type list[T any] struct {
+	Items []T `json:"items"`
+}
+
+// items wraps s, turning nil into an empty list so the JSON is [] and not null.
+func items[T any](s []T) list[T] {
+	if s == nil {
+		s = []T{}
+	}
+
+	return list[T]{Items: s}
+}
+
+// written ends a handler that wrote its own response with err (nil on
+// success). Forge writes nothing more for a nil response.
+func written(err error) (*empty, error) {
+	if err != nil {
+		return nil, err
+	}
+
+	return nil, nil //nolint:nilnil // the response is already written.
+}
