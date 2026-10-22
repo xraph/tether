@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	pahopackets "github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	mochipackets "github.com/mochi-mqtt/server/v2/packets"
@@ -1351,4 +1352,150 @@ func TestAdminOperationsBeforeStart(t *testing.T) {
 	require.ErrorIs(t, b.DeleteSession(tenantA, "dev"), tether.ErrNotFound)
 	require.ErrorIs(t, b.DeleteRetained(tenantA, "t"), tether.ErrNotFound)
 	require.ErrorIs(t, b.Publish(t.Context(), tenantA, "t", nil, 0, false), tether.ErrConflict)
+}
+
+// Fix round 1: a client that reconnects while its session is being deleted
+// is refused, so it can never inherit a session the delete is stripping,
+// and the refusal ends with the delete.
+func TestDeleteSessionRefusesReconnectMidway(t *testing.T) {
+	ta := newTenant(tenant.Limits{})
+	cfg := testConfig()
+	cfg.DataDir = t.TempDir()
+	b := startBrokerCfg(t, cfg, auth.NewStatic(map[string]*auth.Identity{"dev": ident(ta, "dev")}),
+		newMutablePerms(map[string]acl.Rules{"dev": {Subscribe: []string{"t"}}}))
+	addr := b.Addr().String()
+	tenantA := ta.ID.String()
+
+	c, _, err := connect5(t, addr, "keeper", "dev", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, c, "t"))
+
+	type attempt struct {
+		ca  *paho.Connack
+		err error
+	}
+
+	midway := make(chan attempt, 1)
+	b.beforePurge = func() {
+		_, ca, cerr := connect5(t, addr, "keeper", "dev", false)
+		midway <- attempt{ca: ca, err: cerr}
+	}
+
+	require.NoError(t, b.DeleteSession(tenantA, "keeper"))
+	assert.Equal(t, byte(0x98), disconnectedWith(t, c))
+
+	got := <-midway
+	require.Error(t, got.err, "a reconnect during the delete is refused")
+	require.NotNil(t, got.ca)
+	assert.Equal(t, byte(0x88), got.ca.ReasonCode)
+	assert.False(t, got.ca.SessionPresent)
+
+	b.beforePurge = nil
+
+	// The refusal ended with the delete: the device starts a fresh session.
+	c, ca, err := connect5(t, addr, "keeper", "dev", false)
+	require.NoError(t, err)
+	assert.False(t, ca.SessionPresent)
+	assert.Empty(t, subscriptions(t, b, topic.Namespace(tenantA, "keeper")))
+	require.Equal(t, []byte{1}, subscribe5(t, c, "t"))
+}
+
+// Fix round 1: a connection for the client ID that registered before the
+// delete started may be about to take the session over, so the delete
+// backs off and the connection keeps a whole session.
+func TestDeleteSessionConflictsWithConnectInFlight(t *testing.T) {
+	ta := newTenant(tenant.Limits{})
+	perms := newMutablePerms(map[string]acl.Rules{"parked": {Subscribe: []string{"t"}}})
+	b := startBrokerDeps(t, auth.NewStatic(map[string]*auth.Identity{"parked": ident(ta, "parked")}), perms)
+	addr := b.Addr().String()
+	tenantA := ta.ID.String()
+	ns := func(s string) string { return topic.Namespace(tenantA, s) }
+
+	c, _, err := connect5(t, addr, "keeper", "parked", false)
+	require.NoError(t, err)
+	require.Equal(t, []byte{1}, subscribe5(t, c, "t"))
+	require.NoError(t, c.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitStateDropped(t, b, ns("keeper"))
+
+	// Park a reconnect in its second permission load: its state is
+	// registered (a change announced during the first load makes it
+	// authorize again), but mochi has not inherited the session yet.
+	release1 := perms.hold("parked")
+
+	type result struct {
+		c   *client5
+		ca  *paho.Connack
+		err error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		c, ca, err := connect5(t, addr, "keeper", "parked", false)
+		done <- result{c: c, ca: ca, err: err}
+	}()
+
+	require.Equal(t, "parked", <-perms.started)
+	b.changes.Add(1)
+
+	release2 := perms.hold("parked")
+	release1()
+	require.Equal(t, "parked", <-perms.started)
+
+	require.ErrorIs(t, b.DeleteSession(tenantA, "keeper"), tether.ErrConflict)
+
+	release2()
+
+	r := <-done
+	require.NoError(t, r.err)
+	assert.True(t, r.ca.SessionPresent)
+	assert.Equal(t, []string{ns("t")}, subscriptions(t, b, ns("keeper")), "the session is whole")
+
+	// Once nothing races it, the delete goes through.
+	require.NoError(t, b.DeleteSession(tenantA, "keeper"))
+	assert.Equal(t, byte(0x98), disconnectedWith(t, r.c))
+	assert.Empty(t, b.Clients(tenantA))
+}
+
+// Fix round 1: mochi skips OnDisconnect when writing the CONNACK fails, so
+// such a connection never ends; once the wait runs out, its closed session
+// is deleted rather than refused for good.
+func TestDeleteSessionOfConnectionMochiNeverFinished(t *testing.T) {
+	ta := newTenant(tenant.Limits{})
+	b := startBroker(t, map[string]*auth.Identity{"a": ident(ta, "a")}, nil)
+	b.endWait = 100 * time.Millisecond
+	tenantA := ta.ID.String()
+
+	raw, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	faulty := &writeFailListener{Listener: raw, closed: make(chan struct{}, 1)}
+	require.NoError(t, b.server.AddListener(listeners.NewNet("faulty", faulty)))
+	b.server.Listeners.Serve("faulty", b.server.EstablishConnection)
+
+	conn, err := dial(t, raw.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	expiry := uint32(3600)
+	_, err = (&pahopackets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, CleanStart: false, KeepAlive: 30, ClientID: "ghost",
+		Username: "a", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: &pahopackets.Properties{SessionExpiryInterval: &expiry},
+	}).WriteTo(conn)
+	require.NoError(t, err)
+
+	select {
+	case <-faulty.closed:
+	case <-time.After(waitTimeout):
+		t.Fatal("broker never closed the failed handshake")
+	}
+
+	require.Equal(t, []string{"ghost"}, clientIDs(b, tenantA))
+	require.NoError(t, b.DeleteSession(tenantA, "ghost"))
+	assert.Empty(t, b.Clients(tenantA))
+
+	_, ca, err := connect5(t, b.Addr().String(), "ghost", "a", false)
+	require.NoError(t, err)
+	assert.False(t, ca.SessionPresent)
 }

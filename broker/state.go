@@ -57,11 +57,14 @@ type clientState struct {
 	connectedAt   time.Time
 	sessionExpiry uint32
 
-	// gone is closed once the state is dropped from the registry, which
-	// for a connection that ends normally happens after every mochi hook,
-	// storage included, has run its OnDisconnect (lastHook).
-	gone     chan struct{}
-	goneOnce sync.Once
+	// ended is closed when mochi has run every hook's OnDisconnect for the
+	// connection, storage included (lastHook), or when the connection was
+	// refused at CONNECT and never got that far. Nothing else closes it:
+	// a sweep or a stale bind drops the state while the connection may
+	// still be tearing down. It stays open for a connection mochi never
+	// calls OnDisconnect for.
+	ended     chan struct{}
+	endedOnce sync.Once
 }
 
 // grants is one compiled set of topic grants and the roles it came from.
@@ -84,7 +87,7 @@ func newClientState(cl *mqtt.Client, rawID, username string, ident *auth.Identit
 		counters: counters,
 
 		connectedAt: time.Now(),
-		gone:        make(chan struct{}),
+		ended:       make(chan struct{}),
 	}
 	st.ident.Store(ident)
 	st.tenant.Store(tn)
@@ -155,11 +158,9 @@ func (st *clientState) stopTimers() {
 	st.stopRetry()
 }
 
-// dropped stops the state's timers and closes gone. Every path that drops
-// a state from the registry calls it. Safe to call more than once.
-func (st *clientState) dropped() {
-	st.stopTimers()
-	st.goneOnce.Do(func() { close(st.gone) })
+// markEnded closes ended. Safe to call more than once.
+func (st *clientState) markEnded() {
+	st.endedOnce.Do(func() { close(st.ended) })
 }
 
 // releaseSlot gives the tenant's connection slot back. It is safe to call more
@@ -187,18 +188,39 @@ func (st *clientState) transferSlot() bool {
 //
 // refusals holds the CONNACK reason a refused connection should get, from
 // OnConnectAuthenticate until OnPacketEncode rewrites mochi's default CONNACK.
+//
+// closing holds the states a sweep or a stale bind dropped, whose
+// connections may still be tearing down, so lastHook can still mark them
+// ended; entries older than closingTTL are forgotten (mochi never called
+// OnDisconnect for those). deleting holds the namespaced client IDs
+// DeleteSession is deleting: no connection for one may register meanwhile.
 type registry struct {
 	mu       sync.RWMutex
 	byClient map[*mqtt.Client]*clientState
 	byID     map[string]*clientState
 	refusals map[*mqtt.Client]packets.Code
+	closing  map[*mqtt.Client]closingState
+	deleting map[string]struct{}
 }
+
+// closingState is a dropped state waiting for its connection's OnDisconnect.
+type closingState struct {
+	st    *clientState
+	since time.Time
+}
+
+// closingTTL is how long a dropped state waits for its OnDisconnect before
+// the registry forgets it. A connection that is tearing down gets there in
+// milliseconds; one mochi skipped never does.
+const closingTTL = time.Minute
 
 func newRegistry() *registry {
 	return &registry{
 		byClient: make(map[*mqtt.Client]*clientState),
 		byID:     make(map[string]*clientState),
 		refusals: make(map[*mqtt.Client]packets.Code),
+		closing:  make(map[*mqtt.Client]closingState),
+		deleting: make(map[string]struct{}),
 	}
 }
 
@@ -207,6 +229,76 @@ func (r *registry) add(st *clientState) {
 	defer r.mu.Unlock()
 
 	r.byClient[st.cl] = st
+}
+
+// addUnlessDeleting registers st unless DeleteSession is deleting the
+// session of nsID, the namespaced ID st's connection will have. The check
+// and the add are one step under the lock, so DeleteSession sees every
+// connection that registered before it started (beginDelete) and refuses
+// every later one.
+func (r *registry) addUnlessDeleting(st *clientState, nsID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.deleting[nsID]; ok {
+		return false
+	}
+
+	r.byClient[st.cl] = st
+
+	return true
+}
+
+// beginDelete marks nsID as being deleted, for cl, the client mochi holds
+// the session under. It returns cl's state (nil when cl has none: an
+// offline session, or one restored from storage) and false when another
+// delete of nsID is running or another connection for nsID has registered,
+// which may be about to take the session over. On true the caller must
+// call endDelete.
+func (r *registry) beginDelete(nsID string, cl *mqtt.Client) (*clientState, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if _, ok := r.deleting[nsID]; ok {
+		return nil, false
+	}
+
+	for other, st := range r.byClient {
+		if other != cl && namespacedID(st.tenantID, st.rawID) == nsID {
+			return nil, false
+		}
+	}
+
+	r.deleting[nsID] = struct{}{}
+
+	st := r.byClient[cl]
+	if st == nil {
+		st = r.closing[cl].st
+	}
+
+	return st, true
+}
+
+// endDelete lets connections for nsID register again.
+func (r *registry) endDelete(nsID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.deleting, nsID)
+}
+
+// park keeps a dropped state for lastHook and forgets the ones that have
+// waited longer than closingTTL. The caller holds the lock.
+func (r *registry) park(st *clientState) {
+	now := time.Now()
+
+	for cl, c := range r.closing {
+		if now.Sub(c.since) > closingTTL {
+			delete(r.closing, cl)
+		}
+	}
+
+	r.closing[st.cl] = closingState{st: st, since: now}
 }
 
 func (r *registry) get(cl *mqtt.Client) *clientState {
@@ -232,6 +324,7 @@ func (r *registry) bind(st *clientState) {
 	stale := prev != nil && prev != st && prev.cl.Closed()
 	if stale {
 		delete(r.byClient, prev.cl)
+		r.park(prev)
 	}
 
 	r.mu.Unlock()
@@ -241,7 +334,6 @@ func (r *registry) bind(st *clientState) {
 	}
 
 	if stale {
-		prev.dropped()
 		prev.releaseSlot()
 	}
 }
@@ -264,16 +356,26 @@ func (r *registry) match(keep func(*clientState) bool) []*clientState {
 	return out
 }
 
-// remove drops the state of cl (stopping its timers and closing gone) and
-// returns it, or nil when there is none (mochi also calls OnDisconnect for
-// sessions it restores from storage).
+// remove drops the state of cl, stops its timers and marks it ended, for a
+// connection mochi is done with. A state a sweep or a stale bind dropped
+// earlier is found among the closing ones. It returns the state, or nil
+// when there is none (mochi also calls OnDisconnect for sessions it
+// restores from storage).
 func (r *registry) remove(cl *mqtt.Client) *clientState {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	st := r.byClient[cl]
 	if st == nil {
-		return nil
+		c, ok := r.closing[cl]
+		if !ok {
+			return nil
+		}
+
+		delete(r.closing, cl)
+		c.st.markEnded()
+
+		return c.st
 	}
 
 	delete(r.byClient, cl)
@@ -282,7 +384,8 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 		delete(r.byID, cl.ID)
 	}
 
-	st.dropped()
+	st.stopTimers()
+	st.markEnded()
 
 	return st
 }
@@ -291,8 +394,9 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 // releases its slot. It returns how many it dropped.
 //
 // A closed connection never uses its slot again. One that is still tearing
-// down finds no state in OnDisconnect afterwards, which is fine: the slot is
-// released once (releaseSlot is behind a sync.Once). A live connection is
+// down finds its state among the closing ones in OnDisconnect afterwards,
+// which marks it ended; the slot is released once (releaseSlot is behind a
+// sync.Once). A live connection is
 // never closed, so its slot is never touched. The scan is linear in the
 // broker's connections and runs only when a tenant is at its limit.
 func (r *registry) sweepClosed(tenantID string) int {
@@ -311,13 +415,14 @@ func (r *registry) sweepClosed(tenantID string) int {
 			delete(r.byID, cl.ID)
 		}
 
+		r.park(st)
 		swept = append(swept, st)
 	}
 
 	r.mu.Unlock()
 
 	for _, st := range swept {
-		st.dropped()
+		st.stopTimers()
 		st.releaseSlot()
 	}
 

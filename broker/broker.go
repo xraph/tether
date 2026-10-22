@@ -55,6 +55,14 @@ type Broker struct {
 	// aclObserver, when set before Start, sees every ACL check. Tests only.
 	aclObserver func(clientID, topic string, write bool)
 
+	// beforePurge, when set, runs in DeleteSession after the connection
+	// has ended and before the session is purged. Tests only.
+	beforePurge func()
+
+	// endWait bounds how long DeleteSession waits for mochi to finish with
+	// a connection (sessionEndWait). Tests shorten it.
+	endWait time.Duration
+
 	// sysInterval is how often tenant $SYS stats are published. Tests
 	// shorten it before Start.
 	sysInterval time.Duration
@@ -134,6 +142,7 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		retryMax:    defaultRetryMax,
 		retryWindow: defaultRetryWindow,
 		retryQuit:   make(chan struct{}),
+		endWait:     sessionEndWait,
 	}, nil
 }
 

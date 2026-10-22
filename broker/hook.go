@@ -86,7 +86,12 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 	st := newClientState(cl, cl.ID, string(pk.Connect.Username), ident, ident.Tenant, g, h.b.deps.Limits, h.b.countersFor(tenantID))
 	st.sessionExpiry = sessionExpiry(cl, h.b.cfg.sessionExpirySeconds())
-	h.b.state.add(st)
+
+	if !h.b.state.addUnlessDeleting(st, namespacedID(tenantID, cl.ID)) {
+		st.releaseSlot()
+
+		return h.refuse(cl, log, packets.ErrServerUnavailable, "session is being deleted", nil)
+	}
 
 	if h.b.changes.Load() != gen && !h.reauthorize(ctx, cl, pk, st, log) {
 		h.b.state.remove(cl)
@@ -486,7 +491,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 // a hook event on the hooks in the order they were added, so its
 // OnDisconnect is the last hook mochi runs for a connection that ends: when
 // it drops the connection's state, the storage hook has already written the
-// session's final record. DeleteSession relies on that (clientState.gone)
+// session's final record. DeleteSession relies on that (clientState.ended)
 // before it deletes the record.
 type lastHook struct {
 	mqtt.HookBase

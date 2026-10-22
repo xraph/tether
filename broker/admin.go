@@ -601,8 +601,8 @@ func (b *Broker) Kick(tenantID, clientID string) error {
 	return nil
 }
 
-// sessionEndWait bounds how long DeleteSession waits, after disconnecting a
-// client, for mochi to finish with the connection.
+// sessionEndWait bounds how long DeleteSession waits for mochi to finish
+// with a connection.
 const sessionEndWait = 2 * time.Second
 
 // DeleteSession removes tenantID's session with clientID, open or offline.
@@ -614,11 +614,17 @@ const sessionEndWait = 2 * time.Second
 // (OnClientExpired), so it does not come back after a restart. A client
 // that connects again later starts a new session.
 //
-// It returns tether.ErrNotFound when there is no such session, and
-// tether.ErrConflict when the connection did not finish closing in time or
-// the client connected again and took the session over meanwhile; the
-// session is then left alone and the call can be repeated. A delayed will
-// (5.0 Will Delay Interval) already queued by mochi is still sent.
+// While it runs, a CONNECT with that client ID is refused with 0x88 server
+// unavailable (3.1.1: 0x03), so no connection can take the session over
+// halfway through the delete. A connection for the client ID that
+// registered before the delete started makes it fail with
+// tether.ErrConflict instead, leaving the session alone; so does a
+// connection that is still open after sessionEndWait (2 s). A closed connection
+// mochi never finished (it skips OnDisconnect when writing the CONNACK
+// fails) is deleted once the wait runs out.
+//
+// It returns tether.ErrNotFound when there is no such session. A delayed
+// will (5.0 Will Delay Interval) already queued by mochi is still sent.
 func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	nsID, err := sessionID(tenantID, clientID)
 	if err != nil {
@@ -635,24 +641,31 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 		return noSession(clientID)
 	}
 
+	st, ok := b.state.beginDelete(nsID, cl)
+	if !ok {
+		return deleteConflict(clientID, "another connection or delete for the client ID is in progress")
+	}
+	defer b.state.endDelete(nsID)
+
 	log := b.log.With(slog.String("client", nsID), slog.String("tenant", tenantID))
 
-	switch st := b.state.get(cl); {
-	case st != nil:
+	if !cl.Closed() {
+		log.Info("tether: disconnecting client to delete its session")
+		disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+	}
+
+	// The storage hook writes the session's record in its OnDisconnect;
+	// ended is closed after that (lastHook).
+	if st != nil && !waitEnded(st, b.endWait) {
 		if !cl.Closed() {
-			log.Info("tether: disconnecting client to delete its session")
-			disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+			return deleteConflict(clientID, "the connection is still open")
 		}
 
-		// The storage hook writes the session's record in its OnDisconnect;
-		// the state is dropped after that (lastHook).
-		if !waitGone(st, sessionEndWait) {
-			return fmt.Errorf("tether/broker: delete session %q: %w: the connection is still closing", clientID, tether.ErrConflict)
-		}
-	case !cl.Closed():
-		// Every open connection mochi lists has state; this one is not a
-		// tenant's (see hook.OnSessionEstablish). Close it all the same.
-		disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+		log.Warn("tether: connection never finished closing, deleting its session anyway")
+	}
+
+	if b.beforePurge != nil {
+		b.beforePurge()
 	}
 
 	cur, ok := srv.Clients.Get(nsID)
@@ -662,7 +675,7 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	}
 
 	if cur != cl {
-		return fmt.Errorf("tether/broker: delete session %q: %w: the client connected again", clientID, tether.ErrConflict)
+		return deleteConflict(clientID, "the client connected again")
 	}
 
 	b.purgeSession(srv, cl)
@@ -671,17 +684,21 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	return nil
 }
 
-// waitGone waits up to d for st to be dropped from the registry.
-func waitGone(st *clientState, d time.Duration) bool {
+// waitEnded waits up to d for mochi to finish with st's connection.
+func waitEnded(st *clientState, d time.Duration) bool {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 
 	select {
-	case <-st.gone:
+	case <-st.ended:
 		return true
 	case <-timer.C:
 		return false
 	}
+}
+
+func deleteConflict(clientID, why string) error {
+	return fmt.Errorf("tether/broker: delete session %q: %w: %s", clientID, tether.ErrConflict, why)
 }
 
 // purgeSession deletes the session of cl, whose connection has ended: its
