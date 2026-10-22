@@ -1,0 +1,69 @@
+# Example config for the tether binary. Every key is here with its default, so
+# copying this file and deleting what you do not change gives the same server
+# as running with no file at all.
+#
+#   tether --config ./tether.yaml
+#
+# Without --config, tether reads ./tether.yaml when it exists and uses the
+# defaults when it does not. A key you leave out keeps its default.
+#
+# The admin token does not live here. Set TETHER_ADMIN_TOKEN in the
+# environment, or start with --insecure-admin to leave the admin API and the
+# dashboard open (for a laptop, not for a server).
+
+# Settings that only a standalone process needs.
+server:
+  # Where the admin API, the device publish endpoint and the dashboard listen.
+  http_address: ":8080"
+
+  # The SQLite file for tenants, devices, keys and roles. Its directory is
+  # created when it is missing.
+  sqlite_path: "./data/tether.db"
+
+# Tether's own settings. The same keys work under extensions.tether when you
+# mount the extension in your own Forge app.
+tether:
+  # Prefix for every REST route: the admin API lives under
+  # <base_path>/v1/tenants and the device endpoint at <base_path>/v1/publish.
+  base_path: "/tether"
+
+  # Set to true to mount no REST routes at all. The broker still runs.
+  disable_routes: false
+
+  # Name of the grove database to use when the container holds more than one.
+  # Empty uses the default database. The binary has only one.
+  grove_database: ""
+
+  broker:
+    # The plain MQTT listener. Empty turns it off.
+    tcp_address: ":1883"
+
+    # MQTT over WebSocket (subprotocol "mqtt", any path). Empty turns it off.
+    websocket_address: ""
+
+    # MQTT over TLS. Off by default. To turn it on, uncomment all three keys.
+    # tls:
+    #   address: ":8883"
+    #   cert_file: "/etc/tether/server.crt"
+    #   key_file: "/etc/tether/server.key"
+
+    # Where sessions, subscriptions, in-flight messages and retained messages
+    # persist (a Badger database). The directory is created when it is
+    # missing. Set it to "" to keep all of that in memory only.
+    data_dir: "./data/sessions"
+
+    # The longest session expiry a client may ask for. 168h is 7 days.
+    max_session_expiry: 168h
+
+    # The largest MQTT packet the broker accepts, in bytes. This is 1 MiB. The
+    # HTTP publish endpoint takes the same limit for its payload.
+    max_packet_size: 1048576
+
+    # The longest topic name or filter a client may send, in bytes. A longer
+    # one is refused with reason code 0x90.
+    max_topic_length: 1024
+
+# The dashboard has its own section (dashboard:), and its auth is off by
+# default. While it is off, Tether's dashboard pages refuse every request
+# unless the binary runs with --insecure-admin. See the Forge dashboard
+# extension for its keys.

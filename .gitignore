@@ -10,3 +10,7 @@ build-errors.log
 
 # ─── OS ─────────────────────────────────────────────────────
 .DS_Store
+
+# ─── Binary built by `go build ./cmd/tether` ────────────────
+/tether
+/data/

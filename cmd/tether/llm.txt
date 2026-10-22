@@ -1,0 +1,22 @@
+# cmd/tether
+
+The standalone Tether server: `go install github.com/xraph/tether/cmd/tether@latest`, or `go build ./cmd/tether`.
+
+It builds a Forge app with a grove SQLite database in the container, keysmith (`ext.Keysmith(keysmithext.WithDisableRoutes())`), warden (`ext.Warden(wardenext.WithDisableRoutes())`), the Tether extension and the Forge dashboard extension, then calls `app.Run()`, which shuts down on SIGINT and SIGTERM.
+
+## Flags and environment
+
+- `--config <path>`: YAML config. Default `./tether.yaml` when it exists, else the defaults. A named file that is missing is an error.
+- `--insecure-admin`: allow an empty token. The admin API mounts with no auth and the dashboard intents are served to anonymous requests (`WithInsecureDashboard`).
+- `--version`.
+- `TETHER_ADMIN_TOKEN`: bearer token for the admin API, compared as SHA-256 digests with `crypto/subtle.ConstantTimeCompare`. A missing or wrong one is 401 with `WWW-Authenticate: Bearer`. Empty without `--insecure-admin` fails startup. The device endpoint `POST /tether/v1/publish` is not behind it (it uses HTTP Basic with the device key).
+
+## Config
+
+`tether.example.yaml` lists every key with its default. `server.http_address` (`:8080`), `server.sqlite_path` (`./data/tether.db`), and a `tether:` section that is `extension.Config` (`base_path`, `disable_routes`, `grove_database`, `broker.*`, with `broker.data_dir` defaulting to `./data/sessions`). The binary decodes the file over `defaultConfig()` itself and hands the result to the extension with `WithConfig`, then points Forge's own config loader at the same file (for the `dashboard:` section). Environment config sources are off. Data directories are created.
+
+## For tests
+
+`newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption) (forge.App, closeDB func(), err)` builds without starting. `run(args, getenv, stderr)` is the whole program. Get the extension with `app.GetExtension("tether")`, not `vessel.Inject[*extension.Extension]`, which starts it a second time and fails on duplicate routes.
+
+Warden's REST routes are off, so there is no HTTP way to create a role: use the dashboard's warden plugin, or the warden engine in code.
