@@ -3,6 +3,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/xraph/tether/id"
@@ -33,6 +34,25 @@ type Device struct {
 	UpdatedAt time.Time      `json:"updated_at"`
 }
 
+// Validate reports whether d can be stored: it must be non-nil and carry a
+// device ID, a tenant ID and a key ID. The returned error names the problem
+// and is not a tether sentinel, so this package does not import the root
+// package. A store wraps it with tether.ErrInvalidInput.
+func (d *Device) Validate() error {
+	switch {
+	case d == nil:
+		return errors.New("device is required")
+	case d.ID.IsNil():
+		return errors.New("device ID is required")
+	case d.TenantID.IsNil():
+		return errors.New("tenant ID is required")
+	case d.KeyID == "":
+		return errors.New("key ID is required")
+	}
+
+	return nil
+}
+
 // ListFilter pages through the devices of one tenant. TenantID is required:
 // a zero TenantID is invalid input, never "all tenants". Limit zero means no
 // limit. Negative values are invalid.
@@ -40,6 +60,25 @@ type ListFilter struct {
 	TenantID id.TenantID
 	Limit    int
 	Offset   int
+}
+
+// Validate reports whether the filter is usable: TenantID must be set, and
+// Limit and Offset must not be negative. A store wraps the error with
+// tether.ErrInvalidInput.
+func (f ListFilter) Validate() error {
+	if f.TenantID.IsNil() {
+		return errors.New("tenant ID is required")
+	}
+
+	if f.Limit < 0 {
+		return errors.New("limit must not be negative")
+	}
+
+	if f.Offset < 0 {
+		return errors.New("offset must not be negative")
+	}
+
+	return nil
 }
 
 // Store persists devices.

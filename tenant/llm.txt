@@ -7,6 +7,7 @@ Tenant model and store interface. Imports only `id`, so the root package can imp
 - `Tenant{ID id.TenantID, AppID, ExternalID, Name string, Enabled bool, Limits Limits, CreatedAt, UpdatedAt time.Time}`. The `(AppID, ExternalID)` pair is unique: it maps a tenant to the host application's own identifier.
 - `Limits{MaxConnections int, MessagesPerSecond float64, Burst int, MaxSessionExpiry time.Duration}`. Zero means "use the broker default", except `MaxConnections`, where zero means unlimited. Plain value types only: stores persist it as JSON.
 - `ListFilter{Limit, Offset int}`: Limit 0 is no limit, negative values are invalid input.
+- `(*Tenant).Validate()` and `ListFilter.Validate()` return a plain error naming the problem (nil tenant, zero ID, negative limit or offset). They are not tether sentinels, because this package must not import the root package: a store wraps the result once with `tether.ErrInvalidInput`.
 - `Store`: `CreateTenant`, `GetTenant`, `GetTenantByExternal`, `UpdateTenant`, `DeleteTenant`, `ListTenants`.
 
 Contract (every backend passes `store/storetest`):

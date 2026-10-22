@@ -107,8 +107,8 @@ func (s *Store) CreateTenant(ctx context.Context, t *tenant.Tenant) error {
 		return err
 	}
 
-	if t == nil || t.ID.IsNil() {
-		return opErr(op, tether.ErrInvalidInput, "tenant and tenant ID are required")
+	if err := t.Validate(); err != nil {
+		return opErr(op, tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.Lock()
@@ -191,8 +191,8 @@ func (s *Store) UpdateTenant(ctx context.Context, t *tenant.Tenant) error {
 		return err
 	}
 
-	if t == nil || t.ID.IsNil() {
-		return opErr(op, tether.ErrInvalidInput, "tenant and tenant ID are required")
+	if err := t.Validate(); err != nil {
+		return opErr(op, tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.Lock()
@@ -254,8 +254,8 @@ func (s *Store) ListTenants(ctx context.Context, f tenant.ListFilter) ([]*tenant
 		return nil, err
 	}
 
-	if f.Limit < 0 || f.Offset < 0 {
-		return nil, opErr("list tenants", tether.ErrInvalidInput, "limit and offset must not be negative")
+	if err := f.Validate(); err != nil {
+		return nil, opErr("list tenants", tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.RLock()
@@ -288,8 +288,8 @@ func (s *Store) CreateDevice(ctx context.Context, d *device.Device) error {
 		return err
 	}
 
-	if d == nil || d.ID.IsNil() || d.TenantID.IsNil() || d.KeyID == "" {
-		return opErr(op, tether.ErrInvalidInput, "device, device ID, tenant ID and key ID are required")
+	if err := d.Validate(); err != nil {
+		return opErr(op, tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.Lock()
@@ -366,8 +366,8 @@ func (s *Store) UpdateDevice(ctx context.Context, d *device.Device) error {
 		return err
 	}
 
-	if d == nil || d.ID.IsNil() || d.TenantID.IsNil() || d.KeyID == "" {
-		return opErr(op, tether.ErrInvalidInput, "device, device ID, tenant ID and key ID are required")
+	if err := d.Validate(); err != nil {
+		return opErr(op, tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.Lock()
@@ -425,12 +425,8 @@ func (s *Store) ListDevices(ctx context.Context, f device.ListFilter) ([]*device
 		return nil, err
 	}
 
-	if f.TenantID.IsNil() {
-		return nil, opErr("list devices", tether.ErrInvalidInput, "tenant ID is required")
-	}
-
-	if f.Limit < 0 || f.Offset < 0 {
-		return nil, opErr("list devices", tether.ErrInvalidInput, "limit and offset must not be negative")
+	if err := f.Validate(); err != nil {
+		return nil, opErr("list devices", tether.ErrInvalidInput, err.Error())
 	}
 
 	s.mu.RLock()

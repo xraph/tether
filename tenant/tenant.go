@@ -3,6 +3,7 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/xraph/tether/id"
@@ -43,11 +44,41 @@ type Tenant struct {
 	UpdatedAt  time.Time   `json:"updated_at"`
 }
 
+// Validate reports whether t can be stored: it must be non-nil and carry an
+// ID. The returned error names the problem and is not a tether sentinel, so
+// this package does not import the root package. A store wraps it with
+// tether.ErrInvalidInput.
+func (t *Tenant) Validate() error {
+	if t == nil {
+		return errors.New("tenant is required")
+	}
+
+	if t.ID.IsNil() {
+		return errors.New("tenant ID is required")
+	}
+
+	return nil
+}
+
 // ListFilter pages through tenants. Limit zero means no limit. Negative
 // values are invalid.
 type ListFilter struct {
 	Limit  int
 	Offset int
+}
+
+// Validate reports whether the filter is usable: Limit and Offset must not be
+// negative. A store wraps the error with tether.ErrInvalidInput.
+func (f ListFilter) Validate() error {
+	if f.Limit < 0 {
+		return errors.New("limit must not be negative")
+	}
+
+	if f.Offset < 0 {
+		return errors.New("offset must not be negative")
+	}
+
+	return nil
 }
 
 // Store persists tenants.
