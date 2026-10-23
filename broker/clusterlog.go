@@ -381,12 +381,19 @@ type pubPipe struct {
 
 	// pending counts publishes whose ack is not written yet, held the QoS 2
 	// packet IDs whose PUBREC is written and whose PUBREL has not come.
-	// Together they are what counts against the receive maximum. changed
-	// is closed (and replaced) whenever either shrinks.
-	mu      sync.Mutex
-	pending int
-	held    map[uint16]struct{}
-	changed chan struct{}
+	// Together they are what counts against a 5.0 client's receive maximum.
+	// changed is closed (and replaced) whenever either shrinks.
+	//
+	// reserved holds the QoS 2 publishes whose PUBREC sits in the client's
+	// inflight map (reserve) and whose commit has not been seen. abandoned
+	// is set by close; after it nothing is reserved or marked committed, so
+	// every reservation either belongs to a committed publish or is removed.
+	mu        sync.Mutex
+	pending   int
+	held      map[uint16]struct{}
+	changed   chan struct{}
+	reserved  map[uint16]*pubItem
+	abandoned bool
 }
 
 // pubItem is one publish in a pipe.
@@ -401,6 +408,8 @@ type pubItem struct {
 	// retained is the namespaced packet to keep as this node's retained
 	// message once committed, nil when the publish is not retained.
 	retained *packets.Packet
+
+	rec packets.Packet // the PUBREC reserved in the inflight map (QoS 2)
 
 	started chan struct{} // closed when the starter is done with it
 	pend    *cluster.PendingAppend
@@ -418,14 +427,95 @@ func newPubPipe(b *Broker, srv *mqtt.Server, cl *mqtt.Client, st *clientState) *
 	}
 }
 
-// close abandons what is pending and ends the goroutines. Idempotent.
-func (p *pubPipe) close() { p.cancel() }
+// close abandons what is pending and ends the goroutines: the PUBREC
+// reservation of every QoS 2 publish whose commit was not seen is removed
+// from the client's inflight map, so neither this connection nor one that
+// inherits the session (mochi clones the inflight map at a takeover, which
+// is why OnSessionEstablish closes the old connection's pipe first) ever
+// sends a PUBREC for a message that may not be in the log. The client sends
+// those publishes again. Idempotent.
+func (p *pubPipe) close() {
+	p.mu.Lock()
+
+	if !p.abandoned {
+		p.abandoned = true
+
+		for id := range p.reserved {
+			if pk, ok := p.cl.State.Inflight.Get(id); ok && pk.FixedHeader.Type == packets.Pubrec && p.cl.State.Inflight.Delete(id) {
+				atomic.AddInt64(&p.srv.Info.Inflight, -1)
+			}
+		}
+
+		p.reserved = nil
+	}
+
+	p.mu.Unlock()
+	p.cancel()
+}
+
+// reserve puts it's PUBREC into the client's inflight map as soon as the
+// PUBLISH is read, the way mochi's processPublish does, so mochi's
+// NextPacketID never gives that packet ID to an outbound delivery while the
+// commit runs (mochi keeps both directions in one map). The writer only
+// writes it. A same-connection DUP of a QoS 2 publish still pending then
+// gets mochi's own PUBREC 0x91 (packet identifier in use); conforming
+// clients resend only after a reconnect. False when the pipe is abandoned.
+func (p *pubPipe) reserve(it *pubItem) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.abandoned {
+		return false
+	}
+
+	it.rec = packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Pubrec},
+		PacketID:    it.id,
+		Created:     time.Now().Unix(),
+	}
+
+	if p.cl.State.Inflight.Set(it.rec) {
+		atomic.AddInt64(&p.srv.Info.Inflight, 1)
+	}
+
+	if p.reserved == nil {
+		p.reserved = make(map[uint16]*pubItem)
+	}
+
+	p.reserved[it.id] = it
+
+	return true
+}
+
+// committed records that it is in the log, so its reservation stays (a
+// connection that inherits the session resends that PUBREC, rightly). False
+// when the pipe was abandoned first: close already removed the reservation.
+func (p *pubPipe) committed(it *pubItem) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.abandoned {
+		return false
+	}
+
+	if p.reserved[it.id] == it {
+		delete(p.reserved, it.id)
+	}
+
+	return true
+}
 
 // outstanding is the count against the receive maximum, and the channel
-// that closes when it next shrinks.
+// that closes when it next shrinks. For a 3.1.1 client only the publishes
+// whose ack is not written count: its QoS 2 slots free only when a PUBREL is
+// read, and the read loop is the one waiting in admit.
 func (p *pubPipe) outstanding() (n int, changed <-chan struct{}) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.cl.Properties.ProtocolVersion < 5 {
+		return p.pending, p.changed
+	}
 
 	return p.pending + len(p.held), p.changed
 }
@@ -605,7 +695,7 @@ func (p *pubPipe) commit(it *pubItem) bool {
 					retainLocal(p.srv, it.retained)
 				}
 
-				return true
+				return it.qos != 2 || p.committed(it)
 			}
 
 			it.err = err
@@ -639,8 +729,8 @@ func (p *pubPipe) commit(it *pubItem) bool {
 	}
 }
 
-// ack writes the PUBACK or PUBREC of it. A PUBREC goes into the client's
-// inflight first, as mochi's processPublish leaves it, so mochi's own PUBREL
+// ack writes the PUBACK or PUBREC of it. A successful PUBREC is the one
+// reserve put into the client's inflight map, where mochi's own PUBREL
 // handling finds it and answers PUBCOMP (spike 1, TestAsyncAckQoS2). It
 // reports false when the connection has ended.
 func (p *pubPipe) ack(it *pubItem) bool {
@@ -661,6 +751,8 @@ func (p *pubPipe) ack(it *pubItem) bool {
 		ack.FixedHeader.Type = packets.Pubrec
 
 		if it.code == 0 {
+			ack = it.rec
+
 			p.mu.Lock()
 
 			if p.held == nil {
@@ -669,10 +761,6 @@ func (p *pubPipe) ack(it *pubItem) bool {
 
 			p.held[it.id] = struct{}{}
 			p.mu.Unlock()
-
-			if p.cl.State.Inflight.Set(ack) {
-				atomic.AddInt64(&p.srv.Info.Inflight, 1)
-			}
 		}
 	}
 
@@ -690,7 +778,8 @@ func (p *pubPipe) ack(it *pubItem) bool {
 // commitPublish hands a network client's accepted QoS 1 or 2 publish to its
 // pipe. The tenant is the connection's and the topic tenant-relative; the
 // payload is copied. A QoS 2 publish takes its message ID from the session's
-// pending entry (qos2MsgID), so a DUP resend is stored once.
+// pending entry (qos2MsgID), so a DUP resend is stored once, and reserves its
+// packet ID (pubPipe.reserve). Nothing is queued once the pipe is abandoned.
 func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk *packets.Packet) {
 	n := b.cluster
 	qos := pk.FixedHeader.Qos
@@ -719,6 +808,10 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 		ret := pk.Copy(false)
 		ret.Payload = it.msg.Payload
 		it.retained = &ret
+	}
+
+	if qos == 2 && !st.pipe.reserve(it) {
+		return
 	}
 
 	st.pipe.push(it)

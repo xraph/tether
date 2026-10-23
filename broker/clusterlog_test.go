@@ -293,7 +293,7 @@ func TestQoS2ExactlyOnceWithDup(t *testing.T) {
 func TestReceiveMaximumEnforced(t *testing.T) {
 	c, proxy := startProxiedCell(t, 1, func(b *Broker) { b.receiveMaximum = 2 })
 
-	conn, ack := rawConnectAck(t, c.addr(0), "rm", "u1")
+	conn, ack := rawConnectAck(t, c.addr(0), "rm")
 	require.NotNil(t, ack.Properties.ReceiveMaximum)
 	require.Equal(t, uint16(2), *ack.Properties.ReceiveMaximum)
 
@@ -320,8 +320,16 @@ func TestReceiveMaximumEnforced(t *testing.T) {
 }
 
 // Ruling R22 for 3.1.1, which has no receive maximum: the client is held
-// back instead of disconnected, and every publish is acked in the end.
+// back instead of disconnected, and every publish is acked in the end, at
+// QoS 1 and at QoS 2. A 3.1.1 client's QoS 2 slot frees with its PUBREC, not
+// its PUBREL: the PUBREL is read by the very read loop that waits for a slot.
 func TestReceiveMaximumBackpressure311(t *testing.T) {
+	for _, qos := range []byte{1, 2} {
+		t.Run(fmt.Sprintf("qos %d", qos), func(t *testing.T) { backpressure311(t, qos) })
+	}
+}
+
+func backpressure311(t *testing.T, qos byte) {
 	c, proxy := startProxiedCell(t, 1, func(b *Broker) { b.receiveMaximum = 2 })
 	a := c.nodes[0]
 
@@ -335,7 +343,7 @@ func TestReceiveMaximumBackpressure311(t *testing.T) {
 
 	toks := make([]interface{ WaitTimeout(time.Duration) bool }, 0, 6)
 	for i := range 6 {
-		toks = append(toks, v3.Publish("bp/x", 1, false, fmt.Sprint(i)))
+		toks = append(toks, v3.Publish("bp/x", qos, false, fmt.Sprint(i)))
 	}
 
 	for i, tok := range toks {
@@ -377,7 +385,7 @@ func TestAcksInArrivalOrder(t *testing.T) {
 		})
 	a := c.nodes[0]
 
-	conn, _ := rawConnectAck(t, c.addr(0), "order", "u1")
+	conn, _ := rawConnectAck(t, c.addr(0), "order")
 	writePacket(t, conn, &packets.Publish{Topic: "o/1", QoS: 2, PacketID: 1, Payload: []byte("1"), Properties: &packets.Properties{}})
 	writePacket(t, conn, &packets.Publish{Topic: "o/2", QoS: 1, PacketID: 2, Payload: []byte("2"), Properties: &packets.Properties{}})
 
@@ -575,8 +583,8 @@ func TestTenantReaderLifecycle(t *testing.T) {
 	noMoreMsgs(t, sub)
 }
 
-// The cluster's QoS 1 and 2 path leaves the rate limit as it was: a 5.0 QoS
-// 1 publish over the tenant's budget gets PUBACK 0x97, through the pipe.
+// Over the tenant's rate budget a 5.0 QoS 1 publish gets PUBACK 0x97 and a
+// QoS 2 one PUBREC 0x97, through the pipe, after the acks of earlier ones.
 func TestQoS1QuotaExceededInOrder(t *testing.T) {
 	t1 := newTenant(tenant.Limits{MessagesPerSecond: 0.1, Burst: 1})
 	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
@@ -584,30 +592,36 @@ func TestQoS1QuotaExceededInOrder(t *testing.T) {
 	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
 		fakePerms{rules: map[string]acl.Rules{"u1": all}}, nil)
 
-	conn, _ := rawConnectAck(t, c.addr(0), "quota", "u1")
+	conn, _ := rawConnectAck(t, c.addr(0), "quota")
 
-	for id := uint16(1); id <= 2; id++ {
-		writePacket(t, conn, &packets.Publish{Topic: "z", QoS: 1, PacketID: id, Payload: []byte("x"), Properties: &packets.Properties{}})
+	for id := uint16(1); id <= 3; id++ {
+		qos := byte(1)
+		if id == 3 {
+			qos = 2
+		}
+
+		writePacket(t, conn, &packets.Publish{Topic: "z", QoS: qos, PacketID: id, Payload: []byte("x"), Properties: &packets.Properties{}})
 	}
 
-	codes := map[uint16]byte{}
-	order := make([]uint16, 0, 2)
+	cp := readLog(t, conn)
+	require.Equal(t, packets.PUBACK, cp.Type)
+	require.Equal(t, uint16(1), cp.Content.(*packets.Puback).PacketID)
+	require.Equal(t, byte(0), cp.Content.(*packets.Puback).ReasonCode)
 
-	for range 2 {
-		cp := readLog(t, conn)
-		require.Equal(t, packets.PUBACK, cp.Type)
+	cp = readLog(t, conn)
+	require.Equal(t, packets.PUBACK, cp.Type)
+	require.Equal(t, uint16(2), cp.Content.(*packets.Puback).PacketID)
+	require.Equal(t, byte(0x97), cp.Content.(*packets.Puback).ReasonCode)
 
-		pa := cp.Content.(*packets.Puback)
-		codes[pa.PacketID] = pa.ReasonCode
-		order = append(order, pa.PacketID)
-	}
-
-	require.Equal(t, []uint16{1, 2}, order)
-	require.Equal(t, map[uint16]byte{1: 0, 2: 0x97}, codes)
+	// A 5.0 QoS 2 over the budget gets PUBREC 0x97, also in order.
+	cp = readLog(t, conn)
+	require.Equal(t, packets.PUBREC, cp.Type)
+	require.Equal(t, uint16(3), cp.Content.(*packets.Pubrec).PacketID)
+	require.Equal(t, byte(0x97), cp.Content.(*packets.Pubrec).ReasonCode)
 }
 
-// rawConnectAck is rawConnect5 that also returns the CONNACK.
-func rawConnectAck(t *testing.T, addr, clientID, user string) (net.Conn, *packets.Connack) {
+// rawConnectAck is rawConnect5 for user u1 that also returns the CONNACK.
+func rawConnectAck(t *testing.T, addr, clientID string) (net.Conn, *packets.Connack) {
 	t.Helper()
 
 	conn, err := dial(t, addr)
@@ -616,7 +630,7 @@ func rawConnectAck(t *testing.T, addr, clientID, user string) (net.Conn, *packet
 
 	writePacket(t, conn, &packets.Connect{
 		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: clientID, CleanStart: true, KeepAlive: 30,
-		Username: user, UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
 		Properties: &packets.Properties{},
 	})
 
@@ -647,4 +661,207 @@ func readLog(t *testing.T, conn net.Conn) *packets.ControlPacket {
 	require.NoError(t, err)
 
 	return cp
+}
+
+// A client subscribed to its own QoS 2 topic, publishing with the packet ID
+// mochi would give its next outbound delivery: the PUBREC holds that ID in
+// mochi's one inflight map from the moment the PUBLISH is read, so the
+// delivery of the message (from this node's own reader, racing the ack)
+// gets another ID instead of being overwritten by the PUBREC. Both flows
+// complete with success codes and nothing is left in flight.
+//
+// (mochi has the opposite collision of its own, with or without a cluster:
+// a client PUBLISH reusing an ID of an outbound delivery still in flight
+// deletes that delivery's entry in processPublish. The test steers clear of
+// it by completing each round before the next.)
+func TestQoS2SelfSubscribedKeepsDeliveries(t *testing.T) {
+	c := startCluster(t, 1)
+	a := c.nodes[0]
+	nsID := namespacedID(c.t1.ID.String(), "self")
+
+	conn, _ := rawConnectAck(t, c.addr(0), "self")
+	writePacket(t, conn, &packets.Subscribe{PacketID: 1, Subscriptions: []packets.SubOptions{{Topic: "s/#", QoS: 2}}, Properties: &packets.Properties{}})
+	require.Equal(t, packets.SUBACK, readLog(t, conn).Type)
+
+	next := uint16(1) // mochi's next outbound packet ID for this client
+
+	for round := range 20 {
+		writePacket(t, conn, &packets.Publish{Topic: "s/x", QoS: 2, PacketID: next, Payload: []byte(fmt.Sprint(round)), Properties: &packets.Properties{}})
+
+		var (
+			rec   *packets.Pubrec
+			deliv *packets.Publish
+		)
+
+		for rec == nil || deliv == nil {
+			cp := readLog(t, conn)
+
+			switch cp.Type {
+			case packets.PUBREC:
+				rec = cp.Content.(*packets.Pubrec)
+			case packets.PUBLISH:
+				deliv = cp.Content.(*packets.Publish)
+			default:
+				t.Fatalf("round %d: unexpected packet %v", round, cp)
+			}
+		}
+
+		require.Equal(t, next, rec.PacketID)
+		require.Equal(t, byte(0), rec.ReasonCode)
+		require.Equal(t, fmt.Sprint(round), string(deliv.Payload))
+		require.Equal(t, byte(2), deliv.QoS)
+		require.NotEqual(t, next, deliv.PacketID, "round %d: the delivery took the reserved packet ID", round)
+
+		// The publisher's flow.
+		writePacket(t, conn, &packets.Pubrel{PacketID: next, Properties: &packets.Properties{}})
+
+		cp := readLog(t, conn)
+		require.Equal(t, packets.PUBCOMP, cp.Type)
+		require.Equal(t, next, cp.Content.(*packets.Pubcomp).PacketID)
+		require.Equal(t, byte(0), cp.Content.(*packets.Pubcomp).ReasonCode, "round %d", round)
+
+		// The delivery's flow.
+		writePacket(t, conn, &packets.Pubrec{PacketID: deliv.PacketID, Properties: &packets.Properties{}})
+
+		cp = readLog(t, conn)
+		require.Equal(t, packets.PUBREL, cp.Type)
+		require.Equal(t, byte(0), cp.Content.(*packets.Pubrel).ReasonCode, "round %d", round)
+
+		writePacket(t, conn, &packets.Pubcomp{PacketID: deliv.PacketID, Properties: &packets.Properties{}})
+
+		next = deliv.PacketID + 1
+	}
+
+	eventually(t, "nothing left in flight", func() bool {
+		cl, ok := a.server.Clients.Get(nsID)
+
+		return ok && cl.State.Inflight.Len() == 0
+	})
+}
+
+// A pipe abandoned before its QoS 2 commit leaves no PUBREC behind: not in
+// the offline session when the connection drops, and not in the session a
+// takeover inherits while the old connection is still open. The resend then
+// gets a successful PUBREC (a leftover reservation would make mochi answer
+// 0x91), once the message is committed.
+func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
+	c, proxy := startProxiedCell(t, 1, nil)
+	a := c.nodes[0]
+	nsID := namespacedID(c.t1.ID.String(), "ab")
+
+	expiry := uint32(3600)
+	connect := &packets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: "ab", CleanStart: false, KeepAlive: 30,
+		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: &packets.Properties{SessionExpiryInterval: &expiry},
+	}
+
+	inflight := func() int {
+		cl, ok := a.server.Clients.Get(nsID)
+		if !ok {
+			return -1
+		}
+
+		return cl.State.Inflight.Len()
+	}
+
+	// Dropped connection.
+	conn := rawConnect(t, c.addr(0), connect)
+
+	proxy.SetMode(chaos.Both, chaos.Blackhole)
+
+	writePacket(t, conn, &packets.Publish{Topic: "ab/x", QoS: 2, PacketID: 3, Payload: []byte("x"), Properties: &packets.Properties{}})
+	eventually(t, "the reservation", func() bool { return inflight() == 1 })
+
+	require.NoError(t, conn.Close())
+	eventually(t, "the reservation to go", func() bool { return inflight() == 0 })
+
+	// Takeover while the old connection is open.
+	old := rawConnect(t, c.addr(0), connect)
+	writePacket(t, old, &packets.Publish{Topic: "ab/y", QoS: 2, PacketID: 4, Payload: []byte("y"), Properties: &packets.Properties{}})
+	eventually(t, "the second reservation", func() bool { return inflight() == 1 })
+
+	conn = rawConnect(t, c.addr(0), connect)
+	require.Zero(t, inflight(), "the takeover inherited an uncommitted PUBREC")
+
+	proxy.SetMode(chaos.Both, chaos.Pass)
+
+	writePacket(t, conn, &packets.Publish{Topic: "ab/y", QoS: 2, PacketID: 4, Duplicate: true, Payload: []byte("y"), Properties: &packets.Properties{}})
+
+	rec := readLog(t, conn)
+	require.Equal(t, packets.PUBREC, rec.Type)
+	require.Equal(t, uint16(4), rec.Content.(*packets.Pubrec).PacketID)
+	require.Equal(t, byte(0), rec.Content.(*packets.Pubrec).ReasonCode)
+
+	writePacket(t, conn, &packets.Pubrel{PacketID: 4, Properties: &packets.Properties{}})
+	require.Equal(t, packets.PUBCOMP, readLog(t, conn).Type)
+	eventually(t, "nothing in flight", func() bool { return inflight() == 0 })
+}
+
+// Ruling R23 for refusals: in cluster mode the publish ACL is decided in
+// OnPublish, so a refused 5.0 publish's PUBACK or PUBREC 0x87 waits behind
+// the acks of earlier publishes. QoS 0 refusals are dropped and a 3.1.1
+// client sending a refused QoS 1 is disconnected, as without a cluster.
+func TestACLRefusalAckedInOrder(t *testing.T) {
+	t1 := newTenant(tenant.Limits{})
+	rules := acl.Rules{Publish: []string{"ok/#"}, Subscribe: []string{"#"}}
+
+	var proxy *chaos.Proxy
+
+	c := startCellVia(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": rules}}, nil,
+		func(_ int, url string) string {
+			p, err := chaos.NewProxy(strings.TrimPrefix(url, "nats://"))
+			require.NoError(t, err)
+			t.Cleanup(p.Close)
+
+			proxy = p
+
+			return "nats://" + p.Addr()
+		})
+
+	sub, _, err := connect5(t, c.addr(0), "sub", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sub, "#", 1, false)
+
+	conn, _ := rawConnectAck(t, c.addr(0), "pub")
+
+	proxy.SetDelay(chaos.Both, 500*time.Millisecond)
+	proxy.SetMode(chaos.Both, chaos.Delay)
+
+	writePacket(t, conn, &packets.Publish{Topic: "ok/1", QoS: 1, PacketID: 1, Payload: []byte("ok"), Properties: &packets.Properties{}})
+	writePacket(t, conn, &packets.Publish{Topic: "no/1", QoS: 1, PacketID: 2, Payload: []byte("no"), Properties: &packets.Properties{}})
+	writePacket(t, conn, &packets.Publish{Topic: "no/2", QoS: 2, PacketID: 3, Payload: []byte("no"), Properties: &packets.Properties{}})
+	writePacket(t, conn, &packets.Publish{Topic: "no/0", QoS: 0, Payload: []byte("no"), Properties: &packets.Properties{}})
+
+	cp := readLog(t, conn)
+	require.Equal(t, packets.PUBACK, cp.Type)
+	require.Equal(t, uint16(1), cp.Content.(*packets.Puback).PacketID)
+	require.Equal(t, byte(0), cp.Content.(*packets.Puback).ReasonCode)
+
+	cp = readLog(t, conn)
+	require.Equal(t, packets.PUBACK, cp.Type)
+	require.Equal(t, uint16(2), cp.Content.(*packets.Puback).PacketID)
+	require.Equal(t, byte(0x87), cp.Content.(*packets.Puback).ReasonCode)
+
+	cp = readLog(t, conn)
+	require.Equal(t, packets.PUBREC, cp.Type)
+	require.Equal(t, uint16(3), cp.Content.(*packets.Pubrec).PacketID)
+	require.Equal(t, byte(0x87), cp.Content.(*packets.Pubrec).ReasonCode)
+
+	proxy.SetMode(chaos.Both, chaos.Pass)
+
+	writePacket(t, conn, &packets.Publish{Topic: "ok/end", QoS: 1, PacketID: 4, Payload: []byte("end"), Properties: &packets.Properties{}})
+	require.Equal(t, packets.PUBACK, readLog(t, conn).Type)
+
+	require.Equal(t, map[string]int{"ok": 1}, drainToEnd(t, sub))
+
+	v3, err := connect311(t, c.addr(0), "v3", "u1", nil)
+	require.NoError(t, err)
+
+	tok := v3.Publish("no/3", 1, false, "no")
+	tok.WaitTimeout(logWait)
+	eventually(t, "the 3.1.1 client to be disconnected", func() bool { return !v3.IsConnectionOpen() })
+
+	noMoreMsgs(t, sub)
 }

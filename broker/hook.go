@@ -379,6 +379,15 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 		h.b.cluster.dropQoS2(cl.ID)
 	}
 
+	// A takeover: mochi clones the old connection's inflight map right
+	// after this hook, before the old connection ends. Its pipe is
+	// abandoned now, so no PUBREC of an uncommitted publish is cloned.
+	if h.b.cluster != nil {
+		if prev := h.b.state.owner(cl.ID); prev != nil && prev != st && prev.pipe != nil {
+			prev.pipe.close()
+		}
+	}
+
 	h.capSessionExpiry(cl, st)
 
 	h.b.state.bind(st)
@@ -649,7 +658,25 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 
 	n := h.b.cluster
-	logged := n != nil && pk.FixedHeader.Qos > 0
+	qos := pk.FixedHeader.Qos
+	logged := n != nil && qos > 0
+	v5 := cl.Properties.ProtocolVersion == 5
+
+	if n != nil && !h.aclCheck(cl, pk.TopicName, true) {
+		// OnACLCheck let it through (cluster mode), so the refusal is
+		// made here, where its ack can wait its turn in the pipe.
+		h.b.deps.Metrics.ACLDenied(ACLOpPublish)
+
+		switch {
+		case qos == 0:
+		case !v5:
+			disconnect(h.server, h.b.log, cl, packets.ErrNotAuthorized)
+		case st.pipe.admit():
+			st.pipe.ackNow(pk.PacketID, qos, packets.ErrNotAuthorized)
+		}
+
+		return pk, packets.ErrRejectPacket
+	}
 
 	if logged && !st.pipe.admit() {
 		return pk, packets.ErrRejectPacket
@@ -658,13 +685,11 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	if !h.b.deps.Limits.AllowMessage(st.tenantID, st.tenant.Load().Limits) {
 		h.b.log.Debug("tether: publish over the tenant's rate limit", slog.String("client", cl.ID), slog.String("tenant", st.tenantID))
 
-		if cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos == 1 {
-			if logged {
-				st.pipe.ackNow(pk.PacketID, 1, packets.ErrQuotaExceeded)
-
-				return pk, packets.ErrRejectPacket
-			}
-
+		switch {
+		case logged && v5:
+			// PUBACK or PUBREC 0x97, in order.
+			st.pipe.ackNow(pk.PacketID, qos, packets.ErrQuotaExceeded)
+		case v5 && qos == 1:
 			return pk, packets.ErrQuotaExceeded
 		}
 
@@ -892,6 +917,14 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 	}
 
 	if cl.Net.Inline {
+		return true
+	}
+
+	// In cluster mode OnPublish decides a network client's PUBLISH, so a
+	// refused one is acked in order through the pipe (mochi would write
+	// its 0x87 at once). Mochi asks for write access only in
+	// processPublish, right before OnPublish.
+	if write && h.b.cluster != nil {
 		return true
 	}
 
