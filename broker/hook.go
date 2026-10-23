@@ -458,7 +458,8 @@ func (h *hook) reject(cl *mqtt.Client, pk packets.Packet, code packets.Code) (pa
 // OnPacketEncode strips the tenant prefix from every PUBLISH a networked
 // client receives and counts it as a message out for the receiver's tenant,
 // and gives a refused CONNECT the CONNACK reason OnConnectAuthenticate chose
-// (mochi always sends bad username or password).
+// (mochi always sends bad username or password). It also keeps the user
+// properties on a PUBLISH for a client that asked for no problem information.
 //
 // The success CONNACK of a connection that inherited a session is the one
 // point between mochi's session takeover and its resend of the session's
@@ -519,6 +520,14 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 		pk.TopicName = name
 		counters.out.Add(1)
 		h.b.deps.Metrics.MessageOut()
+
+		// Mochi v2.7.9 sets DisallowProblemInfo for a client that connected
+		// with Request Problem Information 0, and then drops the user
+		// properties from every packet it sends it, PUBLISH included.
+		// paho.golang sends 0 unless you ask for 1. MQTT 5 ([MQTT-3.1.2-29])
+		// only restricts the packets other than PUBLISH, CONNACK and
+		// DISCONNECT, so the publisher's user properties stay.
+		pk.Mods.DisallowProblemInfo = false
 
 		return pk
 	default:

@@ -120,6 +120,8 @@ func startBrokerWith(t *testing.T, cfg Config, ids map[string]*auth.Identity, ru
 type message struct {
 	Topic   string
 	Payload string
+	// User holds the 5.0 user properties of the PUBLISH, nil when it had none.
+	User map[string]string
 }
 
 // connect311 connects a 3.1.1 client to addr ("tcp://", "ssl://" or "ws://"
@@ -241,7 +243,16 @@ func dial5(t *testing.T, addr string, cp *paho.Connect) (*client5, *paho.Connack
 		Conn: conn,
 		OnPublishReceived: []func(paho.PublishReceived) (bool, error){
 			func(pr paho.PublishReceived) (bool, error) {
-				msgs <- message{Topic: pr.Packet.Topic, Payload: string(pr.Packet.Payload)}
+				m := message{Topic: pr.Packet.Topic, Payload: string(pr.Packet.Payload)}
+
+				if pp := pr.Packet.Properties; pp != nil && len(pp.User) > 0 {
+					m.User = make(map[string]string, len(pp.User))
+					for _, u := range pp.User {
+						m.User[u.Key] = u.Value
+					}
+				}
+
+				msgs <- m
 
 				return true, nil
 			},
