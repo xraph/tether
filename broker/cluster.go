@@ -1,0 +1,458 @@
+package broker
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+
+	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/packets"
+
+	"github.com/xraph/tether"
+	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/subject"
+	"github.com/xraph/tether/topic"
+)
+
+// Cluster makes the broker one node of a cell: the node's NATS connection and
+// the cluster services built on it. Pass it as Deps.Cluster; nil runs the
+// broker alone, as before.
+//
+// The caller connects, provisions the cell and builds the services; the
+// broker uses them and closes none of them, except a Router it made itself.
+type Cluster struct {
+	// Conn is the node's NATS connection. Required.
+	Conn *cluster.Conn
+
+	// Config is the cluster configuration Conn was opened with. It must be
+	// enabled; NodeID names this node in the cell.
+	Config cluster.Config
+
+	// Sessions is the session store. Not used yet.
+	Sessions *cluster.Sessions
+
+	// Log is the QoS 1 and 2 message log. Not used yet.
+	Log *cluster.Log
+
+	// Router moves QoS 0 messages between the nodes. Leave it nil and the
+	// broker makes one on Conn whose deliver injects into this broker, and
+	// closes it on Stop. A Router you make yourself must hand what it
+	// delivers to (*Broker).DeliverRouted, and you close it.
+	Router *cluster.Router
+
+	// Members tracks the cell's live nodes. Not used yet.
+	Members *cluster.Members
+}
+
+// injectorID is the client ID of the injector, the inline client that
+// publishes messages from other nodes into mochi. It never enters mochi's
+// clients map, so no client can collide with it.
+const injectorID = "tether-cluster"
+
+// clusterNode is the broker's side of a cell.
+type clusterNode struct {
+	Cluster
+
+	log       *slog.Logger
+	ownRouter bool
+
+	// injector is the inline client that publishes routed messages into
+	// mochi. The hook recognises it by pointer: mochi's own inline client
+	// (admin publishes, $SYS) is inline too, and its QoS 0 publishes are
+	// routed, while the injector's never are. Set once at Start.
+	injector atomic.Pointer[mqtt.Client]
+
+	// gate guards srv for inject. Stop clears srv under the write lock
+	// before mochi shuts down, so no injection runs into a closing server.
+	gate sync.RWMutex
+	srv  *mqtt.Server
+
+	// routes holds, per namespaced client ID, the tenant-relative filters
+	// that hold a Router reference. Every reference is taken and dropped
+	// through it, so each is released exactly once.
+	routesMu sync.Mutex
+	routes   map[string]map[string]*routeRef
+
+	// published counts successful Router.Publish calls, routeErrors every
+	// Router call that failed. Tests read them.
+	published   atomic.Uint64
+	routeErrors atomic.Uint64
+}
+
+// routeRef is one session's reference on a (tenant, filter) route. It is
+// pending while Router.Subscribe runs: a release that finds it pending
+// leaves the Router alone and the subscriber gives the reference back.
+type routeRef struct {
+	active bool
+}
+
+// newClusterNode checks c and returns the broker's cluster side. deliver
+// receives the messages a Router made here delivers.
+func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name string, payload []byte, props cluster.Props)) (*clusterNode, error) {
+	if c.Conn == nil {
+		return nil, invalid("deps.Cluster.Conn is required")
+	}
+
+	if !c.Config.Enabled {
+		return nil, invalid("deps.Cluster.Config is not enabled")
+	}
+
+	if err := c.Config.Validate(); err != nil {
+		return nil, fmt.Errorf("tether/broker: %w: cluster config: %w", tether.ErrInvalidInput, err)
+	}
+
+	n := &clusterNode{
+		Cluster: *c,
+		log:     log.With(slog.String("node", c.Config.NodeID)),
+		routes:  make(map[string]map[string]*routeRef),
+	}
+
+	if n.Router == nil {
+		n.Router = cluster.NewRouter(c.Conn, c.Config.NodeID, deliver)
+		n.ownRouter = true
+	}
+
+	return n, nil
+}
+
+// attach makes srv the server injections go to and creates the injector, a
+// 5.0 inline client (spike 1): 5.0 so mochi keeps the properties of what it
+// injects. Called once, from Start.
+func (n *clusterNode) attach(srv *mqtt.Server) {
+	inj := srv.NewClient(nil, mqtt.LocalListener, injectorID, true)
+	inj.Properties.ProtocolVersion = 5
+	n.injector.Store(inj)
+
+	n.gate.Lock()
+	n.srv = srv
+	n.gate.Unlock()
+}
+
+// detach stops injections. When it returns none is running and none starts.
+func (n *clusterNode) detach() {
+	n.gate.Lock()
+	n.srv = nil
+	n.gate.Unlock()
+}
+
+// close closes the Router the broker made. Called after mochi has shut
+// down, so the releases of the last clean sessions still reach it.
+func (n *clusterNode) close() {
+	if n.ownRouter {
+		n.Router.Close()
+	}
+}
+
+// isInjector reports whether cl is this node's injector.
+func (n *clusterNode) isInjector(cl *mqtt.Client) bool {
+	return cl == n.injector.Load()
+}
+
+// errNotInjecting is what inject returns before Start and once Stop began.
+var errNotInjecting = fmt.Errorf("tether/broker: inject: %w: broker not running", tether.ErrConflict)
+
+// inject publishes a message from another node into mochi through the
+// injector, on tenantID's namespaced name, so local delivery, the ACL check
+// on every delivery and the outbound stripping run as for any message. The
+// injector is inline: no rate limit, no message counted in, never routed
+// again. qos is the QoS mochi delivers at most; mochi treats every inline
+// publish as received at QoS 0.
+func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props) error {
+	n := b.cluster
+
+	n.gate.RLock()
+	defer n.gate.RUnlock()
+
+	if n.srv == nil {
+		return errNotInjecting
+	}
+
+	pk := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos},
+		TopicName:   topic.Namespace(tenantID, name),
+		Payload:     payload,
+		Properties:  packetProps(props),
+	}
+
+	if qos > 0 {
+		// Unused for an inline publish, but mochi's validation wants one.
+		pk.PacketID = 1
+	}
+
+	if err := n.srv.InjectPacket(n.injector.Load(), pk); err != nil {
+		return fmt.Errorf("tether/broker: inject: %w", err)
+	}
+
+	return nil
+}
+
+// DeliverRouted hands the broker a QoS 0 message that another node routed,
+// as tenantID's message on the tenant-relative topic name. A Router the
+// broker made calls it itself; a Router you set in Cluster must call it
+// from its deliver function. It does not block on clients.
+//
+// The message comes off NATS, so it is checked like an admin publish: a
+// tenant ID that is not canonical, an invalid name and a name under $SYS
+// (in any casing) are dropped and logged. Before Start and after Stop it
+// drops everything.
+func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props cluster.Props) {
+	if b.cluster == nil {
+		return
+	}
+
+	if !validTenant(tenantID) || topic.Valid(name, false, subject.MaxTopicBytes) != nil || hasSysPrefix(name) {
+		b.cluster.log.Warn("tether: routed message dropped, not a tenant topic", slog.String("tenant", tenantID), slog.String("topic", name))
+
+		return
+	}
+
+	if err := b.inject(tenantID, name, payload, 0, props); err != nil && !errors.Is(err, errNotInjecting) {
+		b.cluster.log.Warn("tether: routed message not injected", slog.String("tenant", tenantID), slog.String("topic", name), slog.Any("error", err))
+	}
+}
+
+// publish routes one QoS 0 message to the other nodes of the cell. QoS 0 is
+// best effort: a failure is logged and counted, and the local delivery goes
+// ahead regardless. The retained flag does not travel.
+func (n *clusterNode) publish(tenantID, rel string, pk *packets.Packet) {
+	if err := n.Router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties)); err != nil {
+		n.routeErrors.Add(1)
+		n.log.Warn("tether: qos 0 message not routed", slog.String("tenant", tenantID), slog.String("topic", rel), slog.Any("error", err))
+
+		return
+	}
+
+	n.published.Add(1)
+}
+
+// publishInline routes a QoS 0 publish of mochi's inline client (Publish,
+// DevicePublish, DeleteRetained) to the other nodes. The name is
+// namespaced; the tenant comes from it. The tenant $SYS stats each node
+// publishes stay on that node, and mochi's own $SYS/broker names belong to
+// no tenant.
+func (n *clusterNode) publishInline(pk *packets.Packet) {
+	tenantID, ok := tenantOfName(pk.TopicName)
+	if !ok {
+		return
+	}
+
+	rel, ok := topic.Strip(tenantID, pk.TopicName)
+	if !ok || hasSysPrefix(rel) {
+		return
+	}
+
+	n.publish(tenantID, rel, pk)
+}
+
+// subscribe takes nsID's reference on (tenantID, filter) unless it holds one
+// already, which a SUBSCRIBE that replaces a subscription finds. The Router
+// call runs outside routesMu. It returns the Router's error, after which
+// nsID holds no reference.
+func (n *clusterNode) subscribe(nsID, tenantID, filter string) error {
+	n.routesMu.Lock()
+
+	set := n.routes[nsID]
+	if _, ok := set[filter]; ok {
+		n.routesMu.Unlock()
+
+		return nil
+	}
+
+	if set == nil {
+		set = make(map[string]*routeRef)
+		n.routes[nsID] = set
+	}
+
+	ref := &routeRef{}
+	set[filter] = ref
+	n.routesMu.Unlock()
+
+	err := n.Router.Subscribe(tenantID, filter)
+
+	n.routesMu.Lock()
+
+	if n.routes[nsID][filter] == ref {
+		if err == nil {
+			ref.active = true
+		} else {
+			n.forget(nsID, filter)
+		}
+
+		n.routesMu.Unlock()
+
+		return err
+	}
+
+	n.routesMu.Unlock()
+
+	// Released while the subscribe ran. The release skipped the Router
+	// because the reference was pending, so it is given back here.
+	if err == nil {
+		n.unsubscribe(tenantID, filter)
+	}
+
+	return err
+}
+
+// release drops nsID's references on filters, the tenant-relative filters
+// mochi no longer holds for the session. A filter with no reference is
+// skipped, so a second release of the same filter does nothing.
+func (n *clusterNode) release(nsID, tenantID string, filters []string) {
+	n.routesMu.Lock()
+
+	var drop []string
+
+	for _, f := range filters {
+		ref, ok := n.routes[nsID][f]
+		if !ok {
+			continue
+		}
+
+		n.forget(nsID, f)
+
+		if ref.active {
+			drop = append(drop, f)
+		}
+	}
+
+	n.routesMu.Unlock()
+
+	for _, f := range drop {
+		n.unsubscribe(tenantID, f)
+	}
+}
+
+// releaseAll drops every reference nsID holds.
+func (n *clusterNode) releaseAll(nsID, tenantID string) {
+	n.routesMu.Lock()
+
+	filters := make([]string, 0, len(n.routes[nsID]))
+	for f := range n.routes[nsID] {
+		filters = append(filters, f)
+	}
+
+	n.routesMu.Unlock()
+
+	n.release(nsID, tenantID, filters)
+}
+
+// forget removes one entry. routesMu must be held.
+func (n *clusterNode) forget(nsID, filter string) {
+	set := n.routes[nsID]
+	delete(set, filter)
+
+	if len(set) == 0 {
+		delete(n.routes, nsID)
+	}
+}
+
+// unsubscribe drops one Router reference, logging and counting a failure.
+func (n *clusterNode) unsubscribe(tenantID, filter string) {
+	if err := n.Router.Unsubscribe(tenantID, filter); err != nil {
+		n.routeErrors.Add(1)
+		n.log.Warn("tether: route not released", slog.String("tenant", tenantID), slog.String("filter", filter), slog.Any("error", err))
+	}
+}
+
+// routed returns the tenant-relative filters nsID holds references on, for
+// tests.
+func (n *clusterNode) routed(nsID string) []string {
+	n.routesMu.Lock()
+	defer n.routesMu.Unlock()
+
+	out := make([]string, 0, len(n.routes[nsID]))
+	for f := range n.routes[nsID] {
+		out = append(out, f)
+	}
+
+	return out
+}
+
+// routedFilter returns the tenant-relative form of a namespaced filter of
+// tenantID that the Router carries, and false for one it does not: a shared
+// filter (Task 12 routes those) or one outside the tenant.
+func routedFilter(tenantID, filter string) (string, bool) {
+	rel, ok := topic.Strip(tenantID, filter)
+	if !ok || rel == "" || withoutShare(rel) != rel {
+		return "", false
+	}
+
+	return rel, true
+}
+
+// tenantOfName returns the tenant of a namespaced topic name: its first
+// level, or its second one for a name whose first level starts with "$".
+func tenantOfName(name string) (string, bool) {
+	first, rest, ok := strings.Cut(name, "/")
+	if !ok {
+		return "", false
+	}
+
+	if strings.HasPrefix(first, "$") {
+		first, _, _ = strings.Cut(rest, "/")
+	}
+
+	if !validTenant(first) {
+		return "", false
+	}
+
+	return first, true
+}
+
+// hasSysPrefix reports whether a tenant-relative name starts with $SYS in
+// any casing, the names neither a client nor the host may publish.
+func hasSysPrefix(name string) bool {
+	return len(name) >= len(sysPrefix) && strings.EqualFold(name[:len(sysPrefix)], sysPrefix)
+}
+
+// clusterProps copies the MQTT 5 publish properties that travel with a
+// message from mochi's form into the cluster's.
+func clusterProps(p packets.Properties) cluster.Props {
+	out := cluster.Props{
+		ContentType:     p.ContentType,
+		ResponseTopic:   p.ResponseTopic,
+		CorrelationData: p.CorrelationData,
+		MessageExpiry:   p.MessageExpiryInterval,
+	}
+
+	if len(p.User) > 0 {
+		out.User = make([]cluster.UserProperty, len(p.User))
+		for i, u := range p.User {
+			out.User[i] = cluster.UserProperty{Key: u.Key, Value: u.Val}
+		}
+	}
+
+	if p.PayloadFormatFlag {
+		f := p.PayloadFormat
+		out.PayloadFormat = &f
+	}
+
+	return out
+}
+
+// packetProps is the inverse of clusterProps.
+func packetProps(p cluster.Props) packets.Properties {
+	out := packets.Properties{
+		ContentType:           p.ContentType,
+		ResponseTopic:         p.ResponseTopic,
+		CorrelationData:       p.CorrelationData,
+		MessageExpiryInterval: p.MessageExpiry,
+	}
+
+	if len(p.User) > 0 {
+		out.User = make([]packets.UserProperty, len(p.User))
+		for i, u := range p.User {
+			out.User[i] = packets.UserProperty{Key: u.Key, Val: u.Value}
+		}
+	}
+
+	if p.PayloadFormat != nil {
+		out.PayloadFormat = *p.PayloadFormat
+		out.PayloadFormatFlag = true
+	}
+
+	return out
+}

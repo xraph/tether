@@ -45,6 +45,11 @@ type Deps struct {
 
 	// Metrics receives the node-wide counters. Nil reports nothing.
 	Metrics Metrics
+
+	// Cluster makes the broker one node of a cell. Nil runs it alone,
+	// exactly as without clustering. With a cluster mochi's storage hook is
+	// never added and Config.DataDir is ignored.
+	Cluster *Cluster
 }
 
 // Broker is a tenant-isolating MQTT broker. Create it with New, then Start
@@ -96,6 +101,9 @@ type Broker struct {
 	// tells it about the subscriptions and inflight messages it removes.
 	storage *badger.Hook
 
+	// cluster is the broker's side of its cell, nil when it runs alone.
+	cluster *clusterNode
+
 	mu      sync.Mutex
 	started bool
 	server  *mqtt.Server
@@ -138,7 +146,7 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		deps.Metrics = noMetrics{}
 	}
 
-	return &Broker{
+	b := &Broker{
 		cfg:         cfg,
 		deps:        deps,
 		log:         deps.Logger,
@@ -150,7 +158,18 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		retryWindow: defaultRetryWindow,
 		retryQuit:   make(chan struct{}),
 		endWait:     sessionEndWait,
-	}, nil
+	}
+
+	if deps.Cluster != nil {
+		n, err := newClusterNode(deps.Cluster, deps.Logger, b.DeliverRouted)
+		if err != nil {
+			return nil, err
+		}
+
+		b.cluster = n
+	}
+
+	return b, nil
 }
 
 // Start opens the listeners and starts serving. A broker starts once; a
@@ -196,6 +215,10 @@ func (b *Broker) Start(ctx context.Context) error {
 		return fmt.Errorf("tether/broker: serve: %w", err)
 	}
 
+	if b.cluster != nil {
+		b.cluster.attach(srv)
+	}
+
 	interval := b.sysInterval
 	if interval <= 0 {
 		interval = defaultSysInterval
@@ -215,7 +238,10 @@ func (b *Broker) setup(ctx context.Context, srv *mqtt.Server) error {
 		return fmt.Errorf("tether/broker: add hook: %w", err)
 	}
 
-	if b.cfg.DataDir != "" {
+	switch {
+	case b.cfg.DataDir != "" && b.cluster != nil:
+		b.log.Info("tether: data_dir is ignored in cluster mode, sessions live in the cell", slog.String("data_dir", b.cfg.DataDir))
+	case b.cfg.DataDir != "":
 		storage := new(badger.Hook)
 		if err := srv.AddHook(storage, &badger.Options{Path: b.cfg.DataDir}); err != nil {
 			return fmt.Errorf("tether/broker: open storage: %w", err)
@@ -314,7 +340,20 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// Pending reload retries end before the clients go.
 		b.stopRetries()
 
-		done <- shutdown(srv, ids)
+		// No message from another node is injected into a server that is
+		// closing. The Router closes last: the clean sessions that end
+		// during the shutdown still release their routes.
+		if b.cluster != nil {
+			b.cluster.detach()
+		}
+
+		err := shutdown(srv, ids)
+
+		if b.cluster != nil {
+			b.cluster.close()
+		}
+
+		done <- err
 	}()
 
 	select {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/subject"
 	"github.com/xraph/tether/tenant"
 	"github.com/xraph/tether/topic"
 )
@@ -51,9 +52,22 @@ var provided = []byte{
 	mqtt.OnWill,
 }
 
+// clusterProvided lists the methods the hook implements only in cluster
+// mode, where they keep the node's QoS 0 routes (cluster.go). Alone, the
+// broker provides exactly the methods it always did.
+var clusterProvided = []byte{
+	mqtt.OnSubscribed,
+	mqtt.OnUnsubscribed,
+	mqtt.OnClientExpired,
+}
+
 // Provides implements mqtt.Hook.
 func (h *hook) Provides(b byte) bool {
-	return bytes.IndexByte(provided, b) >= 0
+	if bytes.IndexByte(provided, b) >= 0 {
+		return true
+	}
+
+	return h.b.cluster != nil && bytes.IndexByte(clusterProvided, b) >= 0
 }
 
 // OnConnectAuthenticate authenticates the client, loads and compiles its
@@ -418,6 +432,10 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 			return h.reject(cl, pk, packets.ErrProtocolViolationNoTopic)
 		case topic.Valid(pk.TopicName, false, h.b.cfg.MaxTopicLength) != nil:
 			return h.reject(cl, pk, packets.ErrTopicNameInvalid)
+		case h.b.cluster != nil && subject.CheckTopic(pk.TopicName) != nil:
+			// The cell carries topics of at most 1024 bytes, whatever
+			// MaxTopicLength allows.
+			return h.reject(cl, pk, packets.ErrTopicNameInvalid)
 		}
 
 		pk.TopicName = topic.Namespace(st.tenantID, pk.TopicName)
@@ -429,7 +447,8 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 	copy(filters, pk.Filters)
 
 	for i := range filters {
-		if topic.Valid(filters[i].Filter, true, h.b.cfg.MaxTopicLength) != nil {
+		if topic.Valid(filters[i].Filter, true, h.b.cfg.MaxTopicLength) != nil ||
+			h.b.cluster != nil && subject.CheckTopic(filters[i].Filter) != nil {
 			filters[i].Filter = ""
 
 			continue
@@ -570,6 +589,12 @@ func (h *hook) withhold(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 // PUBACK where a PUBREC belongs.
 func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
 	if cl.Net.Inline {
+		// The host's QoS 0 publishes reach the other nodes too. What the
+		// injector publishes came from another node and never goes back.
+		if n := h.b.cluster; n != nil && pk.FixedHeader.Qos == 0 && !n.isInjector(cl) {
+			n.publishInline(&pk)
+		}
+
 		return pk, nil
 	}
 
@@ -578,7 +603,8 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrRejectPacket
 	}
 
-	if _, ok := topic.Strip(st.tenantID, pk.TopicName); !ok {
+	rel, ok := topic.Strip(st.tenantID, pk.TopicName)
+	if !ok {
 		return pk, packets.ErrRejectPacket
 	}
 
@@ -595,7 +621,116 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	st.counters.in.Add(1)
 	h.b.deps.Metrics.MessageIn()
 
+	// Mochi delivers to this node's subscribers once this returns; the
+	// Router takes the message to every other node with interest. QoS 1
+	// and 2 stay local until they go through the log.
+	if h.b.cluster != nil && pk.FixedHeader.Qos == 0 {
+		h.b.cluster.publish(st.tenantID, rel, &pk)
+	}
+
 	return pk, nil
+}
+
+// OnSubscribed takes a Router reference for each filter mochi accepted from
+// a network client's SUBSCRIBE (cluster mode only), with the client's tenant
+// and the tenant-relative filter, so QoS 0 messages for it published on
+// other nodes come here. Shared filters are left alone.
+//
+// Mochi has stored the subscriptions when this runs and writes the SUBACK
+// right after, from the same reasonCodes slice. A filter whose Router
+// subscribe fails is refused there: its code becomes 0x80 (unspecified
+// error, also the 3.1.1 failure code), mochi's subscription is removed, and
+// mochi skips its retained messages. The failure is logged at Warn and
+// counted (routeErrors).
+func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
+	n := h.b.cluster
+	if n == nil || cl.Net.Inline {
+		return
+	}
+
+	tenantID, ok := tenantOfID(cl.ID)
+	if !ok {
+		return
+	}
+
+	for i, sub := range pk.Filters {
+		if i >= len(reasonCodes) || reasonCodes[i] >= packets.ErrUnspecifiedError.Code {
+			continue
+		}
+
+		rel, ok := routedFilter(tenantID, sub.Filter)
+		if !ok {
+			continue
+		}
+
+		err := n.subscribe(cl.ID, tenantID, rel)
+		if err == nil {
+			continue
+		}
+
+		n.routeErrors.Add(1)
+		n.log.Warn("tether: subscription refused, its route failed", slog.String("client", cl.ID),
+			slog.String("tenant", tenantID), slog.String("filter", rel), slog.Any("error", err))
+
+		reasonCodes[i] = packets.ErrUnspecifiedError.Code
+
+		if h.server.Topics.Unsubscribe(sub.Filter, cl.ID) {
+			atomic.AddInt64(&h.server.Info.Subscriptions, -1)
+		}
+
+		cl.State.Subscriptions.Delete(sub.Filter)
+	}
+}
+
+// OnUnsubscribed drops the Router references of the filters a network
+// client's session no longer holds (cluster mode only): after an
+// UNSUBSCRIBE, and when mochi unsubscribes a clean session that ended or was
+// taken over. Mochi also calls it for an UNSUBSCRIBE it refused (packet
+// identifier in use) and for filters the client never had, so only filters
+// gone from the session are released.
+func (h *hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
+	n := h.b.cluster
+	if n == nil || cl.Net.Inline {
+		return
+	}
+
+	tenantID, ok := tenantOfID(cl.ID)
+	if !ok {
+		return
+	}
+
+	var gone []string
+
+	for _, sub := range pk.Filters {
+		if _, held := cl.State.Subscriptions.Get(sub.Filter); held {
+			continue
+		}
+
+		if rel, ok := routedFilter(tenantID, sub.Filter); ok {
+			gone = append(gone, rel)
+		}
+	}
+
+	n.release(cl.ID, tenantID, gone)
+}
+
+// OnClientExpired drops every Router reference of a session mochi expired
+// (cluster mode only). Mochi deletes the session from its clients without
+// unsubscribing it, so OnUnsubscribed never runs for it.
+func (h *hook) OnClientExpired(cl *mqtt.Client) {
+	n := h.b.cluster
+	if n == nil || cl.Net.Inline {
+		return
+	}
+
+	if cur, ok := h.server.Clients.Get(cl.ID); ok && cur != cl {
+		// Another connection holds the ID now, with its own subscriptions.
+		return
+	}
+
+	if tenantID, ok := tenantOfID(cl.ID); ok {
+		n.releaseAll(cl.ID, tenantID)
+	}
 }
 
 // lastHook is added after every other hook, storage included. Mochi runs

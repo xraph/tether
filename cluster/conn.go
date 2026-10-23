@@ -124,7 +124,7 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 }
 
 func (c *Conn) natsOptions(cfg Config) []nats.Option {
-	return []nats.Option{
+	opts := []nats.Option{
 		nats.Name("tether-" + cfg.NodeID),
 		nats.NoEcho(),
 		nats.MaxReconnects(-1),
@@ -140,6 +140,12 @@ func (c *Conn) natsOptions(cfg Config) []nats.Option {
 			c.logger.Warn("nats error", "error", err)
 		}),
 	}
+
+	if cfg.NoDiscovery {
+		opts = append(opts, nats.IgnoreDiscoveredServers(), nats.DontRandomize())
+	}
+
+	return opts
 }
 
 // waitJetStream polls until JetStream answers an account info request.

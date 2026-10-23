@@ -2,6 +2,7 @@ package cluster_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"gopkg.in/yaml.v3"
 
 	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/cluster/clustertest"
@@ -304,6 +306,86 @@ func TestConnectNoEcho(t *testing.T) {
 	case m := <-got:
 		t.Fatalf("unexpected extra message %q", m.Data)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestConnectNoDiscovery checks that NoDiscovery keeps a node on the servers
+// it was given: it never learns the cluster's other URLs, so when its server
+// goes away it waits for that server instead of reconnecting to another one.
+// A node behind the fault proxy relies on this. A node without the flag is the
+// control: it learns the other servers and fails over to one of them.
+func TestConnectNoDiscovery(t *testing.T) {
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
+
+	pinnedCfg := externalConfig(urls[:1])
+	pinnedCfg.NoDiscovery = true
+	pinnedCfg.Replicas = 3
+
+	pinned, err := cluster.Connect(ctxT(t, 20*time.Second), pinnedCfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(pinned.Close)
+
+	freeCfg := externalConfig(urls[:1])
+	freeCfg.NodeID = "n2"
+	freeCfg.Replicas = 3
+
+	free, err := cluster.Connect(ctxT(t, 20*time.Second), freeCfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(free.Close)
+
+	// The control learns the other two servers from the cluster's INFO.
+	deadline := time.Now().Add(10 * time.Second)
+	for len(free.NC().DiscoveredServers()) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("control discovered %v, want two servers", free.NC().DiscoveredServers())
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := pinned.NC().Servers(); len(got) != 1 || len(pinned.NC().DiscoveredServers()) != 0 {
+		t.Fatalf("pinned connection knows %v (discovered %v), want only %s", got, pinned.NC().DiscoveredServers(), urls[0])
+	}
+
+	nc.Stop(0)
+
+	deadline = time.Now().Add(10 * time.Second)
+	for !free.NC().IsConnected() || free.NC().ConnectedUrl() == urls[0] {
+		if time.Now().After(deadline) {
+			t.Fatal("control did not fail over to another server")
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The pinned node has had the same time and more: it must still be
+	// waiting for its own server.
+	time.Sleep(time.Second)
+
+	if pinned.NC().IsConnected() {
+		t.Fatalf("pinned connection reconnected to %s, want it to wait for %s", pinned.NC().ConnectedUrl(), urls[0])
+	}
+}
+
+func TestNoDiscoveryConfigKey(t *testing.T) {
+	var cfg cluster.Config
+	if err := json.Unmarshal([]byte(`{"no_discovery": true}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if !cfg.NoDiscovery {
+		t.Fatal("json key no_discovery did not set NoDiscovery")
+	}
+
+	if err := yaml.Unmarshal([]byte("no_discovery: true\n"), &cfg); err != nil || !cfg.NoDiscovery {
+		t.Fatalf("yaml key no_discovery: %v, NoDiscovery = %v", err, cfg.NoDiscovery)
 	}
 }
 

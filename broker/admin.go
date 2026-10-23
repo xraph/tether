@@ -501,7 +501,30 @@ func (b *Broker) unsubscribe(srv *mqtt.Server, cl *mqtt.Client, drop func(filter
 		b.storage.OnUnsubscribed(cl, packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Unsubscribe}, Filters: removed})
 	}
 
+	if len(removed) > 0 && b.cluster != nil {
+		b.releaseRoutes(cl, removed)
+	}
+
 	return len(removed)
+}
+
+// releaseRoutes drops the Router references of subscriptions unsubscribe
+// removed from cl's session.
+func (b *Broker) releaseRoutes(cl *mqtt.Client, removed []packets.Subscription) {
+	tenantID, ok := tenantOfID(cl.ID)
+	if !ok {
+		return
+	}
+
+	rels := make([]string, 0, len(removed))
+
+	for _, sub := range removed {
+		if rel, ok := routedFilter(tenantID, sub.Filter); ok {
+			rels = append(rels, rel)
+		}
+	}
+
+	b.cluster.release(cl.ID, tenantID, rels)
 }
 
 // Admin operations. The host's admin API calls these for one tenant, after

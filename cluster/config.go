@@ -55,6 +55,13 @@ type Config struct {
 	// Replicas is the replica count for the log stream, the control stream and
 	// the buckets. 0 means automatic: see Conn.Replicas. 1 to 3 pins it.
 	Replicas int `yaml:"replicas" json:"replicas"`
+	// NoDiscovery keeps the connection on the servers it was given: it ignores
+	// the server URLs a NATS cluster advertises and tries the given ones in
+	// order. Leave it off in production. A node that reaches NATS through a
+	// proxy (the fault proxy in tests) sets it, or nats.go reconnects around
+	// the proxy. With it on, the automatic replica count sees only the given
+	// URLs, so set Replicas.
+	NoDiscovery bool `yaml:"no_discovery" json:"no_discovery"`
 }
 
 // EmbeddedConfig configures the nats-server that embedded mode runs.
