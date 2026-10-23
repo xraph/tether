@@ -202,7 +202,11 @@ func (b *Broker) runSys(srv *mqtt.Server, interval time.Duration, stop <-chan st
 		case <-tick.C:
 			b.publishSys(srv)
 		case now := <-sweep.C:
-			b.expireSessions(srv, now.Unix())
+			// In cluster mode mochi keeps no offline session: the key's TTL
+			// ends a 3.1.1 session in the cell.
+			if b.cluster == nil {
+				b.expireSessions(srv, now.Unix())
+			}
 		}
 	}
 }

@@ -16,8 +16,6 @@ import (
 
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/cluster"
-	"github.com/xraph/tether/subject"
-	"github.com/xraph/tether/topic"
 )
 
 // QoS 1 and 2 in cluster mode (spike 1, async ack).
@@ -112,6 +110,9 @@ func (b *Broker) ensureReader(tenantID string) error {
 		e.err = errNotInjecting
 	default:
 		e.r = r
+		// The tenant's live position starts where the reader does, before
+		// any CONNECT of the tenant reads it.
+		n.advanceLive(tenantID, r.Position())
 	}
 
 	n.readersMu.Unlock()
@@ -327,35 +328,10 @@ func (n *clusterNode) readerTenants() []string {
 // so mochi delivers it to the matching local sessions at the lower of that
 // and their subscription's QoS, with the ACL check on every delivery and the
 // outbound stripping. The publisher's client ID becomes the packet's origin
-// for No Local.
+// for No Local. deliverLog (cursor.go) does the work, under the tenant's
+// delivery lock, and keeps the sessions' cursors.
 func (b *Broker) logDeliver(tenantID string) func(cluster.LogMessage) error {
-	return func(m cluster.LogMessage) error {
-		n := b.cluster
-
-		if m.Tenant != tenantID || !validTenant(m.Tenant) || topic.Valid(m.Topic, false, subject.MaxTopicBytes) != nil ||
-			hasSysPrefix(m.Topic) || m.QoS < 1 || m.QoS > 2 {
-			n.log.Warn("tether: log message dropped, not a tenant topic", slog.String("tenant", m.Tenant),
-				slog.String("topic", m.Topic), slog.Uint64("seq", m.Seq))
-
-			return nil
-		}
-
-		origin := ""
-		if m.ClientID != "" {
-			origin = namespacedID(m.Tenant, m.ClientID)
-		}
-
-		err := b.inject(m.Tenant, m.Topic, m.Payload, m.QoS, m.Props, origin)
-		if errors.Is(err, errNotInjecting) {
-			return nil
-		}
-
-		if err == nil {
-			n.logDelivered.Add(1)
-		}
-
-		return err
-	}
+	return func(m cluster.LogMessage) error { return b.deliverLog(tenantID, m) }
 }
 
 // pubPipe carries one connection's QoS 1 and 2 publishes to the log and
@@ -645,6 +621,10 @@ func (p *pubPipe) start(it *pubItem) {
 		}
 	}
 
+	if hold := n.holdAppend; hold != nil {
+		hold(p.ctx)
+	}
+
 	ctx, cancel := context.WithTimeout(p.ctx, n.appendAttempt)
 	defer cancel()
 
@@ -867,9 +847,10 @@ func retainLocal(srv *mqtt.Server, pk *packets.Packet) {
 // entry holds; anything else gets a fresh one and becomes the entry. The
 // entry lives until the PUBREL (clearQoS2) or the session's end (dropQoS2).
 //
-// The entries are this node's memory for now. Task 9 persists each into
-// cluster.SessionRecord.QoS2In before the append (persistQoS2) and loads
-// them with the session, so a resend reaching another node finds it too.
+// The entries are this node's memory of the session's record: each is
+// written into cluster.SessionRecord.QoS2In before the append (persistQoS2,
+// for a session that has a record to resume) and loaded with the session, so
+// a resend reaching another node finds it too.
 func (n *clusterNode) qos2MsgID(nsID string, id uint16, dup bool) string {
 	n.qos2Mu.Lock()
 	defer n.qos2Mu.Unlock()
@@ -936,6 +917,10 @@ func (b *Broker) pubrel(cl *mqtt.Client, id uint16) {
 	}
 
 	b.cluster.clearQoS2(cl.ID, id)
+
+	if s := b.cluster.sessionOf(cl); s != nil && s.tracked {
+		s.touch()
+	}
 }
 
 // newMsgID is a fresh Nats-Msg-Id: 26 base32 characters, 128 random bits.

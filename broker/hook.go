@@ -53,12 +53,17 @@ var provided = []byte{
 }
 
 // clusterProvided lists the methods the hook implements only in cluster
-// mode, where they keep the node's QoS 0 routes (cluster.go). Alone, the
-// broker provides exactly the methods it always did.
+// mode, where they keep the node's QoS 0 routes (cluster.go) and its
+// sessions' cursors (cursor.go). Alone, the broker provides exactly the
+// methods it always did.
 var clusterProvided = []byte{
 	mqtt.OnSubscribed,
 	mqtt.OnUnsubscribed,
 	mqtt.OnClientExpired,
+	mqtt.OnSessionEstablished,
+	mqtt.OnQosPublish,
+	mqtt.OnQosDropped,
+	mqtt.OnPublishDropped,
 }
 
 // Provides implements mqtt.Hook.
@@ -86,6 +91,13 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	defer cancel()
 
 	gen := h.b.changes.Load()
+
+	if h.b.cluster != nil {
+		// Ruling R13: the cell keys sessions by client ID, which it caps.
+		if err := checkClientID(cl.ID); err != nil {
+			return h.refuse(cl, log, packets.ErrClientIdentifierNotValid, "client ID the cell cannot carry", err)
+		}
+	}
 
 	ident, g, ok := h.authorize(ctx, cl, pk, log)
 	if !ok {
@@ -135,6 +147,16 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 			st.returnSlot(from)
 
 			return h.refuse(cl, log, packets.ErrServerUnavailable, "cluster log unavailable", err)
+		}
+
+		// Last: once the key is this node's, the session's previous owner,
+		// anywhere in the cell, is on its way out. The session's lock stays
+		// held until OnSessionEstablish is done (st.sessUnlock).
+		if !h.b.acquireSession(cl, st, log) {
+			h.b.state.remove(cl)
+			st.returnSlot(from)
+
+			return h.refuse(cl, log, packets.ErrServerUnavailable, "session unavailable in the cell", nil)
 		}
 	}
 
@@ -343,6 +365,8 @@ func v3ConnackCode(code packets.Code) byte {
 		return packets.ErrMalformedUsernameOrPassword.Code // 0x04, bad user name or password
 	case packets.ErrServerUnavailable, packets.ErrQuotaExceeded, packets.ErrConnectionRateExceeded:
 		return packets.Err3ServerUnavailable.Code
+	case packets.ErrClientIdentifierNotValid:
+		return packets.Err3ClientIdentifierNotValid.Code
 	default:
 		return packets.Err3NotAuthorized.Code
 	}
@@ -364,6 +388,15 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 		cl.Stop(packets.ErrNotAuthorized)
 
 		return
+	}
+
+	if st.sessUnlock != nil {
+		// Taken in OnConnectAuthenticate with the session's key (cluster
+		// mode): held until the connection owns the ID here.
+		defer func() {
+			st.sessUnlock()
+			st.sessUnlock = nil
+		}()
 	}
 
 	cl.ID = namespacedID(st.tenantID, st.rawID)
@@ -418,12 +451,27 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 		return pk, nil
 	}
 
-	if pk.FixedHeader.Type == packets.Pubrel && h.b.cluster != nil {
-		// The end of a QoS 2 publish the pipe acked: its receive slot
-		// frees and its pending entry goes. Mochi answers PUBCOMP.
-		h.b.pubrel(cl, pk.PacketID)
+	if n := h.b.cluster; n != nil {
+		switch pk.FixedHeader.Type {
+		case packets.Pubrel:
+			// The end of a QoS 2 publish the pipe acked: its receive slot
+			// frees and its pending entry goes. Mochi answers PUBCOMP.
+			h.b.pubrel(cl, pk.PacketID)
 
-		return pk, nil
+			return pk, nil
+		case packets.Puback, packets.Pubcomp:
+			// One of the session's deliveries is complete (cursor.go).
+			n.onAck(cl, pk.PacketID, pk.FixedHeader.Type == packets.Pubcomp)
+
+			return pk, nil
+		case packets.Pubrec:
+			// The record says PUBREL before mochi sends it.
+			if !n.onPubrec(cl, pk) {
+				return pk, packets.ErrRejectPacket
+			}
+
+			return pk, nil
+		}
 	}
 
 	switch pk.FixedHeader.Type {
@@ -528,6 +576,29 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 				return pk
 			}
 
+			if h.b.cluster != nil && h.b.state.owner(cl.ID) != st {
+				// A concurrent CONNECT on this node took the ID after this
+				// one inherited (OnSessionEstablished disconnects it): what
+				// mochi cloned into it belongs to the other connection's
+				// flows, and none of it may be resent from here.
+				for _, p := range cl.State.Inflight.GetAll(false) {
+					cl.State.Inflight.Delete(p.PacketID)
+				}
+
+				return pk
+			}
+
+			if n := h.b.cluster; n != nil && !n.mayResend(st) {
+				// Another node took the session while this CONNECT was
+				// loading it: what it restored must not be resent from here
+				// (OnSessionEstablished disconnects it with 0x8E).
+				for _, p := range cl.State.Inflight.GetAll(false) {
+					cl.State.Inflight.Delete(p.PacketID)
+				}
+
+				return pk
+			}
+
 			if pk.SessionPresent {
 				h.b.pruneSession(h.server, st)
 			}
@@ -566,6 +637,12 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			return h.withhold(cl, pk)
 		}
 
+		if n := h.b.cluster; n != nil && pk.FixedHeader.Qos == 2 && !n.beforeQoS2Send(cl, pk) {
+			// The delivery is not in the session's record, so it must not
+			// go out; beforeQoS2Send stopped the client.
+			return blankPublish(pk)
+		}
+
 		pk.TopicName = name
 		counters.out.Add(1)
 		h.b.deps.Metrics.MessageOut()
@@ -596,6 +673,13 @@ func (h *hook) withhold(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 	h.b.log.Error("tether: outbound publish outside the client's namespace, closing the client", slog.String("client", cl.ID))
 	cl.Stop(packets.ErrImplementationSpecificError)
 
+	return blankPublish(pk)
+}
+
+// blankPublish is what a PUBLISH that must not go out becomes once its client
+// is stopped: mochi's write of it then fails, and it carries no tenant, no
+// topic of one, no payload and no properties.
+func blankPublish(pk packets.Packet) packets.Packet {
 	return packets.Packet{
 		FixedHeader:     pk.FixedHeader,
 		PacketID:        pk.PacketID,
@@ -767,6 +851,24 @@ func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 
 		cl.State.Subscriptions.Delete(sub.Filter)
 	}
+
+	if s := n.sessionOf(cl); s != nil {
+		s.touch()
+
+		if s.heldOut() {
+			// The session is still replaying: its new subscriptions wait
+			// out of the index with the rest (cursor.go).
+			var held []packets.Subscription
+
+			for i, code := range reasonCodes {
+				if i < len(pk.Filters) && code < packets.ErrUnspecifiedError.Code {
+					held = append(held, pk.Filters[i])
+				}
+			}
+
+			n.holdOut(s, cl, held)
+		}
+	}
 }
 
 // OnUnsubscribed drops the Router references of the filters a network
@@ -799,6 +901,45 @@ func (h *hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	n.release(cl.ID, tenantID, gone)
+
+	if s := n.sessionOf(cl); s != nil {
+		s.unloaded(pk.Filters)
+	}
+}
+
+// OnSessionEstablished runs after the CONNACK and the resend of the
+// session's inflight messages (cluster mode): see Broker.established.
+func (h *hook) OnSessionEstablished(cl *mqtt.Client, _ packets.Packet) {
+	if h.b.cluster == nil || cl.Net.Inline {
+		return
+	}
+
+	if st := h.b.state.get(cl); st != nil {
+		h.b.established(cl, st)
+	}
+}
+
+// OnQosPublish records the log sequence of a QoS 1 or 2 delivery (cluster
+// mode, cursor.go).
+func (h *hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) {
+	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		n.onQosPublish(cl, pk)
+	}
+}
+
+// OnQosDropped forgets a delivery mochi gave up on (cluster mode).
+func (h *hook) OnQosDropped(cl *mqtt.Client, pk packets.Packet) {
+	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		n.onQosDropped(cl, pk)
+	}
+}
+
+// OnPublishDropped holds the cursor below a delivery mochi could not queue
+// (cluster mode).
+func (h *hook) OnPublishDropped(cl *mqtt.Client, pk packets.Packet) {
+	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		n.onPublishDropped(cl, pk)
+	}
 }
 
 // OnClientExpired drops every Router reference of a session mochi expired
@@ -863,10 +1004,17 @@ func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 		st.releaseSlot()
 	}
 
-	if n := h.b.cluster; n != nil && expire && !cl.Net.Inline {
-		if cur, ok := h.server.Clients.Get(cl.ID); !ok || cur == cl {
-			n.dropQoS2(cl.ID)
+	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		if expire {
+			if cur, ok := h.server.Clients.Get(cl.ID); !ok || cur == cl {
+				n.dropQoS2(cl.ID)
+			}
 		}
+
+		// The session ends here, unless another connection holds it now:
+		// deleted, written one last time and evicted, or left alone when
+		// another node took it (clustersession.go).
+		h.b.endSession(cl, expire)
 	}
 }
 

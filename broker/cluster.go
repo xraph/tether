@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -32,7 +33,9 @@ type Cluster struct {
 	// enabled; NodeID names this node in the cell.
 	Config cluster.Config
 
-	// Sessions is the session store. Not used yet.
+	// Sessions is the cell's session store. Every CONNECT takes its client
+	// ID's key there, and persistent sessions live there while their client
+	// is away. Leave it nil and the broker makes one on Conn.
 	Sessions *cluster.Sessions
 
 	// Log is the QoS 1 and 2 message log. Every QoS 1 and 2 publish goes
@@ -98,8 +101,8 @@ type clusterNode struct {
 	qos2Mu sync.Mutex
 	qos2In map[string]map[uint16]string
 
-	// persistQoS2 is the seam where Task 9 writes a pending QoS 2 entry
-	// into the session record before the append. Nil: memory only.
+	// persistQoS2 writes a pending QoS 2 entry into the session's record
+	// before the append (persistQoS2In). Nil: memory only (tests).
 	persistQoS2 func(tenantID, rawID string, packetID uint16, msgID string) error
 
 	// Timings, defaults in clusterlog.go; tests shorten them before Start.
@@ -109,6 +112,35 @@ type clusterNode struct {
 	// Counters for tests: appends committed (client and host publishes),
 	// acks written, log messages injected, readers restarted.
 	appends, acks, logDelivered, readerRestarts atomic.Uint64
+
+	// holdAppend, when a test sets it before Start, runs before every
+	// append of a client publish and may block until ctx ends.
+	holdAppend func(ctx context.Context)
+
+	// The session side (clustersession.go, cursor.go). mochi is the server,
+	// kept after detach so the sessions that end during Stop can still be
+	// evicted. sess holds the sessions this node owns, by namespaced client
+	// ID, under sessMu; locks serialises the work on one session. tenants
+	// holds the delivery state of each tenant's log, under tenantsMu.
+	mochi       *mqtt.Server
+	sessMu      sync.Mutex
+	sess        map[string]*session
+	locks       sessionLocks
+	tenantsMu   sync.Mutex
+	tenants     map[string]*tenantTrack
+	writeSlots  chan struct{}
+	maxInflight int
+
+	watchStop            func()
+	flushStop, flushDone chan struct{}
+	// flushInterval is how often changed records are written; tests may
+	// shorten it before Start.
+	flushInterval time.Duration
+
+	// Counters for tests: sessions evicted from mochi, session records
+	// written, sessions lost to another node, Acquire retries after a lost
+	// race, messages sent by replays, replays that went live.
+	evictions, sessionWrites, takeovers, casRetries, replayed, replaysDone atomic.Uint64
 }
 
 // routeRef is one session's reference on a (tenant, filter) route. It is
@@ -140,6 +172,10 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 
 		readers:        make(map[string]*tenantReader),
 		qos2In:         make(map[string]map[uint16]string),
+		sess:           make(map[string]*session),
+		tenants:        make(map[string]*tenantTrack),
+		writeSlots:     make(chan struct{}, sessionWriteSlots),
+		flushInterval:  defaultFlushInterval,
 		readerIdle:     defaultReaderIdle,
 		readerSweep:    defaultReaderSweep,
 		appendAttempt:  defaultAppendAttempt,
@@ -150,6 +186,12 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 	if n.Log == nil {
 		n.Log = cluster.NewLog(c.Conn, c.Config)
 	}
+
+	if n.Sessions == nil {
+		n.Sessions = cluster.NewSessions(c.Conn, c.Config)
+	}
+
+	n.persistQoS2 = n.persistQoS2In
 
 	if n.Router == nil {
 		n.Router = cluster.NewRouter(c.Conn, c.Config.NodeID, deliver)
@@ -166,6 +208,9 @@ func (n *clusterNode) attach(srv *mqtt.Server) {
 	inj := srv.NewClient(nil, mqtt.LocalListener, injectorID, true)
 	inj.Properties.ProtocolVersion = 5
 	n.injector.Store(inj)
+
+	n.mochi = srv
+	n.maxInflight = int(srv.Options.Capabilities.MaximumInflight)
 
 	n.gate.Lock()
 	n.srv = srv
@@ -214,7 +259,10 @@ var errNotInjecting = fmt.Errorf("tether/broker: inject: %w: broker not running"
 // origin, when not empty, is the namespaced client ID of the publisher, which
 // OnPublish makes the packet's origin so a No Local subscription of that
 // client skips it.
-func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props, origin string) error {
+//
+// seq, when not zero, is the message's log sequence, tagged on the packet
+// (tagSeq) so the copies mochi makes for each subscriber carry it.
+func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props, origin string, seq uint64) error {
 	n := b.cluster
 
 	n.gate.RLock()
@@ -240,6 +288,10 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 	// publisher's ID rides in a field a PUBLISH never uses and OnPublish
 	// moves it over (injectedOrigin).
 	pk.Connect.ClientIdentifier = origin
+
+	if seq > 0 {
+		tagSeq(&pk, seq)
+	}
 
 	if err := n.srv.InjectPacket(n.injector.Load(), pk); err != nil {
 		return fmt.Errorf("tether/broker: inject: %w", err)
@@ -268,7 +320,7 @@ func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props clus
 		return
 	}
 
-	if err := b.inject(tenantID, name, payload, 0, props, ""); err != nil && !errors.Is(err, errNotInjecting) {
+	if err := b.inject(tenantID, name, payload, 0, props, "", 0); err != nil && !errors.Is(err, errNotInjecting) {
 		b.cluster.log.Warn("tether: routed message not injected", slog.String("tenant", tenantID), slog.String("topic", name), slog.Any("error", err))
 	}
 }

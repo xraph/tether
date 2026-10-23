@@ -1,0 +1,1469 @@
+package broker
+
+import (
+	"cmp"
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/packets"
+
+	"github.com/xraph/tether"
+	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/subject"
+	"github.com/xraph/tether/topic"
+)
+
+// Sessions in cluster mode (spec "Persistent sessions and cursors" and
+// "Ownership, takeover and liveness"; spike 1 answers 1 and 2).
+//
+// Every CONNECT takes its session key in the cell's session bucket by
+// compare-and-set (Sessions.AcquireWith) before its CONNACK, so a second
+// CONNECT with the same client ID anywhere in the cell displaces the first.
+// The node that loses a session it was serving hears it from its owned-keys
+// watch, checks the key, and disconnects its connection with 0x8E.
+//
+// A persistent session lives in the key while its client is away; mochi only
+// holds it while it is connected. At CONNECT a node with no local copy builds
+// mochi's offline client from the record, so mochi's takeover finds it and the
+// client gets session present. The session's subscriptions stay out of mochi's
+// topic index while the node replays what the session missed from the log
+// (cursor.go), and go in when the replay meets the tenant's live reader. After
+// DISCONNECT the node writes the record one last time, with the session's
+// expiry as the key's TTL, and evicts the session from mochi.
+
+const (
+	// defaultFlushInterval is how often changed session records are written:
+	// at most once per interval per session.
+	defaultFlushInterval = time.Second
+	// sessionWriteWait bounds one session write that is not on a CONNECT.
+	sessionWriteWait = 5 * time.Second
+	// sessionWriteSlots bounds the session writes one node runs at once.
+	sessionWriteSlots = 64
+	// closedGrace is how long a session whose connection is closed waits for
+	// mochi's OnDisconnect before the sweep ends it (mochi skips the hook when
+	// the CONNACK or the inflight resend cannot be written).
+	closedGrace = 2 * time.Second
+	// connackWait bounds how long a takeover's disconnect waits for the
+	// losing connection's CONNACK to go out first.
+	connackWait = 5 * time.Second
+)
+
+// errSessionLost is what a write of a session another node took returns.
+var errSessionLost = fmt.Errorf("tether/broker: %w: session owned elsewhere", tether.ErrConflict)
+
+// session is one session this node owns: its key's write state, the record
+// it keeps in the bucket and, for a tracked session, its cursor (cursor.go).
+//
+// Fields marked "node" are guarded by clusterNode.sessMu, "w" by wmu (held
+// across the write), the rest by mu. Lock order: tenantTrack.mu, then mu;
+// wmu, then mu. Never mu across a NATS call.
+type session struct {
+	nsID, tenantID, rawID string
+	tt                    *tenantTrack
+
+	// tracked: the session has a cursor, replays and persists (persistent, or
+	// resumed from a persistent record). Set once at CONNECT.
+	tracked bool
+	// expiryCap is the connection's session expiry cap, for the final TTL.
+	expiryCap uint32
+
+	cl      *mqtt.Client // node
+	prevCl  *mqtt.Client // node: the connection cl took the session over from on this node
+	st      *clientState // node
+	lost    bool         // node: another node took the key, or it was deleted
+	deleted bool         // node: lost because the key was deleted
+	ended   bool         // node: the session's end has been handled
+	// deleting is set by DeleteSession on a session it is about to end: no
+	// final write, the delete removes the key.
+	deleting bool // node
+
+	epoch atomic.Uint64
+	rev   uint64 // w
+	// done (w) is set by the session's last write, or its key's delete:
+	// nothing is written after it.
+	done bool
+
+	// connacked is closed once the connection's CONNACK is out, so a
+	// takeover's DISCONNECT never goes first.
+	connacked chan struct{}
+	ackOnce   sync.Once
+
+	wmu sync.Mutex
+	mu  sync.Mutex
+
+	// base carries the record fields the session does not change while it
+	// runs: protocol version, username, device, expiry, will, clean flag.
+	base cluster.SessionRecord
+
+	// Cursor state (cursor.go).
+	mode      int
+	pos       uint64
+	liveFloor uint64
+	flipFloor uint64
+	loaded    map[string]packets.Subscription // namespaced filter: held out of the index while replaying
+	skip      map[uint64]struct{}             // seqs the replay must not send: restored or already sent
+	out       map[uint16]uint64               // outbound QoS 1/2 deliveries in flight: packet ID to seq
+	pinned    bool
+	pin       uint64 // with pinned: the cursor may not pass it
+	qos2Out   map[uint16]cluster.OutRecord
+	qos2Done  map[uint64]struct{}
+	recvMax   int
+	closedAt  time.Time
+
+	gen, savedGen uint64
+	savedCursor   uint64
+
+	// restored counts the QoS 2 deliveries loadSession put in the offline
+	// client, which mochi resends after the CONNACK (mayResend).
+	restored int
+
+	// finalSubs are the subscriptions read just before an eviction, for
+	// the last record.
+	finalSubs    []cluster.SubRecord
+	hasFinalSubs bool
+
+	replayCancel context.CancelFunc
+	replayDone   chan struct{}
+}
+
+// touch marks the session's record as changed.
+func (s *session) touch() {
+	s.mu.Lock()
+	s.gen++
+	s.mu.Unlock()
+}
+
+// markConnacked closes connacked. Safe to call more than once.
+func (s *session) markConnacked() {
+	s.ackOnce.Do(func() { close(s.connacked) })
+}
+
+// sessionLocks is a lock per namespaced client ID that serialises what a
+// node does to one session: a CONNECT from its key acquire to the end of
+// OnSessionEstablish, a session's end at disconnect, a takeover check and a
+// delete. It is held across NATS calls, never across the registry lock.
+type sessionLocks struct {
+	mu sync.Mutex
+	m  map[string]*sessionLock
+}
+
+type sessionLock struct {
+	token chan struct{}
+	refs  int
+}
+
+// lock takes nsID's lock and returns its release, which is safe to call more
+// than once.
+func (l *sessionLocks) lock(nsID string) func() {
+	l.mu.Lock()
+
+	if l.m == nil {
+		l.m = make(map[string]*sessionLock)
+	}
+
+	e := l.m[nsID]
+	if e == nil {
+		e = &sessionLock{token: make(chan struct{}, 1)}
+		l.m[nsID] = e
+	}
+
+	e.refs++
+	l.mu.Unlock()
+
+	e.token <- struct{}{}
+
+	var once sync.Once
+
+	return func() {
+		once.Do(func() {
+			<-e.token
+
+			l.mu.Lock()
+			e.refs--
+
+			if e.refs == 0 {
+				delete(l.m, nsID)
+			}
+
+			l.mu.Unlock()
+		})
+	}
+}
+
+// sessionOf returns the session cl serves, nil when cl serves none on this
+// node (a connection that was taken over, or one of no session).
+func (n *clusterNode) sessionOf(cl *mqtt.Client) *session {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+
+	if s := n.sess[cl.ID]; s != nil && s.cl == cl && !s.ended {
+		return s
+	}
+
+	return nil
+}
+
+// deliveriesOf returns the tracked session whose deliveries cl carries: its
+// connection, or the one it was handed over from on this node (mochi clones
+// that one's inflight messages into the new connection). Unlike sessionOf it
+// still answers while the session ends, until its cursor is frozen.
+func (n *clusterNode) deliveriesOf(cl *mqtt.Client) *session {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+
+	if s := n.sess[cl.ID]; s != nil && s.tracked && (s.cl == cl || s.prevCl == cl) {
+		return s
+	}
+
+	return nil
+}
+
+// sessionByID returns the session this node owns under nsID, or nil.
+func (n *clusterNode) sessionByID(nsID string) *session {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+
+	return n.sess[nsID]
+}
+
+// client returns the connection serving s.
+func (n *clusterNode) client(s *session) *mqtt.Client {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+
+	return s.cl
+}
+
+// isLost reports whether s was taken over or deleted.
+func (n *clusterNode) isLost(s *session) bool {
+	n.sessMu.Lock()
+	defer n.sessMu.Unlock()
+
+	return s.lost
+}
+
+// acquireSession takes cl's session key for this node, at the end of
+// OnConnectAuthenticate, and prepares what mochi will find when it looks the
+// session up: the offline client of a session resumed from the cell, or the
+// local session it is taking over. It holds the session's lock and leaves it
+// to OnSessionEstablish (st.sessUnlock). It reports false, with the lock
+// released, when the CONNECT must be refused (0x88).
+func (b *Broker) acquireSession(cl *mqtt.Client, st *clientState, log *slog.Logger) bool {
+	n := b.cluster
+	nsID := namespacedID(st.tenantID, st.rawID)
+	unlock := n.locks.lock(nsID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+
+	s, err := b.establish(ctx, cl, st, nsID)
+	if err != nil {
+		unlock()
+		log.Info("tether: session not acquired", slog.Any("error", err))
+
+		return false
+	}
+
+	st.sess = s
+	st.sessUnlock = unlock
+
+	return true
+}
+
+// establish is acquireSession under the session's lock.
+func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState, nsID string) (*session, error) {
+	n := b.cluster
+	srv := n.mochi
+	tt := n.track(st.tenantID)
+
+	resume := !cl.Properties.Clean
+	persistent := st.sessionExpiry > 0
+
+	n.sessMu.Lock()
+	old := n.sess[nsID]
+	n.sessMu.Unlock()
+
+	local, hasLocal := srv.Clients.Get(nsID)
+
+	// A live session of this node that the connection resumes: mochi hands it
+	// over itself (inheritClientSession), cursor and all.
+	handover := resume && old != nil && !old.lost && !old.ended && hasLocal && local == old.cl
+
+	switch {
+	case handover || !hasLocal:
+	case local.Closed():
+		// A session mochi still holds for a connection that is gone, and
+		// that is not this node's to hand over: forget it, so mochi does not
+		// give its stale state to this connection.
+		b.evictLocal(srv, local)
+	case old != nil && local == old.cl && old.lost:
+		// The connection of a session another node took, still being
+		// disconnected: its state goes now, and the session comes from the
+		// cell. mochi then finds the offline client instead of it.
+		b.evictLocal(srv, local)
+	}
+
+	will := willRecord(cl)
+	livePos := tt.livePos.Load()
+
+	var (
+		rec, prev *cluster.SessionRecord
+		rev       uint64
+		err       error
+	)
+
+	build := func(p *cluster.SessionRecord) *cluster.SessionRecord {
+		r := &cluster.SessionRecord{
+			Clean:           cl.Properties.Clean,
+			ProtocolVersion: cl.Properties.ProtocolVersion,
+			Username:        st.username,
+			DeviceID:        st.ident.Load().DeviceID,
+			ExpirySeconds:   st.sessionExpiry,
+			Will:            will,
+			Cursor:          livePos,
+		}
+
+		if resume && p != nil && (p.ExpirySeconds > 0 || handover) {
+			r.Subscriptions = p.Subscriptions
+			r.Cursor = p.Cursor
+			r.QoS2In = p.QoS2In
+			r.QoS2Out = p.QoS2Out
+			r.QoS2Done = p.QoS2Done
+		}
+
+		return r
+	}
+
+	if handover {
+		old.wmu.Lock()
+	}
+
+	for attempt := range 2 {
+		rec, prev, rev, err = n.Sessions.AcquireWith(ctx, st.tenantID, st.rawID, n.Config.NodeID, build)
+		if err == nil || !errors.Is(err, cluster.ErrLostCAS) {
+			break
+		}
+
+		if attempt == 0 {
+			n.casRetries.Add(1)
+		}
+	}
+
+	if err != nil {
+		if handover {
+			old.wmu.Unlock()
+		}
+
+		return nil, fmt.Errorf("tether/broker: acquire session: %w", err)
+	}
+
+	if handover {
+		old.rev = rev
+		old.epoch.Store(rec.Epoch)
+		old.wmu.Unlock()
+
+		b.handOver(old, cl, st, persistent, rec)
+
+		return old, nil
+	}
+
+	if old != nil {
+		// The session this node served under the ID is over here (lost, or
+		// replaced by a clean start): its replay stops and its QoS 0 routes
+		// go; a resumed session takes its own below.
+		b.retire(old)
+		n.releaseAll(nsID, st.tenantID)
+	}
+
+	s := &session{
+		nsID: nsID, tenantID: st.tenantID, rawID: st.rawID, tt: tt,
+		expiryCap: st.expiryCap,
+		cl:        cl, st: st,
+		connacked: make(chan struct{}),
+		rev:       rev,
+		base:      *rec,
+		out:       make(map[uint16]uint64),
+		qos2Out:   make(map[uint16]cluster.OutRecord),
+		qos2Done:  make(map[uint64]struct{}),
+		mode:      modeLive,
+		pos:       livePos,
+		liveFloor: livePos,
+		recvMax:   int(cl.Properties.Props.ReceiveMaximum),
+	}
+	s.epoch.Store(rec.Epoch)
+
+	resumed := resume && prev != nil && prev.ExpirySeconds > 0
+	s.tracked = persistent || resumed
+
+	if resumed {
+		if err := b.loadSession(ctx, s, cl, st, prev); err != nil {
+			return nil, err
+		}
+	}
+
+	n.sessMu.Lock()
+	n.sess[nsID] = s
+	n.sessMu.Unlock()
+
+	if s.tracked {
+		tt.mu.Lock()
+		tt.sessions[s] = struct{}{}
+		tt.mu.Unlock()
+	}
+
+	return s, nil
+}
+
+// handOver gives s, a session this node serves on another connection, to
+// the connection cl that takes it over here; mochi moves its subscriptions
+// and inflight messages when it runs inheritClientSession.
+func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persistent bool, rec *cluster.SessionRecord) {
+	n := b.cluster
+
+	s.mu.Lock()
+
+	prevCl := s.cl
+
+	s.base = *rec
+	s.base.Subscriptions, s.base.QoS2In, s.base.QoS2Out, s.base.QoS2Done = nil, nil, nil, nil
+	s.recvMax = int(cl.Properties.Props.ReceiveMaximum)
+	s.expiryCap = st.expiryCap
+	wasTracked := s.tracked
+	s.gen++
+	s.mu.Unlock()
+
+	if !wasTracked && persistent {
+		// A clean session becomes a persistent one: it has no cursor yet. It
+		// starts at the live position, and what the old connection has in
+		// flight from the log keeps it below those messages.
+		lp := s.tt.livePos.Load()
+
+		s.mu.Lock()
+		s.tracked = true
+		s.mode, s.pos, s.liveFloor = modeLive, lp, lp
+
+		for _, pk := range prevCl.State.Inflight.GetAll(false) {
+			if seq, ok := seqOf(pk); ok && pk.FixedHeader.Type == packets.Publish {
+				s.out[pk.PacketID] = seq
+			}
+		}
+
+		s.mu.Unlock()
+
+		s.tt.mu.Lock()
+		s.tt.sessions[s] = struct{}{}
+		s.tt.mu.Unlock()
+	}
+
+	// A replay running for the old connection stops; OnSessionEstablished
+	// starts it again for this one.
+	n.stopReplay(s)
+
+	n.sessMu.Lock()
+	s.prevCl = prevCl
+	s.cl, s.st = cl, st
+	s.connacked = make(chan struct{})
+	s.ackOnce = sync.Once{}
+	s.closedAt = time.Time{}
+	n.sessMu.Unlock()
+}
+
+// loadSession prepares a session resumed from the cell for mochi: the
+// subscriptions the connection's grants still allow (held out of mochi's
+// topic index until the replay is done), the QoS 2 deliveries in flight as an
+// offline client's inflight messages, and the QoS 2 pending entries of the
+// client's own publishes.
+func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, st *clientState, prev *cluster.SessionRecord) error {
+	n := b.cluster
+
+	s.mode = modeReplay
+	s.pos = prev.Cursor
+	s.liveFloor = prev.Cursor
+	s.flipFloor = prev.Cursor
+	s.loaded = make(map[string]packets.Subscription, len(prev.Subscriptions))
+	s.skip = make(map[uint64]struct{})
+
+	for _, sr := range prev.Subscriptions {
+		ns := topic.Namespace(s.tenantID, sr.Filter)
+		if !b.canRead(s.tenantID, st.acl(), ns) {
+			continue
+		}
+
+		s.loaded[ns] = packets.Subscription{
+			Filter: ns, Qos: sr.QoS, NoLocal: sr.NoLocal, RetainAsPublished: sr.RetainAsPublished,
+			RetainHandling: sr.RetainHandling, Identifier: sr.Identifier,
+		}
+	}
+
+	for _, seq := range prev.QoS2Done {
+		if seq > prev.Cursor {
+			s.qos2Done[seq] = struct{}{}
+			s.skip[seq] = struct{}{}
+			s.flipFloor = max(s.flipFloor, seq)
+		}
+	}
+
+	var inflight []packets.Packet
+
+	ids := make([]uint16, 0, len(prev.QoS2Out))
+	for id := range prev.QoS2Out {
+		ids = append(ids, id)
+	}
+
+	slices.SortFunc(ids, func(a, c uint16) int { return cmp.Compare(prev.QoS2Out[a].Seq, prev.QoS2Out[c].Seq) })
+
+	now := time.Now().Unix()
+
+	for i, id := range ids {
+		or := prev.QoS2Out[id]
+		if or.Seq <= prev.Cursor {
+			continue
+		}
+
+		var pk packets.Packet
+
+		switch or.State {
+		case outPubrel:
+			pk = packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id}
+		default:
+			m, ok, err := b.fetchLog(ctx, s.tenantID, or.Seq)
+			if err != nil {
+				return err
+			}
+
+			if !ok {
+				// Gone from the log: nothing left to send.
+				continue
+			}
+
+			pk = packets.Packet{
+				FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 2},
+				PacketID:    id,
+				TopicName:   topic.Namespace(s.tenantID, m.Topic),
+				Payload:     m.Payload,
+				Properties:  packetProps(m.Props),
+			}
+			if m.ClientID != "" {
+				pk.Origin = namespacedID(m.Tenant, m.ClientID)
+			}
+		}
+
+		// mochi resends in the order of Created.
+		pk.Created = now - int64(len(ids)) + int64(i)
+		tagSeq(&pk, or.Seq)
+
+		s.qos2Out[id] = or
+		s.out[id] = or.Seq
+		s.skip[or.Seq] = struct{}{}
+		s.flipFloor = max(s.flipFloor, or.Seq)
+
+		inflight = append(inflight, pk)
+		s.restored++
+	}
+
+	b.materialize(n.mochi, cl, s.nsID, prev, inflight)
+
+	// The QoS 2 pending entries of the client's own publishes.
+	if len(prev.QoS2In) > 0 {
+		n.qos2Mu.Lock()
+		set := make(map[uint16]string, len(prev.QoS2In))
+
+		for id, msgID := range prev.QoS2In {
+			set[id] = msgID
+		}
+
+		n.qos2In[s.nsID] = set
+		n.qos2Mu.Unlock()
+	}
+
+	// QoS 0 from other nodes for the loaded filters; until the replay is done
+	// the session is not in the index, so it gets none of it (QoS 0 may be
+	// dropped).
+	for ns := range s.loaded {
+		if rel, ok := routedFilter(s.tenantID, ns); ok {
+			if err := n.subscribe(s.nsID, s.tenantID, rel); err != nil {
+				n.routeErrors.Add(1)
+				n.log.Warn("tether: route of a resumed subscription failed", slog.String("client", s.nsID),
+					slog.String("filter", rel), slog.Any("error", err))
+			}
+		}
+	}
+
+	return nil
+}
+
+// fetchLog reads the log message seq of tenantID, false when the log no
+// longer has it.
+func (b *Broker) fetchLog(ctx context.Context, tenantID string, seq uint64) (cluster.LogMessage, bool, error) {
+	var (
+		got   cluster.LogMessage
+		found bool
+	)
+
+	err := b.cluster.Log.Replay(ctx, tenantID, seq, seq, func(m cluster.LogMessage) error {
+		got, found = m, true
+
+		return nil
+	})
+	if err != nil {
+		return cluster.LogMessage{}, false, fmt.Errorf("tether/broker: read log message %d: %w", seq, err)
+	}
+
+	return got, found, nil
+}
+
+// materialize builds the offline mochi client of a session resumed from the
+// cell, the way mochi's loadClients restores one (spike 1): closed, with the
+// session's expiry and the QoS 2 deliveries in flight. inheritClientSession
+// takes it over right after OnSessionEstablish, and the CONNACK says session
+// present. Its subscriptions are not on it: they wait in session.loaded.
+func (b *Broker) materialize(srv *mqtt.Server, cl *mqtt.Client, nsID string, prev *cluster.SessionRecord, inflight []packets.Packet) {
+	off := srv.NewClient(nil, cl.Net.Listener, nsID, false)
+	off.Properties.ProtocolVersion = cl.Properties.ProtocolVersion
+	off.Properties.Clean = false
+	off.Properties.Props.SessionExpiryInterval = prev.ExpirySeconds
+	off.Properties.Props.SessionExpiryIntervalFlag = true
+
+	for _, pk := range inflight {
+		if off.State.Inflight.Set(pk) {
+			atomic.AddInt64(&srv.Info.Inflight, 1)
+		}
+	}
+
+	off.Stop(packets.ErrServerShuttingDown)
+	srv.Clients.Add(off)
+}
+
+// retire forgets old, a session this node no longer serves under its ID
+// (lost, ended, or replaced by a clean start).
+func (b *Broker) retire(old *session) {
+	n := b.cluster
+
+	n.stopReplay(old)
+
+	old.tt.mu.Lock()
+	delete(old.tt.sessions, old)
+	delete(old.tt.waiting, old)
+	old.tt.mu.Unlock()
+
+	old.tt.fullMu.Lock()
+	delete(old.tt.full, old)
+	old.tt.fullMu.Unlock()
+}
+
+// willRecord is the will of cl's CONNECT as the record keeps it, with its
+// tenant-relative topic, or nil.
+func willRecord(cl *mqtt.Client) *cluster.WillRecord {
+	w := &cl.Properties.Will
+	if atomic.LoadUint32(&w.Flag) != 1 {
+		return nil
+	}
+
+	wr := &cluster.WillRecord{
+		Topic:        w.TopicName,
+		Payload:      w.Payload,
+		QoS:          w.Qos,
+		Retain:       w.Retain,
+		DelaySeconds: w.WillDelayInterval,
+	}
+
+	if len(w.User) > 0 {
+		wr.Props.User = make([]cluster.UserProperty, len(w.User))
+		for i, u := range w.User {
+			wr.Props.User[i] = cluster.UserProperty{Key: u.Key, Value: u.Val}
+		}
+	}
+
+	return wr
+}
+
+// established runs in OnSessionEstablished, after mochi took the session
+// over and wrote the CONNACK: a connection that is no longer the owner of
+// its ID (a concurrent CONNECT on this node took it in between) or whose
+// session another node took meanwhile is disconnected with 0x8E; otherwise a
+// session that has a replay to do starts it.
+func (b *Broker) established(cl *mqtt.Client, st *clientState) {
+	n := b.cluster
+
+	s := st.sess
+	if s == nil {
+		return
+	}
+
+	s.markConnacked()
+
+	if b.state.owner(cl.ID) != st {
+		n.log.Info("tether: connection lost its client ID to a concurrent connect", slog.String("client", cl.ID))
+		disconnect(n.mochi, b.log, cl, packets.ErrSessionTakenOver)
+
+		return
+	}
+
+	n.sessMu.Lock()
+	lost, mine := s.lost, s.cl == cl
+	n.sessMu.Unlock()
+
+	if !mine {
+		return
+	}
+
+	if lost {
+		disconnect(n.mochi, b.log, cl, packets.ErrSessionTakenOver)
+
+		return
+	}
+
+	s.mu.Lock()
+	replaying := s.tracked && s.mode != modeLive
+	s.mu.Unlock()
+
+	if replaying {
+		b.startReplay(s, cl)
+	}
+}
+
+// endSession runs in lastHook.OnDisconnect for a network client in cluster
+// mode, after its state is removed. If cl serves its session on this node,
+// the session ends here: a clean one deletes its key; a persistent one is
+// evicted from mochi and its record written one last time with its expiry as
+// the key's TTL; one that another node took (or that is being deleted) is
+// evicted with nothing written.
+func (b *Broker) endSession(cl *mqtt.Client, expire bool) {
+	n := b.cluster
+
+	unlock := n.locks.lock(cl.ID)
+	defer unlock()
+
+	n.sessMu.Lock()
+	s := n.sess[cl.ID]
+	mine := s != nil && s.cl == cl && !s.ended
+	n.sessMu.Unlock()
+
+	if mine {
+		b.finish(s, cl, expire)
+	}
+}
+
+// finish ends s, whose connection cl has ended. The caller holds s's lock.
+//
+// The session keeps recording what is delivered to it until its cursor is
+// frozen and it is out of mochi's index, both under the tenant's lock, so a
+// message injected meanwhile either holds the cursor below it or does not
+// reach the session at all. Only then is it taken out of the node's
+// sessions.
+func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
+	n := b.cluster
+	srv := n.mochi
+
+	n.stopReplay(s)
+
+	// mochi's clients are keyed by ID: never evict a connection that took
+	// the session over. A clean session mochi removes itself.
+	got, ok := srv.Clients.Get(cl.ID)
+	evict := !expire && ok && got == cl && !cl.IsTakenOver()
+
+	s.tt.mu.Lock()
+
+	if evict {
+		subs := n.subRecords(s, cl)
+
+		s.mu.Lock()
+		s.finalSubs, s.hasFinalSubs = subs, true
+		s.mu.Unlock()
+
+		evictSession(srv, cl)
+		n.evictions.Add(1)
+	}
+
+	s.freeze()
+	delete(s.tt.sessions, s)
+	delete(s.tt.waiting, s)
+	s.tt.mu.Unlock()
+
+	b.retire(s)
+
+	n.sessMu.Lock()
+	s.ended = true
+
+	if n.sess[s.nsID] == s {
+		delete(n.sess, s.nsID)
+	}
+
+	lost, deleting := s.lost, s.deleting
+	n.sessMu.Unlock()
+
+	held := ok && got == cl && !cl.IsTakenOver()
+	if held {
+		// The session's QoS 0 routes go with it, those of subscriptions a
+		// replay still held out of the index included. (mochi's own
+		// unsubscribe of a clean session releases nothing twice.) Its QoS 2
+		// pending entries go once the last record has them.
+		n.releaseAll(s.nsID, s.tenantID)
+		defer n.dropQoS2(s.nsID)
+	}
+
+	switch {
+	case lost, deleting:
+		return
+	case expire || !s.tracked:
+		go b.deleteKey(s)
+	default:
+		ttl := time.Duration(sessionExpiry(cl, s.expiryCap)) * time.Second
+		if ttl <= 0 {
+			go b.deleteKey(s)
+
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+		defer cancel()
+
+		if err := n.persist(ctx, s, ttl); err != nil && !errors.Is(err, errSessionLost) {
+			n.log.Warn("tether: final session write failed; the next owner replays from the last cursor written",
+				slog.String("client", s.nsID), slog.Any("error", err))
+		}
+	}
+}
+
+// deleteKey deletes s's key at the revision this node last wrote. A lost
+// race means someone else holds the key now, which is fine.
+func (b *Broker) deleteKey(s *session) {
+	n := b.cluster
+
+	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+	defer cancel()
+
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+
+	s.done = true
+
+	err := n.Sessions.Delete(ctx, s.tenantID, s.rawID, s.rev)
+	if err != nil && !errors.Is(err, cluster.ErrLostCAS) {
+		n.log.Warn("tether: session key not deleted", slog.String("client", s.nsID), slog.Any("error", err))
+	}
+}
+
+// evictLocal evicts a closed client's leftover session from mochi.
+func (b *Broker) evictLocal(srv *mqtt.Server, cl *mqtt.Client) {
+	if got, ok := srv.Clients.Get(cl.ID); !ok || got != cl || cl.IsTakenOver() || cl.Net.Inline {
+		return
+	}
+
+	if tenantID, ok := tenantOfID(cl.ID); ok {
+		if tt := b.cluster.trackIfAny(tenantID); tt != nil {
+			tt.mu.Lock()
+			evictSession(srv, cl)
+			tt.mu.Unlock()
+		} else {
+			evictSession(srv, cl)
+		}
+
+		b.cluster.releaseAll(cl.ID, tenantID)
+	} else {
+		evictSession(srv, cl)
+	}
+
+	b.cluster.evictions.Add(1)
+}
+
+// evictSession removes cl's session from mochi's memory without the hook
+// events an UNSUBSCRIBE or a session expiry would fire (spike 1: never
+// UnsubscribeClient or ClearInflights). The caller has checked that cl still
+// owns its ID.
+func evictSession(srv *mqtt.Server, cl *mqtt.Client) {
+	for filter := range cl.State.Subscriptions.GetAll() {
+		if srv.Topics.Unsubscribe(filter, cl.ID) {
+			atomic.AddInt64(&srv.Info.Subscriptions, -1)
+		}
+
+		cl.State.Subscriptions.Delete(filter)
+	}
+
+	for _, pk := range cl.State.Inflight.GetAll(false) {
+		if cl.State.Inflight.Delete(pk.PacketID) {
+			atomic.AddInt64(&srv.Info.Inflight, -1)
+		}
+	}
+
+	srv.Clients.Delete(cl.ID)
+}
+
+// snapshot is the record s should have now. final makes it the record of a
+// session whose client is away: no owner, no will, disconnected now.
+func (n *clusterNode) snapshot(s *session, cl *mqtt.Client, final bool) (rec *cluster.SessionRecord, gen uint64) {
+	subs := n.subRecords(s, cl)
+	lp := s.tt.livePos.Load()
+
+	s.mu.Lock()
+
+	if s.hasFinalSubs {
+		subs = s.finalSubs
+	}
+
+	base := s.base
+	rec = &base
+	rec.Owner = n.Config.NodeID
+	rec.Epoch = s.epoch.Load()
+	rec.Subscriptions = subs
+
+	if s.tracked {
+		rec.Cursor = s.cursorLocked(lp)
+	}
+
+	if len(s.qos2Out) > 0 {
+		rec.QoS2Out = make(map[uint16]cluster.OutRecord, len(s.qos2Out))
+		for id, or := range s.qos2Out {
+			rec.QoS2Out[id] = or
+		}
+	} else {
+		rec.QoS2Out = nil
+	}
+
+	rec.QoS2Done = nil
+
+	for seq := range s.qos2Done {
+		if seq <= rec.Cursor {
+			delete(s.qos2Done, seq)
+
+			continue
+		}
+
+		rec.QoS2Done = append(rec.QoS2Done, seq)
+	}
+
+	slices.Sort(rec.QoS2Done)
+
+	gen = s.gen
+	s.mu.Unlock()
+
+	rec.QoS2In = nil
+	if in := n.qos2Entries(s.nsID); len(in) > 0 {
+		rec.QoS2In = in
+	}
+
+	if final {
+		rec.Owner = ""
+		rec.Will = nil
+		rec.DisconnectedAt = time.Now().UTC()
+		rec.ExpirySeconds = sessionExpiry(cl, s.expiryCap)
+	}
+
+	return rec, gen
+}
+
+// subRecords lists s's subscriptions as the record keeps them: the
+// connection's and those still held out of the index, tenant-relative,
+// sorted by filter.
+func (n *clusterNode) subRecords(s *session, cl *mqtt.Client) []cluster.SubRecord {
+	all := cl.State.Subscriptions.GetAll()
+
+	s.mu.Lock()
+	for f, sub := range s.loaded {
+		if _, ok := all[f]; !ok {
+			all[f] = sub
+		}
+	}
+	s.mu.Unlock()
+
+	out := make([]cluster.SubRecord, 0, len(all))
+
+	for f, sub := range all {
+		rel, ok := topic.Strip(s.tenantID, f)
+		if !ok {
+			continue
+		}
+
+		out = append(out, cluster.SubRecord{
+			Filter: rel, QoS: sub.Qos, NoLocal: sub.NoLocal, RetainAsPublished: sub.RetainAsPublished,
+			RetainHandling: sub.RetainHandling, Identifier: sub.Identifier,
+		})
+	}
+
+	slices.SortFunc(out, func(a, c cluster.SubRecord) int { return strings.Compare(a.Filter, c.Filter) })
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// persist writes s's record as a compare-and-set on the revision this node
+// last wrote, with ttl as the key's expiry when it is not zero (the final
+// write of a session whose client is away). A lost race marks s lost and
+// disconnects its connection.
+func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration) error {
+	select {
+	case n.writeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("tether/broker: session write: %w", ctx.Err())
+	}
+
+	defer func() { <-n.writeSlots }()
+
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+
+	if n.isLost(s) {
+		return errSessionLost
+	}
+
+	if s.done {
+		// A flush that raced the session's end: the last record is in.
+		return nil
+	}
+
+	cl := n.client(s)
+	rec, gen := n.snapshot(s, cl, ttl > 0)
+
+	var (
+		rev uint64
+		err error
+	)
+
+	if ttl > 0 {
+		rev, err = n.Sessions.Expire(ctx, s.tenantID, s.rawID, s.rev, rec, ttl)
+	} else {
+		rev, err = n.Sessions.Update(ctx, s.tenantID, s.rawID, s.rev, rec)
+	}
+
+	if err != nil {
+		if errors.Is(err, cluster.ErrLostCAS) {
+			n.lose(s, false)
+
+			return errSessionLost
+		}
+
+		return fmt.Errorf("tether/broker: session write: %w", err)
+	}
+
+	n.sessionWrites.Add(1)
+	s.rev = rev
+	s.done = ttl > 0
+
+	s.mu.Lock()
+	s.savedGen = gen
+	s.savedCursor = rec.Cursor
+	s.mu.Unlock()
+
+	return nil
+}
+
+// lose marks s lost and disconnects its connection: 0x8E when another node
+// took it, 0x98 when its key was deleted. The disconnect waits for the
+// connection's CONNACK, so the DISCONNECT never comes first.
+func (n *clusterNode) lose(s *session, deleted bool) {
+	n.sessMu.Lock()
+
+	if s.lost || s.ended {
+		n.sessMu.Unlock()
+
+		return
+	}
+
+	s.lost, s.deleted = true, deleted
+	cl, acked := s.cl, s.connacked
+	n.sessMu.Unlock()
+
+	n.takeovers.Add(1)
+
+	code := packets.ErrSessionTakenOver
+	if deleted {
+		code = packets.ErrAdministrativeAction
+	}
+
+	n.log.Info("tether: session moved off this node, disconnecting", slog.String("client", s.nsID), slog.Bool("deleted", deleted))
+
+	go func() {
+		timer := time.NewTimer(connackWait)
+		defer timer.Stop()
+
+		select {
+		case <-acked:
+		case <-timer.C:
+		}
+
+		if !cl.Closed() {
+			disconnect(n.mochi, n.log, cl, code)
+		}
+	}()
+}
+
+// onOwnedLost is the owned-keys watch's callback: another node took the key
+// of a session this node owned, or the key went. The watch can report a
+// claim this node has already replaced, so the key is read again, under the
+// session's lock, before anything is dropped.
+func (n *clusterNode) onOwnedLost(tenantID, clientID string, _ *cluster.SessionRecord, _ bool) {
+	if !validTenant(tenantID) {
+		return
+	}
+
+	nsID := namespacedID(tenantID, clientID)
+	if n.sessionByID(nsID) == nil {
+		return
+	}
+
+	go n.verifyOwner(nsID, tenantID, clientID)
+}
+
+// verifyOwner reads the key of a session the watch says this node lost and
+// marks it lost unless the record still names this node at the epoch the
+// session holds.
+func (n *clusterNode) verifyOwner(nsID, tenantID, clientID string) {
+	unlock := n.locks.lock(nsID)
+
+	s := n.sessionByID(nsID)
+	if s == nil {
+		unlock()
+
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+	rec, _, err := n.Sessions.Get(ctx, tenantID, clientID)
+
+	cancel()
+
+	var deleted bool
+
+	switch {
+	case err == nil && rec.Owner == n.Config.NodeID && rec.Epoch == s.epoch.Load():
+		unlock()
+
+		return
+	case err == nil:
+	case errors.Is(err, tether.ErrNotFound):
+		deleted = true
+	default:
+		unlock()
+		n.log.Warn("tether: could not check a session the watch reported lost", slog.String("client", nsID), slog.Any("error", err))
+
+		return
+	}
+
+	unlock()
+	n.lose(s, deleted)
+}
+
+// startSessions starts the owned-keys watch and the flusher. Called once,
+// from Start.
+func (b *Broker) startSessions() error {
+	n := b.cluster
+
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+
+	stop, err := n.Sessions.WatchOwned(ctx, n.Config.NodeID, n.onOwnedLost)
+	if err != nil {
+		return fmt.Errorf("tether/broker: watch owned sessions: %w", err)
+	}
+
+	n.watchStop = stop
+	n.flushStop, n.flushDone = make(chan struct{}), make(chan struct{})
+
+	go b.runFlusher(n.flushStop, n.flushDone)
+
+	return nil
+}
+
+// stopSessions stops the flusher and the watch. Called from Stop, after the
+// clients are gone.
+func (b *Broker) stopSessions() {
+	n := b.cluster
+
+	if n.flushStop != nil {
+		close(n.flushStop)
+		<-n.flushDone
+		n.flushStop = nil
+	}
+
+	if n.watchStop != nil {
+		n.watchStop()
+		n.watchStop = nil
+	}
+}
+
+// runFlusher writes the changed records of the node's tracked sessions every
+// flushInterval, in parallel up to sessionWriteSlots, and ends the sessions
+// whose connection mochi closed without an OnDisconnect.
+func (b *Broker) runFlusher(stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+
+	tick := time.NewTicker(b.cluster.flushInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-tick.C:
+			b.flush()
+		}
+	}
+}
+
+// flush is one round of runFlusher.
+func (b *Broker) flush() {
+	n := b.cluster
+	now := time.Now()
+
+	n.sessMu.Lock()
+
+	var (
+		dirty  []*session
+		closed []*mqtt.Client
+	)
+
+	for _, s := range n.sess {
+		if s.ended || s.lost {
+			continue
+		}
+
+		if s.cl.Closed() {
+			if s.closedAt.IsZero() {
+				s.closedAt = now
+			} else if now.Sub(s.closedAt) > closedGrace {
+				closed = append(closed, s.cl)
+			}
+
+			continue
+		}
+
+		if s.tracked {
+			dirty = append(dirty, s)
+		}
+	}
+
+	n.sessMu.Unlock()
+
+	var wg sync.WaitGroup
+
+	for _, s := range dirty {
+		if !n.needsWrite(s) {
+			continue
+		}
+
+		wg.Go(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+			defer cancel()
+
+			if err := n.persist(ctx, s, 0); err != nil && !errors.Is(err, errSessionLost) {
+				n.log.Warn("tether: session write failed", slog.String("client", s.nsID), slog.Any("error", err))
+			}
+		})
+	}
+
+	wg.Wait()
+
+	// mochi ended these without OnDisconnect.
+	for _, cl := range closed {
+		expire := cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0 ||
+			cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean
+		b.endSession(cl, expire)
+	}
+}
+
+// needsWrite reports whether s's record changed since it was last written.
+func (n *clusterNode) needsWrite(s *session) bool {
+	lp := s.tt.livePos.Load()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.gen != s.savedGen || s.cursorLocked(lp) != s.savedCursor
+}
+
+// mayResend runs at the CONNACK of a session resumed from the cell with QoS 2
+// deliveries in flight, right before mochi resends them: the record is
+// written once more, which only works while the key is still this node's. A
+// node that resumed the session later may already have finished those
+// deliveries with the client, and a resend from here would then be a new
+// message to it. False means the key is gone: resend nothing.
+func (n *clusterNode) mayResend(st *clientState) bool {
+	s := st.sess
+	if s == nil || s.restored == 0 {
+		return true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+	defer cancel()
+
+	err := n.persist(ctx, s, 0)
+	if err != nil && !errors.Is(err, errSessionLost) {
+		n.log.Warn("tether: session write before the resend failed, resending nothing", slog.String("client", s.nsID), slog.Any("error", err))
+	}
+
+	return err == nil
+}
+
+// persistQoS2In is clusterNode.persistQoS2 in cluster mode: the pending entry
+// of a QoS 2 publish (already in qos2In) is written to the session's record
+// before the publish is appended, so a resend reaching any node finds its
+// message ID. Sessions without a record to resume keep it in memory only.
+func (n *clusterNode) persistQoS2In(tenantID, rawID string, _ uint16, _ string) error {
+	s := n.sessionByID(namespacedID(tenantID, rawID))
+	if s == nil || !s.tracked {
+		return nil
+	}
+
+	s.touch()
+
+	ctx, cancel := context.WithTimeout(context.Background(), n.appendAttempt)
+	defer cancel()
+
+	return n.persist(ctx, s, 0)
+}
+
+// deleteClusterSession is DeleteSession in cluster mode (ruling R7). A
+// session this node serves is disconnected first and its end writes
+// nothing; then the key is deleted at the revision read, whoever wrote it
+// last, unless another node owns the session now: that is an error naming
+// the owner (the control bus that reaches it comes later).
+func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID string) error {
+	n := b.cluster
+	log := b.log.With(slog.String("client", nsID), slog.String("tenant", tenantID))
+
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+
+	local, hasLocal := srv.Clients.Get(nsID)
+
+	var cl *mqtt.Client
+	if hasLocal {
+		cl = local
+	}
+
+	st, ok := b.state.beginDelete(nsID, cl)
+	if !ok {
+		return deleteConflict(clientID, "another connection or delete for the client ID is in progress")
+	}
+	defer b.state.endDelete(nsID)
+
+	if s := n.sessionByID(nsID); s != nil {
+		n.sessMu.Lock()
+		s.deleting = true
+		live := s.cl
+		n.sessMu.Unlock()
+
+		if !live.Closed() {
+			log.Info("tether: disconnecting client to delete its session")
+			disconnect(srv, b.log, live, packets.ErrAdministrativeAction)
+		}
+
+		if st != nil && !waitEnded(st, b.endWait) && !live.Closed() {
+			return deleteConflict(clientID, "the connection is still open")
+		}
+
+		// mochi skipped OnDisconnect, or it has not run yet: end it here.
+		b.endSession(live, false)
+	}
+
+	if hasLocal {
+		if cur, ok := srv.Clients.Get(nsID); ok && cur == local && local.Closed() {
+			b.evictLocal(srv, local)
+		}
+	}
+
+	rec, rev, err := n.Sessions.Get(ctx, tenantID, clientID)
+	if errors.Is(err, tether.ErrNotFound) {
+		if hasLocal {
+			return nil
+		}
+
+		return noSession(clientID)
+	}
+
+	if err != nil {
+		return fmt.Errorf("tether/broker: delete session %q: %w", clientID, err)
+	}
+
+	if rec.Owner != "" && rec.Owner != n.Config.NodeID {
+		return fmt.Errorf("tether/broker: delete session %q: %w: owned by node %q", clientID, tether.ErrConflict, rec.Owner)
+	}
+
+	if err := n.Sessions.Delete(ctx, tenantID, clientID, rev); err != nil {
+		if errors.Is(err, cluster.ErrLostCAS) {
+			return deleteConflict(clientID, "the session changed while it was being deleted")
+		}
+
+		return fmt.Errorf("tether/broker: delete session %q: %w", clientID, err)
+	}
+
+	n.dropQoS2(nsID)
+	log.Info("tether: session deleted")
+
+	return nil
+}
+
+// clusterClients is Clients in cluster mode: the tenant's sessions in the
+// cell, with this node's open connections described from their state. A
+// session another node serves is listed as connected, without a remote
+// address. If the cell cannot be read, only this node's sessions are listed.
+func (b *Broker) clusterClients(local []ClientInfo, tenantID string) []ClientInfo {
+	n := b.cluster
+
+	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+	defer cancel()
+
+	entries, err := n.Sessions.Entries(ctx, tenantID)
+	if err != nil {
+		n.log.Warn("tether: listing the tenant's sessions in the cell failed", slog.String("tenant", tenantID), slog.Any("error", err))
+
+		return local
+	}
+
+	seen := make(map[string]struct{}, len(local))
+	for _, ci := range local {
+		seen[ci.ClientID] = struct{}{}
+	}
+
+	out := local
+
+	for _, e := range entries {
+		if _, ok := seen[e.ClientID]; ok {
+			continue
+		}
+
+		rec := e.Record
+		subs := make([]string, 0, len(rec.Subscriptions))
+
+		for _, sr := range rec.Subscriptions {
+			subs = append(subs, sr.Filter)
+		}
+
+		slices.Sort(subs)
+
+		out = append(out, ClientInfo{
+			ClientID:        e.ClientID,
+			Username:        rec.Username,
+			DeviceID:        rec.DeviceID,
+			Connected:       rec.Owner != "",
+			ProtocolVersion: rec.ProtocolVersion,
+			Subscriptions:   subs,
+			SessionExpiry:   rec.ExpirySeconds,
+		})
+	}
+
+	slices.SortFunc(out, func(x, y ClientInfo) int { return strings.Compare(x.ClientID, y.ClientID) })
+
+	return out
+}
+
+// checkClientID is ruling R13 at CONNECT: a client ID the cell cannot carry
+// is refused before any KV call.
+func checkClientID(rawID string) error {
+	if err := subject.CheckClientID(rawID); err != nil {
+		return fmt.Errorf("tether/broker: client ID: %w", err)
+	}
+
+	return nil
+}

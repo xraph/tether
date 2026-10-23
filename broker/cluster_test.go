@@ -343,10 +343,10 @@ func TestRouteFailureRefusesFilter(t *testing.T) {
 }
 
 // Every path that ends a subscription gives its Router reference back,
-// once: UNSUBSCRIBE, a clean session ending, DeleteSession of an offline
-// persistent session, mochi's 5.0 session expiry, the 3.1.1 expiry sweep, a
-// takeover by a clean session and pruning after a grant is revoked. A
-// persistent session that is offline keeps its references.
+// once: UNSUBSCRIBE, a clean session ending, a persistent session going
+// offline (it is evicted from mochi and lives in the cell), mochi's 5.0
+// session expiry, the 3.1.1 expiry sweep, a takeover by a clean session and
+// pruning after a grant is revoked.
 func TestRoutesReleased(t *testing.T) {
 	t1 := newTenant(tenant.Limits{MaxSessionExpiry: 2 * time.Second})
 	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
@@ -397,14 +397,13 @@ func TestRoutesReleased(t *testing.T) {
 		require.Equal(t, []string{"a/b"}, routed("p"))
 		require.Equal(t, base+1, nc.NumSubscriptions())
 
-		// Offline, the session keeps its subscription and its route.
+		// Offline, the session is evicted to the cell and its route goes.
 		require.NoError(t, p.Disconnect(&paho.Disconnect{ReasonCode: 0}))
-		eventually(t, "the session to go offline", func() bool { return b.state.owner(namespacedID(tid, "p")) == nil })
-		require.Equal(t, []string{"a/b"}, routed("p"))
+		waitRouted("p")
+		require.Equal(t, base, nc.NumSubscriptions())
 
 		require.NoError(t, b.DeleteSession(tid, "p"))
 		require.Empty(t, routed("p"))
-		require.Equal(t, base, nc.NumSubscriptions())
 	})
 
 	t.Run("clean session ends", func(t *testing.T) {
@@ -520,7 +519,7 @@ func TestDeliverRoutedDropsForeign(t *testing.T) {
 	// After Stop nothing is injected, and nothing fails.
 	require.NoError(t, b.Stop(t.Context()))
 	b.DeliverRouted(tid, "ok", []byte("late"), cluster.Props{})
-	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, ""), errNotInjecting))
+	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, "", 0), errNotInjecting))
 }
 
 // Ruling R3: the publish properties survive mochi to cluster and back.

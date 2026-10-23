@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -263,6 +264,11 @@ func TestQoS2ExactlyOnceWithDup(t *testing.T) {
 	require.Equal(t, "once", recvLog(t, sub).Payload)
 	require.Zero(t, a.cluster.acks.Load())
 
+	// The reconnect takes the session's key, so NATS is quick again; the
+	// old connection's last record write goes first.
+	proxy.SetMode(chaos.Both, chaos.Pass)
+	eventually(t, "the old connection's session to end", func() bool { return a.cluster.sessionByID(nsID) == nil })
+
 	conn = rawConnect(t, c.addr(0), connect)
 	writePacket(t, conn, &packets.Publish{Topic: "q2/x", QoS: 2, PacketID: 7, Duplicate: true, Payload: []byte("once"), Properties: &packets.Properties{}})
 
@@ -485,7 +491,7 @@ func TestInjectQoS12KeepsNoState(t *testing.T) {
 
 	for i := range 20 {
 		qos := byte(1 + i%2)
-		require.NoError(t, a.inject(tid, "i/x", []byte(fmt.Sprint(i)), qos, cluster.Props{}, ""))
+		require.NoError(t, a.inject(tid, "i/x", []byte(fmt.Sprint(i)), qos, cluster.Props{}, "", 0))
 	}
 
 	for i := range 20 {
@@ -746,9 +752,13 @@ func TestQoS2SelfSubscribedKeepsDeliveries(t *testing.T) {
 // gets a successful PUBREC (a leftover reservation would make mochi answer
 // 0x91), once the message is committed.
 func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
-	c, proxy := startProxiedCell(t, 1, nil)
+	t1 := newTenant(tenant.Limits{})
+	gate := newAppendGate()
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": {Publish: []string{"#"}, Subscribe: []string{"#"}}}},
+		func(b *Broker) { b.cluster.holdAppend = gate.hold })
 	a := c.nodes[0]
-	nsID := namespacedID(c.t1.ID.String(), "ab")
+	nsID := namespacedID(t1.ID.String(), "ab")
 
 	expiry := uint32(3600)
 	connect := &packets.Connect{
@@ -766,16 +776,17 @@ func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
 		return cl.State.Inflight.Len()
 	}
 
-	// Dropped connection.
+	// Dropped connection. (In cluster mode the offline session is evicted
+	// from mochi, so nothing at all is left.)
 	conn := rawConnect(t, c.addr(0), connect)
 
-	proxy.SetMode(chaos.Both, chaos.Blackhole)
+	gate.close()
 
 	writePacket(t, conn, &packets.Publish{Topic: "ab/x", QoS: 2, PacketID: 3, Payload: []byte("x"), Properties: &packets.Properties{}})
 	eventually(t, "the reservation", func() bool { return inflight() == 1 })
 
 	require.NoError(t, conn.Close())
-	eventually(t, "the reservation to go", func() bool { return inflight() == 0 })
+	eventually(t, "the reservation to go", func() bool { return inflight() <= 0 })
 
 	// Takeover while the old connection is open.
 	old := rawConnect(t, c.addr(0), connect)
@@ -785,7 +796,7 @@ func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
 	conn = rawConnect(t, c.addr(0), connect)
 	require.Zero(t, inflight(), "the takeover inherited an uncommitted PUBREC")
 
-	proxy.SetMode(chaos.Both, chaos.Pass)
+	gate.open()
 
 	writePacket(t, conn, &packets.Publish{Topic: "ab/y", QoS: 2, PacketID: 4, Duplicate: true, Payload: []byte("y"), Properties: &packets.Properties{}})
 
@@ -797,6 +808,54 @@ func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
 	writePacket(t, conn, &packets.Pubrel{PacketID: 4, Properties: &packets.Properties{}})
 	require.Equal(t, packets.PUBCOMP, readLog(t, conn).Type)
 	eventually(t, "nothing in flight", func() bool { return inflight() == 0 })
+}
+
+// appendGate holds the appends of client publishes back while closed, the
+// way an unreachable log would, while the session store stays reachable.
+type appendGate struct {
+	mu sync.Mutex
+	ch chan struct{} // closed while the gate is open
+}
+
+func newAppendGate() *appendGate {
+	g := &appendGate{ch: make(chan struct{})}
+	close(g.ch)
+
+	return g
+}
+
+// hold is clusterNode.holdAppend.
+func (g *appendGate) hold(ctx context.Context) {
+	g.mu.Lock()
+	ch := g.ch
+	g.mu.Unlock()
+
+	select {
+	case <-ch:
+	case <-ctx.Done():
+	}
+}
+
+func (g *appendGate) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	select {
+	case <-g.ch:
+		g.ch = make(chan struct{})
+	default:
+	}
+}
+
+func (g *appendGate) open() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	select {
+	case <-g.ch:
+	default:
+		close(g.ch)
+	}
 }
 
 // Ruling R23 for refusals: in cluster mode the publish ACL is decided in
@@ -893,29 +952,21 @@ func disconnectWindow(t *testing.T, holdRemoved bool, limits tenant.Limits) {
 	nsID := namespacedID(t1.ID.String(), "win")
 
 	var (
-		proxy   *chaos.Proxy
 		armed   atomic.Bool
 		reached = make(chan struct{})
 		release = make(chan struct{})
+		gate    = newAppendGate()
 	)
 
-	c := startCellVia(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
 		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.cluster.holdAppend = gate.hold
 			b.disconnectHold = func(cl *mqtt.Client, removed bool) {
 				if removed == holdRemoved && cl.ID == nsID && armed.CompareAndSwap(true, false) {
 					close(reached)
 					<-release
 				}
 			}
-		},
-		func(_ int, url string) string {
-			p, err := chaos.NewProxy(strings.TrimPrefix(url, "nats://"))
-			require.NoError(t, err)
-			t.Cleanup(p.Close)
-
-			proxy = p
-
-			return "nats://" + p.Addr()
 		})
 	a := c.nodes[0]
 
@@ -945,7 +996,7 @@ func disconnectWindow(t *testing.T, holdRemoved bool, limits tenant.Limits) {
 
 	conn := rawConnect(t, c.addr(0), connect)
 
-	proxy.SetMode(chaos.Both, chaos.Blackhole)
+	gate.close()
 
 	writePacket(t, conn, &packets.Publish{Topic: "w/x", QoS: 2, PacketID: 3, Payload: []byte("x"), Properties: &packets.Properties{}})
 	eventually(t, "the reservation", func() bool { return inflight() == 1 })
@@ -971,7 +1022,7 @@ func disconnectWindow(t *testing.T, holdRemoved bool, limits tenant.Limits) {
 	}
 
 	close(release)
-	proxy.SetMode(chaos.Both, chaos.Pass)
+	gate.open()
 
 	writePacket(t, conn, &packets.Publish{Topic: "w/x", QoS: 2, PacketID: 3, Duplicate: true, Payload: []byte("x"), Properties: &packets.Properties{}})
 

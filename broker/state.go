@@ -82,6 +82,13 @@ type clientState struct {
 	// (clusterlog.go). Cluster mode only; set before the state is
 	// registered and never changed.
 	pipe *pubPipe
+
+	// sess is the cell session the connection serves (cluster mode), set at
+	// the end of OnConnectAuthenticate. sessUnlock releases the session's
+	// lock that CONNECT holds from its key acquire until the end of
+	// OnSessionEstablish; nil once released.
+	sess       *session
+	sessUnlock func()
 }
 
 // grants is one compiled set of topic grants and the roles it came from.

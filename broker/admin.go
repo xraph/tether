@@ -465,6 +465,10 @@ func (b *Broker) pruneSession(srv *mqtt.Server, st *clientState) {
 			if b.storage != nil {
 				b.storage.OnQosDropped(cl, pk)
 			}
+
+			if b.cluster != nil {
+				b.cluster.prunedDelivery(cl, pk)
+			}
 		}
 	}
 }
@@ -504,6 +508,10 @@ func (b *Broker) unsubscribe(srv *mqtt.Server, cl *mqtt.Client, drop func(filter
 
 	if len(removed) > 0 && b.cluster != nil {
 		b.releaseRoutes(cl, removed)
+
+		if s := b.cluster.sessionOf(cl); s != nil {
+			s.touch()
+		}
 	}
 
 	return len(removed)
@@ -592,6 +600,12 @@ type RetainedInfo struct {
 // ConnectedAt of an open connection come from its authentication; for an
 // offline session only what mochi kept is known. Before Start, after Stop
 // and for a malformed tenant ID it returns nil.
+//
+// In cluster mode it lists the tenant's sessions in the whole cell: this
+// node's from mochi as above, and every other one from the cell's session
+// store, with what its record holds (connected when another node serves it,
+// no remote address or connect time). If the store cannot be read in time,
+// this node's sessions alone are listed.
 func (b *Broker) Clients(tenantID string) []ClientInfo {
 	if !validTenant(tenantID) {
 		return nil
@@ -626,6 +640,10 @@ func (b *Broker) Clients(tenantID string) []ClientInfo {
 	}
 
 	slices.SortFunc(out, func(x, y ClientInfo) int { return strings.Compare(x.ClientID, y.ClientID) })
+
+	if b.cluster != nil {
+		return b.clusterClients(out, tenantID)
+	}
 
 	return out
 }
@@ -723,6 +741,13 @@ const sessionEndWait = 2 * time.Second
 //
 // It returns tether.ErrNotFound when there is no such session. A delayed
 // will (5.0 Will Delay Interval) already queued by mochi is still sent.
+//
+// In cluster mode the session lives in the cell (ruling R7). One this node
+// serves is disconnected as above and its key deleted; an offline one is
+// deleted from the cell's session store whichever node it was on, at the
+// revision read, so a CONNECT that resumes it meanwhile wins (the delete
+// fails with tether.ErrConflict). A session another node serves is refused
+// with tether.ErrConflict naming that node.
 func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	nsID, err := sessionID(tenantID, clientID)
 	if err != nil {
@@ -732,6 +757,14 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	srv := b.running()
 	if srv == nil {
 		return noSession(clientID)
+	}
+
+	if b.cluster != nil {
+		if err := checkClientID(clientID); err != nil {
+			return fmt.Errorf("tether/broker: %w", err)
+		}
+
+		return b.deleteClusterSession(srv, tenantID, clientID, nsID)
 	}
 
 	cl, ok := srv.Clients.Get(nsID)

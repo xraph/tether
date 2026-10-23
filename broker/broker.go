@@ -225,11 +225,22 @@ func (b *Broker) Start(ctx context.Context) error {
 	// reader started for that client has somewhere to deliver.
 	if b.cluster != nil {
 		b.cluster.attach(srv)
+
+		// The owned-sessions watch runs before the first CONNECT can take
+		// a session.
+		if err := b.startSessions(); err != nil {
+			b.cluster.detach()
+			_ = srv.Close()
+			b.server = nil
+
+			return err
+		}
 	}
 
 	if err := srv.Serve(); err != nil {
 		if b.cluster != nil {
 			b.cluster.detach()
+			b.stopSessions()
 		}
 
 		_ = srv.Close()
@@ -375,7 +386,10 @@ func (b *Broker) Stop(ctx context.Context) error {
 
 		err := shutdown(srv, ids)
 
+		// The sessions that ended in the shutdown have written their last
+		// records; the watch and the flusher go now.
 		if b.cluster != nil {
+			b.stopSessions()
 			b.cluster.close()
 		}
 
