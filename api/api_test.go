@@ -411,6 +411,7 @@ func TestTenantsRejectBadInput(t *testing.T) {
 		{"duplicate external id", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": "aapp_2", "external_id": "aorg_1"}, http.StatusConflict},
 		{"negative limit", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp, "external_id": "n", "limits": map[string]any{"burst": -1}}, http.StatusBadRequest},
 		{"negative session limit", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp, "external_id": "n", "limits": map[string]any{"max_sessions": -1}}, http.StatusBadRequest},
+		{"sub-second session expiry", http.MethodPost, "/tether/v1/tenants", map[string]any{"app_id": testApp, "external_id": "n", "limits": map[string]any{"max_session_expiry": int64(500 * time.Millisecond)}}, http.StatusBadRequest},
 		{"not json", http.MethodPost, "/tether/v1/tenants", []byte("{nope"), http.StatusBadRequest},
 		{"malformed id", http.MethodGet, "/tether/v1/tenants/not-an-id", nil, http.StatusBadRequest},
 		{"device id as tenant id", http.MethodGet, "/tether/v1/tenants/" + id.NewDeviceID().String(), nil, http.StatusBadRequest},

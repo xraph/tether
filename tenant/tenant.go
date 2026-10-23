@@ -4,6 +4,7 @@ package tenant
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/xraph/tether/id"
@@ -34,7 +35,9 @@ type Limits struct {
 	// whole seconds, and only lowers the broker's own cap. A 5.0 client
 	// that asks for more is told the capped value in its CONNACK; a 3.1.1
 	// persistent session gets the cap as its expiry. Zero means the
-	// broker's cap. A change reaches connections made after it.
+	// broker's cap. A positive value under a second is invalid: it would
+	// round down to zero seconds and end every session at disconnect. A
+	// change reaches connections made after it.
 	MaxSessionExpiry time.Duration `json:"max_session_expiry,omitempty"`
 
 	// MaxSessions is the most sessions the tenant may hold on one broker
@@ -58,10 +61,26 @@ type Tenant struct {
 	UpdatedAt  time.Time   `json:"updated_at"`
 }
 
-// Validate reports whether t can be stored: it must be non-nil and carry an
-// ID. The returned error names the problem and is not a tether sentinel, so
-// this package does not import the root package. A store wraps it with
+// Validate reports whether the limits can be stored. None may be negative,
+// since the limiter would read a negative value as unlimited, and a positive
+// MaxSessionExpiry must be at least a second. The returned error names the
+// problem and is not a tether sentinel; the caller wraps it with
 // tether.ErrInvalidInput.
+func (l Limits) Validate() error {
+	switch {
+	case l.MaxConnections < 0, l.MessagesPerSecond < 0, l.Burst < 0, l.MaxSessionExpiry < 0, l.MaxSessions < 0:
+		return errors.New("limits must not be negative")
+	case l.MaxSessionExpiry > 0 && l.MaxSessionExpiry < time.Second:
+		return errors.New("max_session_expiry must be zero or at least one second")
+	}
+
+	return nil
+}
+
+// Validate reports whether t can be stored: it must be non-nil, carry an ID,
+// and have valid Limits. The returned error names the problem and is not a
+// tether sentinel, so this package does not import the root package. A store
+// wraps it with tether.ErrInvalidInput.
 func (t *Tenant) Validate() error {
 	if t == nil {
 		return errors.New("tenant is required")
@@ -69,6 +88,10 @@ func (t *Tenant) Validate() error {
 
 	if t.ID.IsNil() {
 		return errors.New("tenant ID is required")
+	}
+
+	if err := t.Limits.Validate(); err != nil {
+		return fmt.Errorf("tenant limits: %w", err)
 	}
 
 	return nil

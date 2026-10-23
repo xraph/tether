@@ -301,6 +301,18 @@ func testTenantInvalidInput(t *testing.T, s store.Store) {
 	require.ErrorIs(t, s.CreateTenant(ctx, noID), tether.ErrInvalidInput)
 	require.ErrorIs(t, s.UpdateTenant(ctx, noID), tether.ErrInvalidInput)
 
+	// A positive session expiry cap under a second would round to zero
+	// seconds, which ends every session at disconnect.
+	subSecond := newTenant()
+	subSecond.Limits.MaxSessionExpiry = 500 * time.Millisecond
+	require.ErrorIs(t, s.CreateTenant(ctx, subSecond), tether.ErrInvalidInput)
+
+	stored := newTenant()
+	require.NoError(t, s.CreateTenant(ctx, stored))
+
+	stored.Limits.MaxSessionExpiry = time.Millisecond
+	require.ErrorIs(t, s.UpdateTenant(ctx, stored), tether.ErrInvalidInput)
+
 	_, err := s.ListTenants(ctx, tenant.ListFilter{Limit: -1})
 	require.ErrorIs(t, err, tether.ErrInvalidInput)
 

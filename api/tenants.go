@@ -191,12 +191,12 @@ func page(req *pageRequest) (limit, offset int, err error) {
 	return req.Limit, req.Offset, nil
 }
 
-// validateLimits rejects negative limits, which the limiter would read as
-// "unlimited".
+// validateLimits rejects limits tenant.Limits.Validate refuses: negative
+// ones, which the limiter would read as "unlimited", and a session expiry cap
+// under a second.
 func validateLimits(l tenant.Limits) error {
-	switch {
-	case l.MaxConnections < 0, l.MessagesPerSecond < 0, l.Burst < 0, l.MaxSessionExpiry < 0, l.MaxSessions < 0:
-		return fmt.Errorf("%w: limits must not be negative", tether.ErrInvalidInput)
+	if err := l.Validate(); err != nil {
+		return fmt.Errorf("%w: %w", tether.ErrInvalidInput, err)
 	}
 
 	return nil

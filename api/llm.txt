@@ -16,7 +16,7 @@ All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged 
 
 | Route | Does |
 |---|---|
-| `POST /v1/tenants` | body `{app_id, external_id, name, limits}`; 201 with the tenant. Limits are `tenant.Limits` JSON (`max_connections`, `messages_per_second`, `burst`, `max_session_expiry`, `max_sessions`), so `max_session_expiry` is nanoseconds. Negative limits are 400. A reused external ID is 409. |
+| `POST /v1/tenants` | body `{app_id, external_id, name, limits}`; 201 with the tenant. Limits are `tenant.Limits` JSON (`max_connections`, `messages_per_second`, `burst`, `max_session_expiry`, `max_sessions`), so `max_session_expiry` is nanoseconds. Negative limits, and a `max_session_expiry` above zero but under one second, are 400 (`tenant.Limits.Validate`). A reused external ID is 409. |
 | `GET /v1/tenants`, `GET /:tenantId` | list, get |
 | `PATCH /:tenantId` | body `{name, enabled, limits}`, absent fields untouched; then `Broker.UpdateTenant` (live connections take the new limits, or are disconnected when disabled) |
 | `DELETE /:tenantId` | 204. `Delete` first (409 while devices exist, and then nothing changes); on success `Broker.UpdateTenant` with a disabled copy so live connections end |

@@ -52,6 +52,11 @@ func TestCreateValidatesAndDefaultsEnabled(t *testing.T) {
 	_, err = svc.Create(ctx, CreateTenantInput{AppID: "aapp_1"})
 	require.ErrorIs(t, err, tether.ErrInvalidInput)
 
+	_, err = svc.Create(ctx, CreateTenantInput{
+		AppID: "aapp_1", ExternalID: "aorg_sub", Limits: tenant.Limits{MaxSessionExpiry: 500 * time.Millisecond},
+	})
+	require.ErrorIs(t, err, tether.ErrInvalidInput, "a sub-second session expiry cap rounds to zero")
+
 	got, err := svc.Create(ctx, CreateTenantInput{
 		AppID: "aapp_1", ExternalID: "aorg_1", Name: "Acme",
 		Limits: tenant.Limits{MaxConnections: 5},
