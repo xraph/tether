@@ -1,0 +1,18 @@
+# tether/internal/chaos
+
+Import: github.com/xraph/tether/internal/chaos (internal: Tether's own tests only)
+
+Fault injection for tests. Today that is a TCP proxy. It imports no testing package; tests call `t.Cleanup(p.Close)` themselves.
+
+## Proxy
+
+- `NewProxy(target string) (*Proxy, error)`: listens on a random `127.0.0.1` port and forwards each accepted connection to `target` ("host:port"). `Addr()` is what clients dial (prefix `nats://` for a NATS URL). `Conns()` is the number of connections it holds open. `Close()` stops the listener, drops every connection and waits for its goroutines; idempotent.
+- `SetMode(dir, mode)` and `SetDelay(dir, d)`, `dir` one of `ClientToServer`, `ServerToClient`, `Both`. Changes reach connections that are already open, including bytes the proxy has read and not yet written.
+- Modes:
+  - `Pass`: forward as bytes arrive.
+  - `Delay`: forward each chunk `delay` after it was read (the delay is read when the chunk is written, so a change applies to chunks in flight). Chunks are pipelined, so throughput is not capped to one chunk per delay.
+  - `Blackhole`: forward nothing and close nothing. The proxy stops reading that direction (the kernel buffers fill and the sender is pushed back, as in a real partition) and holds the chunk it already read. A connection accepted in this mode is accepted and stays silent. A return to `Pass` delivers what was held, so a healed partition looks like TCP retransmission, not data loss. The peers never see a reset.
+  - `Reset`: closes every connection with a TCP RST (SO_LINGER 0) and does the same to each new one at accept. Setting it on either direction resets the connection. A client's connect may itself fail with a reset.
+- The proxy dials the target when it accepts, whatever the mode (unless it is resetting), so the target sees an ordinary connection.
+
+Tests (proxy_test.go): pass round trips, delay adds at least the delay, blackhole stalls without closing and delivers on heal (both directions, new connections too), reset closes existing and new connections, pass works again after reset, Close.
