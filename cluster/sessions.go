@@ -56,6 +56,10 @@ type SessionRecord struct {
 	QoS2In map[uint16]string `json:"qos2_in,omitempty"`
 	// QoS2Out maps the packet IDs of outbound QoS 2 deliveries to their state.
 	QoS2Out map[uint16]OutRecord `json:"qos2_out,omitempty"`
+	// QoS2Done lists the log sequences above Cursor of outbound QoS 2
+	// deliveries the client has completed, so a node that resumes the session
+	// does not send them again. Their packet IDs may be in use again already.
+	QoS2Done []uint64 `json:"qos2_done,omitempty"`
 	// DisconnectedAt is when the session lost its connection, zero while
 	// connected.
 	DisconnectedAt time.Time `json:"disconnected_at,omitzero"`
@@ -386,13 +390,37 @@ func (s *Sessions) write(ctx context.Context, h *sessionHandles, key string, rec
 // absent or as a different marker afterwards. The first read was stale about an
 // expiring marker, so Acquire tries once more.
 func (s *Sessions) Acquire(ctx context.Context, tenant, clientID, nodeID string) (rec *SessionRecord, rev uint64, existed bool, err error) {
+	rec, prev, rev, err := s.AcquireWith(ctx, tenant, clientID, nodeID, func(prev *SessionRecord) *SessionRecord {
+		if prev == nil {
+			return new(SessionRecord)
+		}
+
+		c := *prev
+
+		return &c
+	})
+
+	return rec, rev, prev != nil, err
+}
+
+// AcquireWith is Acquire where build decides what the takeover stores. build
+// gets the session as it was (nil when none existed) and returns the record to
+// write; AcquireWith then sets its Owner to nodeID and its Epoch to one above
+// the previous record's (1 for a new session). build must not change prev, and
+// it may run twice (see Acquire for the one retry).
+//
+// It returns the record it stored, the previous one (nil when no session
+// existed) and the key's new revision.
+func (s *Sessions) AcquireWith(ctx context.Context, tenant, clientID, nodeID string,
+	build func(prev *SessionRecord) *SessionRecord,
+) (rec, prev *SessionRecord, rev uint64, err error) {
 	key, err := sessionKey(tenant, clientID)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, nil, 0, err
 	}
 
-	if nodeID == "" {
-		return nil, 0, false, fmt.Errorf("cluster: acquire session: empty node id: %w", tether.ErrInvalidInput)
+	if nodeID == "" || build == nil {
+		return nil, nil, 0, fmt.Errorf("cluster: acquire session: needs a node id and a builder: %w", tether.ErrInvalidInput)
 	}
 
 	ctx, cancel := opContext(ctx)
@@ -400,12 +428,12 @@ func (s *Sessions) Acquire(ctx context.Context, tenant, clientID, nodeID string)
 
 	h, err := s.handles(ctx)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, nil, 0, err
 	}
 
 	unlock, err := s.keys.lock(ctx, key)
 	if err != nil {
-		return nil, 0, false, s.wrapErr("acquire session", err)
+		return nil, nil, 0, s.wrapErr("acquire session", err)
 	}
 	defer unlock()
 
@@ -417,7 +445,7 @@ func (s *Sessions) Acquire(ctx context.Context, tenant, clientID, nodeID string)
 	for attempt := 0; ; attempt++ {
 		cur, rerr := s.read(ctx, h, key)
 		if rerr != nil {
-			return nil, 0, false, rerr
+			return nil, nil, 0, rerr
 		}
 
 		if attempt == 0 && s.afterRead != nil {
@@ -425,24 +453,33 @@ func (s *Sessions) Acquire(ctx context.Context, tenant, clientID, nodeID string)
 		}
 
 		if attempt > 0 && (cur.state == stateLive || cur.rev == firstRev) {
-			return nil, 0, false, firstErr
+			return nil, nil, 0, firstErr
 		}
 
-		next := cur.rec
+		var epoch uint64
+		if cur.rec != nil {
+			epoch = cur.rec.Epoch
+		}
+
+		next := build(cur.rec)
 		if next == nil {
 			next = new(SessionRecord)
 		}
 
 		next.Owner = nodeID
-		next.Epoch++
+		next.Epoch = epoch + 1
 
 		newRev, werr := s.write(ctx, h, key, next, cur.rev, 0)
 		if werr == nil {
-			return next, newRev, cur.state == stateLive, nil
+			if cur.state != stateLive {
+				return next, nil, newRev, nil
+			}
+
+			return next, cur.rec, newRev, nil
 		}
 
 		if !isLostCAS(werr) || cur.state == stateLive || attempt > 0 {
-			return nil, 0, false, s.wrapErr("acquire session", werr)
+			return nil, nil, 0, s.wrapErr("acquire session", werr)
 		}
 
 		firstRev, firstErr = cur.rev, s.wrapErr("acquire session", werr)
@@ -576,10 +613,33 @@ func (s *Sessions) Get(ctx context.Context, tenant, clientID string) (*SessionRe
 	return cur.rec, cur.rev, nil
 }
 
+// SessionEntry is one session Entries found: the client ID its key names, its
+// record and the key's revision.
+type SessionEntry struct {
+	ClientID string
+	Record   *SessionRecord
+	Revision uint64
+}
+
 // List returns every live session of a tenant, in no particular order. It reads
 // the whole tenant through a watcher, so it costs a pass over the tenant's
 // keys.
 func (s *Sessions) List(ctx context.Context, tenant string) ([]*SessionRecord, error) {
+	entries, err := s.Entries(ctx, tenant)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]*SessionRecord, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Record)
+	}
+
+	return out, nil
+}
+
+// Entries is List with each session's client ID and revision.
+func (s *Sessions) Entries(ctx context.Context, tenant string) ([]SessionEntry, error) {
 	probe, err := sessionKey(tenant, "x")
 	if err != nil {
 		return nil, err
@@ -598,7 +658,7 @@ func (s *Sessions) List(ctx context.Context, tenant string) ([]*SessionRecord, e
 	}
 	defer s.stopWatcher(w)
 
-	var out []*SessionRecord
+	var out []SessionEntry
 
 	for {
 		select {
@@ -613,6 +673,13 @@ func (s *Sessions) List(ctx context.Context, tenant string) ([]*SessionRecord, e
 				return out, nil
 			}
 
+			_, clientID, kerr := splitSessionKey(e.Key())
+			if kerr != nil {
+				s.c.logger.Warn("skipping undecodable session key", "key", e.Key(), "error", kerr)
+
+				continue
+			}
+
 			rec, derr := decodeSession(e.Value())
 			if derr != nil {
 				s.c.logger.Warn("skipping undecodable session record", "key", e.Key(), "error", derr)
@@ -620,7 +687,7 @@ func (s *Sessions) List(ctx context.Context, tenant string) ([]*SessionRecord, e
 				continue
 			}
 
-			out = append(out, rec)
+			out = append(out, SessionEntry{ClientID: clientID, Record: rec, Revision: e.Revision()})
 		}
 	}
 }

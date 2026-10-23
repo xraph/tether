@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -29,6 +30,13 @@ import (
 // stop is called. stop is safe to call more than once and from fn; it does not
 // wait for a running fn, though fn is not called for events that arrive after
 // stop returns.
+//
+// A watch that ends by itself (its subscription closed under it) is logged at
+// Error and started again, with backoff while NATS refuses, and its fresh first
+// pass brings the owned sessions up to date: a takeover it missed is reported
+// then, and an owned session whose key is gone without a marker left to read is
+// reported as deleted. If that happens before the first pass finished,
+// WatchOwned returns at once and the new watch does the first pass.
 func (s *Sessions) WatchOwned(ctx context.Context, nodeID string, fn func(tenant, clientID string, rec *SessionRecord, deleted bool)) (stop func(), err error) {
 	if nodeID == "" || fn == nil {
 		return nil, fmt.Errorf("cluster: watch sessions: needs a node id and a callback: %w", tether.ErrInvalidInput)
@@ -133,6 +141,14 @@ type ownedWatch struct {
 	kick      chan struct{}
 	ready     chan struct{}
 	readyOnce sync.Once
+
+	// kw is the running KV watcher, under mu, so a test can end it. resync,
+	// under mu, is non-nil during the first pass of a restarted watch and
+	// collects the keys it read. beforeRestart, when a test sets it, runs
+	// between a watch ending and its replacement starting.
+	kw            jetstream.KeyWatcher
+	resync        map[string]struct{}
+	beforeRestart func()
 }
 
 // begin marks a write on key as in flight.
@@ -255,12 +271,39 @@ func (w *ownedWatch) wake() {
 }
 
 // run reads the watch until ctx ends and calls fn for what evaluate decided.
+// A watch that ends by itself is started again (ruling R26).
 func (w *ownedWatch) run(ctx context.Context, kw jetstream.KeyWatcher) {
-	defer func() {
-		w.s.stopWatcher(kw)
-		w.s.unregister(w)
-	}()
+	defer w.s.unregister(w)
 
+	w.setWatcher(kw)
+
+	for {
+		w.read(ctx, kw)
+		w.s.stopWatcher(kw)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		w.s.c.logger.Error("watch: the sessions watch ended by itself, restarting it", "node", w.nodeID)
+
+		// WatchOwned must not wait on a first pass this watch will never finish.
+		w.readyOnce.Do(func() { close(w.ready) })
+
+		if hook := w.beforeRestart; hook != nil {
+			hook()
+		}
+
+		var ok bool
+
+		if kw, ok = w.restart(ctx); !ok {
+			return
+		}
+	}
+}
+
+// read consumes kw until it closes or ctx ends.
+func (w *ownedWatch) read(ctx context.Context, kw jetstream.KeyWatcher) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -272,6 +315,7 @@ func (w *ownedWatch) run(ctx context.Context, kw jetstream.KeyWatcher) {
 			}
 
 			if e == nil { // the sessions that existed at the start have been read
+				w.endFirstPass()
 				w.readyOnce.Do(func() { close(w.ready) })
 			} else {
 				w.consume(e)
@@ -282,8 +326,84 @@ func (w *ownedWatch) run(ctx context.Context, kw jetstream.KeyWatcher) {
 	}
 }
 
+// restart opens a new watch, retrying with backoff until it works or ctx
+// ends. Its first pass is a resync (endFirstPass).
+func (w *ownedWatch) restart(ctx context.Context) (jetstream.KeyWatcher, bool) {
+	delay := consumerRetry
+
+	for {
+		h, err := w.s.handles(ctx)
+
+		var kw jetstream.KeyWatcher
+		if err == nil {
+			w.mu.Lock()
+			w.resync = make(map[string]struct{})
+			w.mu.Unlock()
+
+			kw, err = h.kv.WatchAll(ctx)
+		}
+
+		if err == nil {
+			w.setWatcher(kw)
+
+			return kw, true
+		}
+
+		w.s.c.logger.Error("watch: restarting the sessions watch failed", "node", w.nodeID, "error", err)
+
+		select {
+		case <-ctx.Done():
+			return nil, false
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, watchRetryMax)
+	}
+}
+
+// watchRetryMax caps the backoff between attempts to restart a watch.
+const watchRetryMax = 5 * time.Second
+
+func (w *ownedWatch) setWatcher(kw jetstream.KeyWatcher) {
+	w.mu.Lock()
+	w.kw = kw
+	w.mu.Unlock()
+}
+
+// endFirstPass finishes a restarted watch's first pass: an owned key the pass
+// did not read is gone (its marker expired while no watch ran), so it is
+// reported deleted. Keys with a write in flight are left to that write.
+func (w *ownedWatch) endFirstPass() {
+	w.mu.Lock()
+
+	if w.resync != nil {
+		for key := range w.owned {
+			if _, seen := w.resync[key]; seen {
+				continue
+			}
+
+			if _, inFlight := w.flights[key]; inFlight {
+				continue
+			}
+
+			delete(w.owned, key)
+			w.fires = append(w.fires, fireItem{key: key, deleted: true})
+		}
+
+		w.resync = nil
+	}
+
+	w.mu.Unlock()
+}
+
 func (w *ownedWatch) consume(e jetstream.KeyValueEntry) {
 	ev := watchEvent{key: e.Key(), rev: e.Revision()}
+
+	w.mu.Lock()
+	if w.resync != nil {
+		w.resync[ev.key] = struct{}{}
+	}
+	w.mu.Unlock()
 
 	if e.Operation() != jetstream.KeyValuePut {
 		ev.deleted = true
