@@ -27,9 +27,17 @@ type routed struct {
 type sink struct {
 	mu   sync.Mutex
 	msgs []routed
+
+	// pause, when set, runs at the start of every deliver, outside mu, so a
+	// test can make deliver slow.
+	pause atomic.Pointer[func(payload string)]
 }
 
 func (s *sink) deliver(tenant, topic string, payload []byte, props Props) {
+	if p := s.pause.Load(); p != nil {
+		(*p)(string(payload))
+	}
+
 	s.mu.Lock()
 	s.msgs = append(s.msgs, routed{tenant, topic, string(payload), props})
 	s.mu.Unlock()
@@ -223,6 +231,55 @@ func TestOverlapDedup(t *testing.T) {
 	for i := range 20 {
 		if n := b.sink.count("t1", fmt.Sprintf("a/%d", i)); n != 1 {
 			t.Fatalf("a/%d delivered %d times through three overlapping filters, want 1", i, n)
+		}
+	}
+}
+
+// Ruling R19: a topic matched by several of a node's subscriptions, each
+// with its own NATS dispatch goroutine, still reaches deliver in publish
+// order and once per message. A slow deliver on some messages widens the
+// window where one goroutine could skip a duplicate and run ahead.
+func TestOverlapKeepsTopicOrder(t *testing.T) {
+	nodes := startRouteNodes(t, 2)
+	a, b := nodes[0], nodes[1]
+
+	mustSub(t, b, "t1", "o/+")
+	mustSub(t, b, "t1", "o/#")
+	mustSub(t, b, "t1", "+/x")
+	mustSub(t, b, "t1", "#")
+	ready(t, a, b)
+
+	pause := func(payload string) {
+		if strings.HasSuffix(payload, "3") || strings.HasSuffix(payload, "7") {
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
+	b.sink.pause.Store(&pause)
+
+	const n = 2000
+
+	for i := range n {
+		mustPub(t, a, "t1", "o/x", fmt.Sprint(i))
+	}
+
+	b.sink.waitCount(t, "t1", "o/x", n)
+	time.Sleep(settle)
+
+	var got []string
+
+	for _, m := range b.sink.all() {
+		if m.topic == "o/x" {
+			got = append(got, m.payload)
+		}
+	}
+
+	if len(got) != n {
+		t.Fatalf("o/x delivered %d times, want %d", len(got), n)
+	}
+
+	for i, p := range got {
+		if p != fmt.Sprint(i) {
+			t.Fatalf("delivery %d is message %s: out of order", i, p)
 		}
 	}
 }

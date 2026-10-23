@@ -20,6 +20,10 @@ import (
 // ID and a counter, and the receiving side deduplicates on it.
 const hdrID = "Tether-Id"
 
+// orderStripes is how many locks onMessage spreads subjects over (ruling
+// R19). Messages on one subject always share a lock.
+const orderStripes = 64
+
 // errRouterClosed is returned by Subscribe and Publish after Close.
 var errRouterClosed = fmt.Errorf("tether/cluster: router is closed: %w", ErrUnavailable)
 
@@ -56,6 +60,12 @@ type Router struct {
 	dedup   *dedup
 	counter atomic.Uint64
 
+	// order holds a lock per stripe of subjects, held across the dedup claim
+	// and deliver. Without it, of two subscriptions matching one topic, the
+	// goroutine that loses message N's claim could deliver N+1 while the
+	// winner is still delivering N.
+	order [orderStripes]sync.Mutex
+
 	mu     sync.Mutex // guards routes, closed and every route's pins
 	routes map[routeKey]*route
 	closed bool
@@ -68,10 +78,13 @@ type Router struct {
 // NewRouter returns a router on c for the node nodeID. deliver is called for
 // every message that arrives from another node, after deduplication.
 //
-// deliver runs on NATS's dispatch goroutines, one per subscription, so calls
-// for different subscriptions can overlap and a slow deliver delays the
-// messages behind it on its subscription (a subscription whose backlog passes
-// the nats.go pending limits drops messages: QoS 0 allows that). Keep deliver
+// deliver runs on NATS's dispatch goroutines, one per subscription. Calls for
+// one topic never overlap and come in publish order, even when several
+// subscriptions match it; calls for different topics can overlap. deliver
+// runs under a lock shared by one stripe of subjects, so a slow deliver
+// delays the messages behind it on its subscription and the messages of
+// other subjects in its stripe (a subscription whose backlog passes the
+// nats.go pending limits drops messages: QoS 0 allows that). Keep deliver
 // short: hand the message to the broker's own queues and return. payload and
 // props belong to deliver.
 func NewRouter(c *Conn, nodeID string, deliver func(tenant, topic string, payload []byte, props Props)) *Router {
@@ -363,6 +376,12 @@ func (r *Router) Publish(tenant, topic string, payload []byte, props Props) erro
 }
 
 // onMessage is the handler of every subscription.
+//
+// The dedup claim and deliver run under the subject's order lock, so a
+// message reaches deliver only after every earlier message on its subject
+// has been delivered or found a duplicate: each subscription hands its
+// messages over in publish order, and a goroutine that finds message N a
+// duplicate waits until the claim's deliver of N has returned.
 func (r *Router) onMessage(m *nats.Msg) {
 	tenant, topic, err := subject.DecodeQoS0(m.Subject)
 	if err != nil {
@@ -370,6 +389,10 @@ func (r *Router) onMessage(m *nats.Msg) {
 
 		return
 	}
+
+	mu := &r.order[stripe(m.Subject)]
+	mu.Lock()
+	defer mu.Unlock()
 
 	// A publisher that is not a Tether node sends no id. Deliver it once, without
 	// deduplication: the message is real, and a client of an overlapping filter
@@ -390,6 +413,18 @@ func (r *Router) onMessage(m *nats.Msg) {
 	}
 
 	r.deliver(tenant, topic, m.Data, props)
+}
+
+// stripe picks the order lock of a subject (FNV-1a).
+func stripe(subj string) int {
+	h := uint32(2166136261)
+
+	for i := range len(subj) {
+		h ^= uint32(subj[i])
+		h *= 16777619
+	}
+
+	return int(h % orderStripes)
 }
 
 // wrapNATS wraps err for the caller, marking it ErrUnavailable when the cause is
