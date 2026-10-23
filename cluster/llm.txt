@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/cluster
 
-Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, and the sentinel errors. Later tasks add the members, session ownership, log, retained and router code on top of `*Conn`.
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. Later tasks add the members, log, retained and router code on top of `*Conn`.
 
 ## Config
 
@@ -37,7 +37,24 @@ All with `Conn.Replicas()` replicas. Placement errors that clear while a fresh c
 
 ## Errors
 
-`ErrLostCAS` (JetStream 10071 and 10164 both mean this; callers map them), `ErrFenced`, `ErrUnavailable`. Messages start `tether/cluster: `.
+`ErrLostCAS` (JetStream 10071 and 10164 both mean this; Sessions maps both, and the returned error also wraps the `*jetstream.APIError`), `ErrFenced`, `ErrUnavailable`. Messages start `tether/cluster: `.
+
+## Sessions
+
+One KV key per MQTT session in the sessions bucket, key `subject.SessionKey(tenant, clientID)`, value a JSON `SessionRecord{Owner, Epoch, Clean, ProtocolVersion, Username, DeviceID, ExpirySeconds, Subscriptions []SubRecord, Cursor, Will *WillRecord, QoS2In map[uint16]string, QoS2Out map[uint16]OutRecord, DisconnectedAt}`. `WillRecord.Props` is a `Props` (props.go): `User []UserProperty` (ordered, duplicate keys kept), `ContentType`, `ResponseTopic`, `CorrelationData`, `MessageExpiry` (seconds, 0 = none), `PayloadFormat *byte` (nil = absent). `Props.IsZero()` backs `omitzero`.
+
+`NewSessions(c *Conn, cfg Config) *Sessions` (the bucket must exist, so Provision first). Every method checks the client ID with `subject.CheckClientID` and a non-empty tenant, and returns an error wrapping `tether.ErrInvalidInput` otherwise; no "" key is ever written. A write that loses wraps `ErrLostCAS`; a NATS timeout or no responders wraps `ErrUnavailable`. A call without a context deadline gets 10 s.
+
+- `Acquire(ctx, tenant, clientID, nodeID) (rec, rev, existed, err)`: read from the stream leader, then CAS the record with Owner = nodeID and Epoch + 1. Absent key: created at epoch 1. A key holding only a limit marker or purge marker reads as absent but the create must name the marker's revision (JetStream refuses expected sequence 0 while the marker lives, until `LimitMarkerTTL`); Acquire does that. `rec` is the record as it was, with the new owner and epoch. A lost CAS is returned, not retried, except one retry of a create that lost over a stale marker read.
+- `Update(ctx, tenant, clientID, rev, rec) (newRev, err)`: CAS, no TTL (this clears an earlier Expire).
+- `Expire(ctx, tenant, clientID, rev, rec, ttl) (newRev, err)`: CAS like Update, as a raw publish to `$KV.<bucket>.<key>` with `Nats-TTL` (whole seconds, rounded up, min 1 s) and `Nats-Expected-Last-Subject-Sequence`. When it runs out the key becomes a limit marker; watchers see a purge with reason MaxAge.
+- `Delete(ctx, tenant, clientID, rev) error`: CAS purge that leaves a marker for `LimitMarkerTTL`.
+- `Get(ctx, tenant, clientID) (rec, rev, err)`: `tether.ErrNotFound` when absent, deleted or expired. Reads use the JetStream non-direct message get, so the stream leader answers and a node sees its own writes.
+- `List(ctx, tenant) ([]*SessionRecord, error)`: a watcher pass over the tenant's keys, live ones only.
+- `WatchOwned(ctx, nodeID, fn func(tenant, clientID string, rec *SessionRecord, deleted bool)) (stop func(), err error)`: one watcher over every key. It tracks the sessions nodeID owns (from this Sessions' successful Acquire, Update and Expire, and from records the watch reads with Owner == nodeID) and calls fn once when one changes owner or epoch (rec is the new record), or is deleted, purged or expired (rec nil, deleted true), then forgets it. This Sessions' own writes and deletes never fire. It returns after the first pass over existing keys. fn runs on one goroutine. Decisions compare revisions, with a write in flight parking the watch's event until the write's revision is known. stop is idempotent.
+- One outstanding CAS per key per node: a keyed lock inside Sessions (entries freed when unused). JetStream refuses an expected-sequence write on a subject that has any write in flight (10164), so two writes of one key from one node must not overlap. A loser behind the lock meets an applied write (10071).
+
+Internals worth knowing: `isLostCAS(err)` matches API error codes 10071 and 10164 and nats.go's `ErrKeyExists` and `ErrKeyRevisionMismatch`. `Sessions.afterRead` is a test hook that holds Acquire between its read and its write.
 
 ## clustertest
 
@@ -47,4 +64,4 @@ Import: github.com/xraph/tether/cluster/clustertest
 - `StartCluster(t, n) *Cluster`: same, with `Servers []*server.Server`, `URLs()` and `Stop(i)`.
 - `FreePorts(t, n) []int`, `RouteURL(port) string`: for tests that run embedded nodes as a cluster.
 
-Tests: conn_test.go covers the single and three-node embedded connect, idempotent provisioning on one and three servers, NoEcho, unavailable, and the Validate table.
+Tests: conn_test.go covers the single and three-node embedded connect, idempotent provisioning on one and three servers, NoEcho, unavailable, and the Validate table. sessions_test.go (package cluster, on a three-server clustertest cell) covers the one-winner Acquire race with both error shapes, stale revisions, the keyed lock, expiry seen by a watcher, re-create over a marker, WatchOwned, the record round trip, List and Get, invalid input and isLostCAS.
