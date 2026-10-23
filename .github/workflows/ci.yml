@@ -45,9 +45,10 @@ jobs:
       - name: Install goimports
         run: go install golang.org/x/tools/cmd/goimports@latest
 
+      # spikes/ holds throwaway modules with their own go.mod, so skip them.
       - name: Check formatting (goimports)
         run: |
-          OUTPUT=$(goimports -l -local github.com/xraph/tether .)
+          OUTPUT=$(find . -path ./spikes -prune -o -name '*.go' -print | xargs goimports -l -local github.com/xraph/tether)
           if [ -n "$OUTPUT" ]; then
             echo "::error::The following files need goimports formatting:"
             echo "$OUTPUT"

@@ -94,6 +94,9 @@ linters:
         - fieldalignment
 
   exclusions:
+    # spikes/ holds throwaway modules with their own go.mod. They never ship.
+    paths:
+      - spikes/
     presets:
       - comments
       - std-error-handling
@@ -109,6 +112,9 @@ formatters:
   enable:
     - gofmt
     - goimports
+  exclusions:
+    paths:
+      - spikes/
   settings:
     goimports:
       local-prefixes:
