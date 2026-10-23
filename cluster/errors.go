@@ -54,5 +54,6 @@ func isUnavailable(err error) bool {
 		errors.Is(err, nats.ErrConnectionClosed) ||
 		errors.Is(err, nats.ErrDisconnected) ||
 		errors.Is(err, jetstream.ErrNoStreamResponse) ||
+		errors.Is(err, jetstream.ErrAsyncPublishTimeout) ||
 		errors.Is(err, context.DeadlineExceeded)
 }

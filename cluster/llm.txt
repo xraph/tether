@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/cluster
 
-Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. Later tasks add the members, log, retained and router code on top of `*Conn`.
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. Later tasks add the members, retained and router code.
 
 ## Config
 
@@ -56,6 +56,21 @@ One KV key per MQTT session in the sessions bucket, key `subject.SessionKey(tena
 
 Internals worth knowing: `isLostCAS(err)` matches API error codes 10071 and 10164 and nats.go's `ErrKeyExists` and `ErrKeyRevisionMismatch`. `Sessions.afterRead` is a test hook that holds Acquire between its read and its write.
 
+## Log
+
+The cell's QoS 1 and 2 messages live in one JetStream stream, `Config.LogStream()`, subject `subject.Log(tenant, topic)` = `d.<tenant>.<enc topic>` (`$` topics stay under the plain tenant token). `Log` never creates the stream: Provision first. Everything that delivers a QoS 1/2 message to a session reads it through a `Reader` or `Replay`, so a tenant's order is the stream order.
+
+`LogMessage{Seq, Tenant, Topic, Payload, QoS, Retain, Props, Origin, PublishedAt}`. Tenant and topic are not headers: they come back from the subject through `subject.DecodeLog`, which is lossless. Headers: `Tether-QoS` (1 or 2), `Tether-Retain` ("1" when set), `Tether-Origin` (node ID, omitted when empty), `Tether-Published-At` (unix nanoseconds), and the `Tether-Prop-*` headers of `Props`. Readers and Replay hand the same Payload and Props arrays to every caller on the node: do not modify them.
+
+`NewLog(c *Conn, cfg Config) *Log` keeps a JetStream handle of its own for publishing, with a 30 s ack timeout so abandoned publishes free their bookkeeping.
+
+- `Append(ctx, msg, msgID) (seq, dup, err)`: refuses with `tether.ErrInvalidInput`, before building a subject, an empty tenant, a topic over 1024 bytes (`subject.CheckTopic`), a QoS other than 1 or 2, and an Origin or msgID that is not a plain header value (no control characters, no space at either end). Async publish (`PublishMsgAsync`), waits for the ack future or ctx (10 s when ctx has no deadline). A non-empty msgID is `Nats-Msg-Id`: a repeat inside the 2 minute window returns the first sequence with `dup` true and stores nothing. `msg.Seq` is ignored; a zero PublishedAt becomes now. Unreachable JetStream, no ack in time and a closed connection wrap `ErrUnavailable`. When the publisher has 4000 acks outstanding Append waits and retries until ctx ends.
+- `Reader(tenant, fromSeq, fn) (*Reader, error)`: ordered consumer with exactly one filter `subject.LogTenantAll(tenant)`. fromSeq 0 = only messages appended from now (resolved to last sequence + 1 at creation, so a consumer recreated before its first message does not skip any); otherwise the first tenant message at or after fromSeq. The server consumer exists when Reader returns. fn runs on one goroutine; an fn error is logged at Warn and the reader goes on (one bad message must not stall a tenant); an entry that does not decode is logged at Warn and skipped. `Position()` (atomic) is the sequence of the last entry the reader is done with (fn returned, or skipped), starting at fromSeq-1 (or the log's last sequence for fromSeq 0), never going back. `Stop()` is idempotent, waits for the goroutine and deletes the server consumer; do not call it from fn.
+- `Replay(ctx, tenant, fromSeq, toSeq, fn) error`: reads the tenant's messages in [fromSeq, toSeq]. The range is cut to the tenant's last message when the call starts (read with `GetLastMsgForSubject`), so a large toSeq does not wait for new messages; an empty range returns nil without a consumer. Calls for one tenant on one node share a consumer when the running one started at or below the newcomer's fromSeq and has not yet handed out a message with sequence fromSeq or more; otherwise the newcomer gets its own. Each call receives only its own range. fn runs on the consumer's goroutine (a slow fn slows calls that share it); an fn error ends that call alone with the error wrapped; when Replay returns fn is not running. ctx ends the call; the consumer stops, and is deleted, when no call uses it. A consumer that says it has caught up (pending 0) is double-checked against the tenant's last sequence before the calls waiting on it are ended, because a message appended after the server counted pending could fall in a later caller's range.
+- `Log.consumers` (atomic) counts the server consumers the Log created; tests read it.
+
+`Props` encoding (props.go, unexported `encode(nats.Header)` and `decode(nats.Header) error`): headers only for present properties. `Tether-Prop-User` is base64url (unpadded) of frames, per property uvarint(len key) key uvarint(len value) value, so order, duplicate keys, CR/LF and non-UTF-8 bytes survive. `-Content-Type`, `-Response-Topic` and `-Correlation-Data` are base64url of the raw bytes. `-Message-Expiry` and `-Payload-Format` are decimal numbers (the latter present means non-nil, so a pointer to 0 survives). A header that does not parse is an error from decode.
+
 ## clustertest
 
 Import: github.com/xraph/tether/cluster/clustertest
@@ -64,4 +79,4 @@ Import: github.com/xraph/tether/cluster/clustertest
 - `StartCluster(t, n) *Cluster`: same, with `Servers []*server.Server`, `URLs()` and `Stop(i)`.
 - `FreePorts(t, n) []int`, `RouteURL(port) string`: for tests that run embedded nodes as a cluster.
 
-Tests: conn_test.go covers the single and three-node embedded connect, idempotent provisioning on one and three servers, NoEcho, unavailable, and the Validate table. sessions_test.go (package cluster, on a three-server clustertest cell) covers the one-winner Acquire race with both error shapes, stale revisions, the keyed lock, expiry seen by a watcher, re-create over a marker, WatchOwned, the record round trip, List and Get, invalid input and isLostCAS.
+Tests: conn_test.go covers the single and three-node embedded connect, idempotent provisioning on one and three servers, NoEcho, unavailable, and the Validate table. log_test.go (package cluster, `startLogs` gives one Log per node on a three-server cell) covers ordered reads with tenant isolation, `$` topics, QoS 2 dedup across nodes, fromSeq, handler errors and undecodable entries, Stop, shared and separate replay consumers (through `Log.consumers` and the server's consumer count), replay ranges, settle, cancel, invalid input, a closed connection and the Props round trip. sessions_test.go (package cluster, on a three-server clustertest cell) covers the one-winner Acquire race with both error shapes, stale revisions, the keyed lock, expiry seen by a watcher, re-create over a marker, WatchOwned, the record round trip, List and Get, invalid input and isLostCAS.
