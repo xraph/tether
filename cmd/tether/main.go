@@ -78,7 +78,7 @@ func loadConfig(path string, explicit bool) (config, error) {
 		return cfg, nil
 	}
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(filepath.Clean(path))
 	if errors.Is(err, os.ErrNotExist) && !explicit {
 		return cfg, nil
 	}
