@@ -31,10 +31,11 @@ type Handler interface {
 	// changed (rotated; the old one may still work during a grace window).
 	KeyInvalidated(ctx context.Context, keyID string, disconnect bool)
 
-	// KeyRotated reports that the keysmith key keyID was rotated at
-	// rotatedAt with a grace window: its previous secret keeps working
-	// until graceEnds, and no longer. A rotation with no grace window is
-	// KeyInvalidated(keyID, true) instead.
+	// KeyRotated reports that the keysmith key keyID was rotated with a
+	// grace window: its previous secret keeps working until graceEnds, and
+	// no longer. rotatedAt is a time after keysmith stored the new secret,
+	// so every connection made with the previous secret predates it. A
+	// rotation with no grace window is KeyInvalidated(keyID, true) instead.
 	KeyRotated(ctx context.Context, keyID string, rotatedAt, graceEnds time.Time)
 
 	// RolesChanged reports that the warden role roleID changed: updated,

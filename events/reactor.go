@@ -30,8 +30,9 @@ type reactor struct {
 //     connection authenticated with it (0x98 administrative action).
 //   - KeyInvalidated without disconnect: evict the key only.
 //   - KeyRotated (a rotation with a grace window): evict the key, then end
-//     every connection made before the rotation, which used the previous
-//     secret, when the grace window closes (ExpirePrincipal; 0xA0 then).
+//     every connection made before rotatedAt, which covers all that used
+//     the previous secret, when the grace window closes (ExpirePrincipal;
+//     0xA0 then).
 //     Connections made with the new secret stay, and one made with the
 //     previous secret during the window already expires with it, because
 //     keysmith says so when it validates (auth.Keysmith).

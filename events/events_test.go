@@ -11,6 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/keysmith"
+	kid "github.com/xraph/keysmith/id"
+	"github.com/xraph/keysmith/key"
+	"github.com/xraph/keysmith/rotation"
 	kmemory "github.com/xraph/keysmith/store/memory"
 	"github.com/xraph/warden"
 	"github.com/xraph/warden/role"
@@ -46,6 +49,7 @@ type env struct {
 	roles   *perm.Roles
 	bridge  *service.WardenRoles
 	wd      *warden.Engine
+	ks      *events.KeysmithPlugin
 	wctx    context.Context
 }
 
@@ -101,6 +105,7 @@ func newEnv(t *testing.T) *env {
 		roles:   perm.NewRoles(wd),
 		bridge:  bridge,
 		wd:      wd,
+		ks:      ks,
 		wctx:    scope.With(t.Context(), testApp, testOrg),
 	}
 }
@@ -326,6 +331,30 @@ func TestRotateKeepsConnection(t *testing.T) {
 
 	mustConnect(t, e.addr, "dev-2", creds)   // the old password, inside the grace window
 	mustConnect(t, e.addr, "dev-3", rotated) // and the new one
+}
+
+// TestRotationGraceCoversConnectBeforeHook covers the gap between keysmith
+// making the rotation record and the hook firing. Keysmith stores the new
+// secret only after it makes the record, so a CONNECT with the old secret can
+// complete in that gap, and the hook has to end it with the grace window too.
+func TestRotationGraceCoversConnectBeforeHook(t *testing.T) {
+	e := newEnv(t)
+	e.role(t, "dev", acl.Rules{Publish: []string{"up"}})
+	creds := e.provision(t, service.ProvisionInput{Roles: []string{"dev"}})
+
+	keyID, err := kid.ParseKeyID(creds.Username)
+	require.NoError(t, err)
+
+	createdAt := time.Now().Add(-time.Millisecond)
+	c := mustConnect(t, e.addr, "dev-1", creds) // the old secret, after the record was made
+
+	start := time.Now()
+	ends := start.Add(300 * time.Millisecond)
+	require.NoError(t, e.ks.OnKeyRotated(t.Context(), &key.Key{ID: keyID},
+		&rotation.Record{GraceTTL: time.Hour, CreatedAt: createdAt, GraceEnds: ends}))
+
+	assert.Equal(t, byte(0xA0), disconnectedWithin(t, c, 2*time.Second-time.Since(start)), "maximum connect time")
+	assert.False(t, time.Now().Before(ends), "not before the grace window closed")
 }
 
 func TestRoleChangeDropsSubscription(t *testing.T) {

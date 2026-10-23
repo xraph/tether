@@ -122,11 +122,16 @@ func TestKeysmithPluginMapsHooks(t *testing.T) {
 	h := &recorder{}
 	p.Bind(h)
 
-	rotatedAt := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
-	graceEnds := rotatedAt.Add(time.Hour)
+	createdAt := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	graceEnds := createdAt.Add(time.Hour)
 
-	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Hour, CreatedAt: rotatedAt, GraceEnds: graceEnds}))
-	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Minute, CreatedAt: rotatedAt})) // no GraceEnds: TTL after
+	before := time.Now()
+
+	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Hour, CreatedAt: createdAt, GraceEnds: graceEnds}))
+	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: time.Minute, CreatedAt: createdAt})) // no GraceEnds: TTL after
+
+	after := time.Now()
+
 	require.NoError(t, p.OnKeyRotated(ctx, k, nil))
 	require.NoError(t, p.OnKeyRotated(ctx, k, &rotation.Record{GraceTTL: 0})) // the old secret is dead at once
 	require.NoError(t, p.OnKeyRevoked(ctx, k, "stolen"))
@@ -134,15 +139,32 @@ func TestKeysmithPluginMapsHooks(t *testing.T) {
 	require.NoError(t, p.OnKeyExpired(ctx, k))
 
 	id := k.ID.String()
+	calls := h.all()
+	require.Len(t, calls, 7)
+
+	// The rotation time is when the hook ran, not the record's CreatedAt:
+	// keysmith makes the record before it stores the new secret, and an
+	// old-secret connection made in between must not slip past the cut-off.
+	// The grace end is still the record's.
+	for i, ends := range []time.Time{graceEnds, createdAt.Add(time.Minute)} {
+		c := calls[i]
+		require.Equal(t, "KeyRotated", c.Method)
+		require.Len(t, c.Args, 3)
+		assert.Equal(t, id, c.Args[0])
+
+		at, ok := c.Args[1].(time.Time)
+		require.True(t, ok)
+		assert.False(t, at.Before(before) || at.After(after), "rotatedAt %v is the hook's time", at)
+		assert.Equal(t, ends, c.Args[2])
+	}
+
 	assert.Equal(t, []call{
-		{"KeyRotated", []any{id, rotatedAt, graceEnds}},
-		{"KeyRotated", []any{id, rotatedAt, rotatedAt.Add(time.Minute)}},
 		{"KeyInvalidated", []any{id, false}},
 		{"KeyInvalidated", []any{id, true}},
 		{"KeyInvalidated", []any{id, true}},
 		{"KeyInvalidated", []any{id, true}},
 		{"KeyInvalidated", []any{id, true}},
-	}, h.all())
+	}, calls[2:])
 }
 
 func TestKeysmithPluginWired(t *testing.T) {

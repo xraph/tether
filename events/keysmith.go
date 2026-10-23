@@ -21,15 +21,16 @@ const pluginName = "tether"
 // Bind. Events that arrive before Bind are dropped.
 //
 // Rotation reports KeyRotated(id, rotatedAt, graceEnds): the previous secret
-// keeps working until the grace window ends. A rotation with no grace window
-// (keysmith.WithGrace(0), what a compromised key gets) reports
+// keeps working until the grace window ends. rotatedAt is when the hook ran,
+// which is after keysmith stored the new secret. A rotation with no grace
+// window (keysmith.WithGrace(0), what a compromised key gets) reports
 // KeyInvalidated(id, true) instead, because the previous secret is dead at
 // once and a connection made with it cannot be told from one made with the
 // new secret. A rotation hook with no record reports KeyInvalidated(id,
-// false). Revocation, suspension and expiry report
-// KeyInvalidated(id, true). Every hook returns nil and
-// recovers a panic from the Handler, because keysmith stops dispatching at
-// the first plugin error and would fail the caller's operation.
+// false). Revocation, suspension and expiry report KeyInvalidated(id, true).
+// Every hook returns nil and recovers a panic from the Handler, because
+// keysmith stops dispatching at the first plugin error and would fail the
+// caller's operation.
 type KeysmithPlugin struct {
 	h     atomic.Pointer[handlerRef]
 	wired atomic.Bool
@@ -81,9 +82,15 @@ func (p *KeysmithPlugin) OnKeyRotated(ctx context.Context, k *key.Key, rec *rota
 }
 
 // rotated reports a rotation with a grace window. The window ends at
-// rec.GraceEnds, or GraceTTL after the rotation when keysmith left it unset.
-// The rotation time is when keysmith made the record, before it stored the
-// new secret, so no connection made with the new secret can predate it.
+// rec.GraceEnds, or GraceTTL after rec.CreatedAt when keysmith left it unset.
+//
+// The rotation time it reports is now, when the hook runs, not
+// rec.CreatedAt. Keysmith makes the record before it stores the new secret,
+// so a CONNECT with the old secret (or one served from Tether's auth cache,
+// which the reactor evicts only after this) can complete between the two.
+// Cutting off at the hook catches that connection. The price is that a
+// connection made with the new secret in the same gap gets the grace end as
+// well, and simply reconnects then.
 func (p *KeysmithPlugin) rotated(ctx context.Context, k *key.Key, rec *rotation.Record) {
 	ref := p.h.Load()
 	if ref == nil || k == nil || k.ID.IsNil() {
@@ -92,17 +99,19 @@ func (p *KeysmithPlugin) rotated(ctx context.Context, k *key.Key, rec *rotation.
 
 	defer recoverHandler()
 
-	at := rec.CreatedAt
-	if at.IsZero() {
-		at = time.Now()
-	}
+	now := time.Now()
 
 	ends := rec.GraceEnds
 	if ends.IsZero() {
-		ends = at.Add(rec.GraceTTL)
+		from := rec.CreatedAt
+		if from.IsZero() {
+			from = now
+		}
+
+		ends = from.Add(rec.GraceTTL)
 	}
 
-	ref.h.KeyRotated(ctx, k.ID.String(), at, ends)
+	ref.h.KeyRotated(ctx, k.ID.String(), now, ends)
 }
 
 // OnKeyRevoked implements keysmith's plugin.KeyRevoked.
