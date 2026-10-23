@@ -259,7 +259,7 @@ func (r *replayer) open() (jetstream.Consumer, jetstream.MessagesContext, error)
 		return nil, nil, err
 	}
 
-	msgs, err := cons.Messages()
+	msgs, err := r.l.messages(cons)
 	if err != nil {
 		r.l.dropConsumer(cons)
 
@@ -417,8 +417,8 @@ func (r *replayer) shutdown(err error) {
 
 // closeLocked marks the consumer closed, takes it out of the Log's table and
 // signals its goroutine to stop. The caller holds the Log's rmu. It returns the
-// calls that were still waiting and the iterator to stop once the lock is
-// released (stopping may wait for the NATS client, which the lock must not).
+// calls that were still waiting and the iterator to stop with stopMsgs once the
+// lock is released.
 func (r *replayer) closeLocked() ([]*waiter, jetstream.MessagesContext) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -448,8 +448,11 @@ func (r *replayer) closeLocked() ([]*waiter, jetstream.MessagesContext) {
 	return ws, r.msgs
 }
 
+// stopMsgs stops the iterator in the background: while NATS is unreachable the
+// stop waits for the ordered consumer to finish an attempt to recreate itself,
+// and the caller may be a Replay whose context has ended.
 func stopMsgs(msgs jetstream.MessagesContext) {
 	if msgs != nil {
-		msgs.Stop()
+		go msgs.Stop()
 	}
 }

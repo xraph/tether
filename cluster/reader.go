@@ -43,7 +43,11 @@ type Reader struct {
 	pos    atomic.Uint64
 	stop   chan struct{}
 	once   sync.Once
-	done   chan struct{}
+
+	// fnMu is held while fn runs. Stop takes it to set stopped, which is how
+	// it knows fn is not running and will not run again.
+	fnMu    sync.Mutex
+	stopped bool
 }
 
 // Reader starts reading tenant's messages. fromSeq 0 means only messages
@@ -96,7 +100,7 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 		return nil, err
 	}
 
-	msgs, err := cons.Messages()
+	msgs, err := l.messages(cons)
 	if err != nil {
 		l.dropConsumer(cons)
 
@@ -105,7 +109,7 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 
 	r := &Reader{
 		l: l, tenant: tenant, cons: cons, msgs: msgs, fn: fn,
-		stop: make(chan struct{}), done: make(chan struct{}),
+		stop: make(chan struct{}),
 	}
 	r.pos.Store(start - 1)
 
@@ -122,20 +126,27 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 // goroutine.
 func (r *Reader) Position() uint64 { return r.pos.Load() }
 
-// Stop ends the reader, waits for its goroutine (so fn is not running when
-// Stop returns) and deletes its consumer. It is safe to call more than once.
-// Calling it from fn waits for itself forever.
+// Stop ends the reader. When it returns, fn is not running and is never called
+// again: Stop waits for a message that fn is in the middle of, and no more
+// reach it after that. It does not wait for the consumer. The iterator and the
+// server consumer are shut down in the background, which can take 20 s or more
+// while NATS is unreachable (the ordered consumer is then in its recreate
+// loop and leaves it only between attempts), and a fenced node must be able to
+// stop all its readers at once. Stop is safe to call more than once. Calling
+// it from fn waits for itself forever.
 func (r *Reader) Stop() {
 	r.once.Do(func() {
-		close(r.stop)
-		r.msgs.Stop()
-	})
+		r.fnMu.Lock()
+		r.stopped = true
+		r.fnMu.Unlock()
 
-	<-r.done
+		close(r.stop)
+
+		go r.msgs.Stop()
+	})
 }
 
 func (r *Reader) run() {
-	defer close(r.done)
 	defer r.l.dropConsumer(r.cons)
 
 	r.l.pump(r.msgs, r.stop, r.handle)
@@ -161,11 +172,27 @@ func (r *Reader) handle(msg jetstream.Msg) {
 
 	lm.Seq = seq
 
-	if err := r.fn(lm); err != nil {
-		r.l.logger.Warn("log reader: handler failed, going on to the next entry", "tenant", r.tenant, "seq", seq, "error", err)
+	if !r.call(lm) {
+		return
 	}
 
 	r.advance(seq)
+}
+
+// call runs fn for lm unless the reader has been stopped, which it reports.
+func (r *Reader) call(lm LogMessage) bool {
+	r.fnMu.Lock()
+	defer r.fnMu.Unlock()
+
+	if r.stopped {
+		return false
+	}
+
+	if err := r.fn(lm); err != nil {
+		r.l.logger.Warn("log reader: handler failed, going on to the next entry", "tenant", r.tenant, "seq", lm.Seq, "error", err)
+	}
+
+	return true
 }
 
 func (r *Reader) advance(seq uint64) {
@@ -198,6 +225,15 @@ func (l *Log) consumer(ctx context.Context, tenant string, start uint64, inactiv
 	l.consumers.Add(1)
 
 	return cons, nil
+}
+
+// messages starts the iterator of cons.
+func (l *Log) messages(cons jetstream.Consumer) (jetstream.MessagesContext, error) {
+	if l.heartbeat > 0 {
+		return cons.Messages(jetstream.PullHeartbeat(l.heartbeat))
+	}
+
+	return cons.Messages()
 }
 
 // dropConsumer deletes cons on the server, best effort: the server would

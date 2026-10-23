@@ -83,6 +83,10 @@ type Log struct {
 
 	// consumers counts the server consumers this Log created, for tests.
 	consumers atomic.Int64
+	// heartbeat is the idle heartbeat of the pull requests of readers and
+	// replays, 0 for the nats.go default (5 s, so a dead server is noticed
+	// after about 10 s). Tests shorten it.
+	heartbeat time.Duration
 }
 
 type streamBox struct{ s jetstream.Stream }

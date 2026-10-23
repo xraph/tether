@@ -1174,3 +1174,249 @@ func TestReaderAndReplayWhenConnClosed(t *testing.T) {
 		t.Fatal("Replay did not return after the connection closed")
 	}
 }
+
+// startOutageLog starts a one-server cell, so a test can take NATS away from
+// the node, and returns the log with the server to stop. Readers and replays
+// notice a dead server after about a second.
+func startOutageLog(t *testing.T) (*Log, *clustertest.Cluster) {
+	t.Helper()
+
+	cl := clustertest.StartCluster(t, 1)
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.NodeID = "n1"
+	cfg.Cell = "c1"
+	cfg.Mode = ModeExternal
+	cfg.URLs = cl.URLs()
+	cfg.Replicas = 1
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	l := NewLog(c, cfg)
+	l.heartbeat = 500 * time.Millisecond
+
+	return l, cl
+}
+
+// A node cut off from NATS has readers inside the ordered consumer's recreate
+// loop, which the library does not leave for ten seconds or more. Stop must
+// not wait for it: a fenced node stops all its readers at once.
+func TestReaderStopWhileUnreachable(t *testing.T) {
+	l, cl := startOutageLog(t)
+
+	for range 5 {
+		mustAppend(t, l, LogMessage{Tenant: testTenant, Topic: "t"})
+	}
+
+	var calls atomic.Int32
+
+	readers := make([]*Reader, 3)
+
+	for i := range readers {
+		tenant := testTenant
+		if i > 0 {
+			tenant = fmt.Sprintf("ttnt_other%d", i)
+
+			mustAppend(t, l, LogMessage{Tenant: tenant, Topic: "t"})
+		}
+
+		r, err := l.Reader(tenant, 1, func(LogMessage) error {
+			calls.Add(1)
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		readers[i] = r
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for calls.Load() < 7 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if calls.Load() != 7 {
+		t.Fatalf("readers saw %d messages, want 7", calls.Load())
+	}
+
+	cl.Stop(0)
+	time.Sleep(4 * time.Second) // well past two missed heartbeats
+
+	start := time.Now()
+
+	for _, r := range readers {
+		r.Stop()
+	}
+
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("stopping 3 readers took %s while NATS was unreachable", d)
+	}
+
+	n := calls.Load()
+
+	time.Sleep(time.Second)
+
+	if calls.Load() != n {
+		t.Fatal("handler called after Stop returned")
+	}
+}
+
+// After Stop returns the handler is not running and is never called again,
+// even when Stop arrives in the middle of a message.
+func TestReaderStopWaitsForRunningHandler(t *testing.T) {
+	l, _ := startOutageLog(t)
+
+	var (
+		running atomic.Int32
+		calls   atomic.Int32
+		entered = make(chan struct{}, 1)
+	)
+
+	r, err := l.Reader(testTenant, 0, func(LogMessage) error {
+		calls.Add(1)
+		running.Add(1)
+		defer running.Add(-1)
+
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+
+		time.Sleep(300 * time.Millisecond)
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for range 10 {
+		mustAppend(t, l, LogMessage{Tenant: testTenant, Topic: "t"})
+	}
+
+	<-entered
+	r.Stop()
+
+	if running.Load() != 0 {
+		t.Fatal("handler running after Stop returned")
+	}
+
+	n := calls.Load()
+
+	time.Sleep(time.Second)
+
+	if calls.Load() != n {
+		t.Fatalf("handler called after Stop returned: %d -> %d", n, calls.Load())
+	}
+
+	waitNoConsumers(t, l)
+}
+
+// A cancelled Replay returns when its context ends, also while the consumer
+// is stuck recreating itself against a server that is gone.
+func TestReplayCancelWhileUnreachable(t *testing.T) {
+	l, cl := startOutageLog(t)
+
+	const total = 3000
+
+	var wg sync.WaitGroup
+
+	for w := range 10 {
+		wg.Go(func() {
+			for range total / 10 {
+				if _, _, err := l.Append(tctx(t, 60*time.Second), LogMessage{Tenant: testTenant, Topic: fmt.Sprintf("t/%d", w), QoS: 1}, ""); err != nil {
+					t.Error(err)
+
+					return
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if t.Failed() {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	var (
+		gate    = make(chan struct{})
+		entered = make(chan struct{})
+		once    sync.Once
+		calls   atomic.Int32
+		running atomic.Int32
+	)
+
+	done := make(chan error, 1)
+
+	go func() {
+		done <- l.Replay(ctx, testTenant, 1, total, func(LogMessage) error {
+			calls.Add(1)
+			running.Add(1)
+			defer running.Add(-1)
+
+			once.Do(func() {
+				close(entered)
+				<-gate
+			})
+
+			return nil
+		})
+	}()
+
+	<-entered
+	cl.Stop(0)
+	close(gate) // the buffered messages drain, then the consumer is cut off
+
+	time.Sleep(4 * time.Second)
+
+	select {
+	case err := <-done:
+		t.Fatalf("replay ended before cancel: %v (%d messages)", err, calls.Load())
+	default:
+	}
+
+	start := time.Now()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Replay did not return after cancel")
+	}
+
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("cancelled Replay took %s to return while NATS was unreachable", d)
+	}
+
+	if running.Load() != 0 {
+		t.Fatal("handler running after Replay returned")
+	}
+
+	n := calls.Load()
+
+	time.Sleep(time.Second)
+
+	if calls.Load() != n {
+		t.Fatal("handler called after Replay returned")
+	}
+}
