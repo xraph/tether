@@ -59,6 +59,10 @@ type Router struct {
 	mu     sync.Mutex // guards routes, closed and every route's pins
 	routes map[routeKey]*route
 	closed bool
+
+	// testUnpin, when set by a test before the router is used, runs at the top
+	// of unpin with the route's mutex held.
+	testUnpin func(key routeKey, e *route)
 }
 
 // NewRouter returns a router on c for the node nodeID. deliver is called for
@@ -147,20 +151,25 @@ func (r *Router) pin(key routeKey) (*route, error) {
 }
 
 // unpin releases e and forgets it when nobody holds or waits for it and it has
-// no references.
+// no references. It takes the router's lock while still holding e.mu, so refs
+// cannot change between the check and the delete: a Subscribe that pinned e
+// before this point shows in pins and keeps it, and one that pins after the
+// delete makes a new route. The lock order is e.mu then Router.mu; no code waits
+// for e.mu while holding Router.mu.
 func (r *Router) unpin(key routeKey, e *route) {
-	idle := e.refs == 0
-
-	e.mu.Unlock()
+	if r.testUnpin != nil {
+		r.testUnpin(key, e)
+	}
 
 	r.mu.Lock()
 
 	e.pins--
-	if e.pins == 0 && idle && r.routes[key] == e {
+	if e.pins == 0 && e.refs == 0 && r.routes[key] == e {
 		delete(r.routes, key)
 	}
 
 	r.mu.Unlock()
+	e.mu.Unlock()
 }
 
 // Subscribe adds one reference to (tenant, filter). The first reference
@@ -275,6 +284,9 @@ func (e *route) drop() error {
 
 // Close unsubscribes everything and makes later Subscribe, Unsubscribe and
 // Publish calls fail. It is idempotent. It does not close the Conn.
+//
+// Close is not a barrier for deliver: a message NATS had already handed to a
+// dispatch goroutine can still reach deliver briefly after Close returns.
 func (r *Router) Close() {
 	r.mu.Lock()
 

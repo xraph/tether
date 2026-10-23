@@ -622,6 +622,99 @@ func TestRefcountConcurrent(t *testing.T) {
 	}
 }
 
+// The interleaving that once orphaned a route: Unsubscribe drops the last
+// reference and is about to forget the route while a Subscribe has already
+// pinned it. The route must survive with the new reference and its
+// subscriptions, and a later Unsubscribe and Close must clean it up.
+func TestUnpinKeepsRouteSubscribeWon(t *testing.T) {
+	n := startRouteNodes(t, 1)[0]
+	key := routeKey{"t1", "u/#"}
+
+	mustSub(t, n, "t1", "u/#")
+
+	subscribed := make(chan error, 1)
+	armed := true
+
+	n.r.testUnpin = func(k routeKey, _ *route) {
+		if !armed || k != key {
+			return
+		}
+
+		armed = false
+
+		// Unsubscribe has dropped the last reference and holds the route
+		// mutex. Start a Subscribe and wait until it has pinned the route.
+		go func() { subscribed <- n.r.Subscribe("t1", "u/#") }()
+
+		deadline := time.Now().Add(5 * time.Second)
+
+		for {
+			n.r.mu.Lock()
+			e := n.r.routes[key]
+			pinned := e != nil && e.pins == 2
+			n.r.mu.Unlock()
+
+			if pinned {
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Error("the second Subscribe never pinned the route")
+
+				return
+			}
+
+			time.Sleep(time.Millisecond)
+		}
+
+		// Give the Subscribe every chance to run to the end. While Unsubscribe
+		// holds the route mutex it cannot; a version that released the mutex
+		// before this point would let it finish, and then Unsubscribe would
+		// delete a route that holds a reference.
+		select {
+		case err := <-subscribed:
+			subscribed <- err
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	if err := n.r.Unsubscribe("t1", "u/#"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-subscribed; err != nil {
+		t.Fatal(err)
+	}
+
+	n.r.mu.Lock()
+	e := n.r.routes[key]
+	n.r.mu.Unlock()
+
+	if e == nil {
+		t.Fatal("the route was deleted while a Subscribe held a reference to it")
+	}
+
+	if got := n.held(); got != 2 {
+		t.Fatalf("held %d nats subscriptions, want 2", got)
+	}
+
+	if err := n.r.Unsubscribe("t1", "u/#"); err != nil {
+		t.Fatalf("Unsubscribe of the surviving reference = %v", err)
+	}
+
+	if got := n.held(); got != 0 {
+		t.Fatalf("held %d nats subscriptions after the last Unsubscribe, want 0", got)
+	}
+
+	// And Close cleans up a route that is still referenced.
+	mustSub(t, n, "t1", "u/#")
+	n.r.Close()
+
+	if got := n.held(); got != 0 {
+		t.Fatalf("Close left %d nats subscriptions", got)
+	}
+}
+
 // Close racing Subscribe must not leave a subscription behind.
 func TestCloseRacesSubscribe(t *testing.T) {
 	nodes := startRouteNodes(t, 1)
