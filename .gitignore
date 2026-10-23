@@ -14,3 +14,6 @@ build-errors.log
 # ─── Binary built by `go build ./cmd/tether` ────────────────
 /tether
 /data/
+
+# ─── Design notes, kept on disk, not committed ──────────────
+_project_files/

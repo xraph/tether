@@ -1,6 +1,6 @@
 # Working in tether
 
-Tether is a multi-tenant MQTT broker in the xraph forgery stack. You import it as a library, and a Forge extension (under `extension/`) mounts it in a Forge app. It embeds mochi-mqtt for the protocol, keysmith for device keys and warden for topic permissions. The design lives in `_project_files/TETHER-DESIGN.md`, and when this file and the design disagree, the design wins.
+Tether is a multi-tenant MQTT broker in the xraph forgery stack. You import it as a library, and a Forge extension (under `extension/`) mounts it in a Forge app. It embeds mochi-mqtt for the protocol, keysmith for device keys and warden for topic permissions. The design lives in `_project_files/TETHER-DESIGN.md`, and when this file and the design disagree, the design wins. Git ignores `_project_files/`, so a fresh clone doesn't have it: ask for a copy before you change anything the design covers.
 
 Module path: `github.com/xraph/tether`. One `go.mod` covers the repo. It's `go 1.26.0` with `toolchain go1.26.9`, and the license is MIT with Rex Raphael as the copyright holder, which is what every new package in the stack gets.
 
