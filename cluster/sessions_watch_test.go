@@ -1,0 +1,222 @@
+package cluster
+
+import (
+	"testing"
+)
+
+// testKey is the key every bare-watch test works on.
+const testKey = "t.k"
+
+// newBareWatch returns an ownedWatch for node n1 with no NATS behind it. The
+// tests feed it begin, handle and end calls in the orders the real code can
+// produce and read what it decided from w.fires.
+func newBareWatch() *ownedWatch {
+	return &ownedWatch{
+		nodeID:  "n1",
+		owned:   make(map[string]ownedState),
+		flights: make(map[string]*watchEvent),
+		floors:  make(map[string]uint64),
+		kick:    make(chan struct{}, 1),
+	}
+}
+
+func put(rev uint64, owner string, epoch uint64) watchEvent {
+	return watchEvent{key: testKey, rev: rev, rec: &SessionRecord{Owner: owner, Epoch: epoch}}
+}
+
+// purge is the delete marker at revision 9, which every test uses.
+func purge() watchEvent {
+	return watchEvent{key: testKey, rev: 9, deleted: true}
+}
+
+func (w *ownedWatch) drain() []fireItem {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	f := w.fires
+	w.fires = nil
+
+	return f
+}
+
+func (w *ownedWatch) checkClean(t *testing.T) {
+	t.Helper()
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if len(w.floors) != 0 || len(w.flights) != 0 {
+		t.Fatalf("leftover state: floors %v, flights %v", w.floors, w.flights)
+	}
+}
+
+func TestOwnedWatchOwnDelete(t *testing.T) {
+	for name, order := range map[string]string{
+		"event before end": "event,end",
+		"end before event": "end,event",
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newBareWatch()
+			w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+			w.begin(testKey)
+
+			if order == "event,end" {
+				w.handle(purge()) // parked: the write is in flight
+				w.end(testKey, 9, nil, true, true)
+			} else {
+				w.end(testKey, 9, nil, true, true)
+				w.handle(purge())
+			}
+
+			if f := w.drain(); len(f) != 0 {
+				t.Fatalf("own delete fired %+v", f)
+			}
+
+			if _, ok := w.owned[testKey]; ok {
+				t.Fatal("deleted key still tracked")
+			}
+
+			w.checkClean(t)
+		})
+	}
+}
+
+func TestOwnedWatchOwnDeleteLaggingPut(t *testing.T) {
+	w := newBareWatch()
+	w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+	// The delete is acknowledged before the watch has delivered an older put of
+	// the same node. The put must not bring the key back, and the marker after
+	// it must not fire.
+	w.begin(testKey)
+	w.end(testKey, 9, nil, true, true)
+
+	w.handle(put(7, "n1", 1))
+	w.handle(purge())
+
+	if f := w.drain(); len(f) != 0 {
+		t.Fatalf("fired %+v", f)
+	}
+
+	if len(w.owned) != 0 {
+		t.Fatalf("tracked %v", w.owned)
+	}
+
+	w.checkClean(t)
+}
+
+func TestOwnedWatchDeleteFailsTakeoverParked(t *testing.T) {
+	w := newBareWatch()
+	w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+	// Our delete is in flight while another node takes the session over. Our
+	// delete loses; the parked takeover must then fire.
+	w.begin(testKey)
+	w.handle(put(8, "n2", 2))
+	w.end(testKey, 0, nil, true, false)
+
+	f := w.drain()
+	if len(f) != 1 || f[0].deleted || f[0].rec == nil || f[0].rec.Owner != "n2" {
+		t.Fatalf("fires = %+v, want one takeover by n2", f)
+	}
+
+	if len(w.owned) != 0 {
+		t.Fatalf("still tracked: %v", w.owned)
+	}
+
+	w.checkClean(t)
+}
+
+func TestOwnedWatchWriteFailsTakeoverParked(t *testing.T) {
+	w := newBareWatch()
+	w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+	w.begin(testKey)
+	w.handle(put(8, "n2", 2))
+	w.end(testKey, 0, &SessionRecord{Owner: "n1", Epoch: 1}, false, false)
+
+	if f := w.drain(); len(f) != 1 || f[0].rec == nil || f[0].rec.Owner != "n2" {
+		t.Fatalf("fires = %+v, want one takeover by n2", f)
+	}
+
+	w.checkClean(t)
+}
+
+func TestOwnedWatchOwnWriteThenTakeover(t *testing.T) {
+	for name, eventFirst := range map[string]bool{"event before end": true, "end before event": false} {
+		t.Run(name, func(t *testing.T) {
+			w := newBareWatch()
+			w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+			own := &SessionRecord{Owner: "n1", Epoch: 1}
+
+			w.begin(testKey)
+
+			if eventFirst {
+				w.handle(put(6, "n1", 1)) // our own write, parked
+			}
+
+			w.end(testKey, 6, own, false, true)
+
+			if !eventFirst {
+				w.handle(put(6, "n1", 1))
+			}
+
+			if f := w.drain(); len(f) != 0 {
+				t.Fatalf("own write fired %+v", f)
+			}
+
+			if st := w.owned[testKey]; st.rev != 6 || st.epoch != 1 {
+				t.Fatalf("tracked %+v, want rev 6 epoch 1", st)
+			}
+
+			// A takeover after our write fires once.
+			w.handle(put(7, "n2", 2))
+
+			f := w.drain()
+			if len(f) != 1 || f[0].rec == nil || f[0].rec.Owner != "n2" || f[0].deleted {
+				t.Fatalf("fires = %+v, want one takeover by n2", f)
+			}
+
+			if len(w.owned) != 0 {
+				t.Fatalf("still tracked: %v", w.owned)
+			}
+
+			w.checkClean(t)
+		})
+	}
+}
+
+func TestOwnedWatchParkedNewerThanWrite(t *testing.T) {
+	w := newBareWatch()
+	w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+	// Our write lands at 6 and a takeover at 7 is parked behind it.
+	w.begin(testKey)
+	w.handle(put(6, "n1", 1))
+	w.handle(put(7, "n2", 2))
+	w.end(testKey, 6, &SessionRecord{Owner: "n1", Epoch: 1}, false, true)
+
+	f := w.drain()
+	if len(f) != 1 || f[0].rec == nil || f[0].rec.Owner != "n2" {
+		t.Fatalf("fires = %+v, want the takeover", f)
+	}
+
+	w.checkClean(t)
+}
+
+func TestOwnedWatchPurgeOfOwnedKey(t *testing.T) {
+	w := newBareWatch()
+	w.owned[testKey] = ownedState{rev: 5, epoch: 1}
+
+	// An expiry marker for a key the node owns fires once, then the key is
+	// forgotten.
+	w.handle(purge())
+
+	if f := w.drain(); len(f) != 1 || !f[0].deleted || f[0].rec != nil {
+		t.Fatalf("fires = %+v, want one deletion", f)
+	}
+
+	w.checkClean(t)
+}

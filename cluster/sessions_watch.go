@@ -155,7 +155,12 @@ func (w *ownedWatch) end(key string, rev uint64, rec *SessionRecord, deleted, ok
 		case deleted:
 			delete(w.owned, key)
 
-			w.floors[key] = rev
+			// The floor makes the watch skip the marker when it arrives. If the
+			// watch delivered it already (it is parked, at this revision or
+			// later), nothing is left to skip, and a floor would stay forever.
+			if parked == nil || parked.rev < rev {
+				w.floors[key] = rev
+			}
 		case rec != nil && rec.Owner == w.nodeID:
 			w.owned[key] = ownedState{rev: rev, epoch: rec.Epoch}
 		default:
