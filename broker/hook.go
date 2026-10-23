@@ -390,6 +390,13 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 
 	st := h.b.state.get(cl)
 	if st == nil {
+		// A clean DISCONNECT still has to reach mochi, or the read ends
+		// with an error and mochi publishes the will the client asked it
+		// to drop.
+		if pk.FixedHeader.Type == packets.Disconnect {
+			return pk, nil
+		}
+
 		return pk, packets.ErrRejectPacket
 	}
 

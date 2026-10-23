@@ -446,6 +446,29 @@ func TestOutboundStripFailureFailsClosed(t *testing.T) {
 	}
 }
 
+// A DISCONNECT from a client with no state passes through, so mochi ends the
+// connection cleanly and drops the will. Refusing it would end the read with
+// an error, and mochi would publish the will. Every other packet from such a
+// client is still refused.
+func TestOnPacketReadNilStateDisconnect(t *testing.T) {
+	h, srv, ta := unitHook(t, tenant.Limits{})
+	cl, _ := netClient(t, srv, ta.ID.String()+"/gone", 5)
+
+	disc := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Disconnect},
+		ReasonCode:  packets.CodeDisconnect.Code,
+		Properties:  packets.Properties{SessionExpiryInterval: 30, SessionExpiryIntervalFlag: true},
+	}
+
+	got, err := h.OnPacketRead(cl, disc)
+	require.NoError(t, err)
+	assert.Equal(t, disc, got, "unchanged")
+
+	pub := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Publish}, TopicName: "t"}
+	_, err = h.OnPacketRead(cl, pub)
+	assert.Equal(t, packets.ErrRejectPacket, err)
+}
+
 // OnPublish error semantics (mochi-facts "PUBLISH path"): a bare
 // ErrQuotaExceeded only for 5.0 QoS 1; ErrRejectPacket for everything else, or
 // mochi would publish the message anyway. The inline client is never limited.
