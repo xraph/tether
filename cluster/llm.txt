@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/cluster
 
-Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. The QoS 0 router (route.go, dedup.go) sits on `*Conn` too. Later tasks add the members and retained code.
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. The QoS 0 router (route.go, dedup.go) sits on `*Conn` too, and so does the membership service (members.go). Later tasks add the retained code.
 
 ## Config
 
@@ -85,6 +85,21 @@ QoS 0 messages cross nodes by NATS subject interest, on core NATS (no JetStream)
 - `Close()`: unsubscribes everything, idempotent, does not close the Conn, and is not a barrier for deliver: a message NATS already handed to a dispatch goroutine can reach deliver briefly after Close returns. After it Subscribe, Unsubscribe and Publish return an error wrapping `ErrUnavailable`. A Subscribe racing Close never leaves a subscription behind (the route is marked dead under its mutex).
 
 route_test.go (package cluster, `startRouteNodes` gives n nodes, each with its own connection, on a three-server cell; `ready(a, b)` waits for b's interest to reach a's server with a probe subscription, which routes keep in order) covers routing across nodes, overlap dedup over three filters, `a/#` matching `a`, the `$` rule, tenant isolation, refcounts, NoEcho, the Props round trip, a foreign publisher, invalid input, Close, concurrent Subscribe/Unsubscribe and Close racing Subscribe under -race, and the dedup window and bounds with a fake clock.
+
+## Members
+
+`NewMembers(c *Conn, cfg Config) *Members` (the members bucket must exist: Provision first). Each node writes `{node_id, started_at, seq}` (snake_case JSON) under its own key (the node ID) in the members bucket every `Heartbeat`, with a plain `Put` (history 1), and watches every key. A renew succeeds when the KV put is acknowledged. A write times out after Lease/4, well under Lease/2, and the heartbeat goroutine and the monitor are separate, so a hung write cannot hold the fence back. Every duration is a local `time.Now()` reading compared with `time.Since`; KV timestamps are never used.
+
+- `Start(ctx) error`: writes the first heartbeat, then starts the watch and waits until it has delivered the members that exist (the nil marker). ctx bounds Start only (10 s when it has no deadline); the goroutines run until Stop. A Stop during Start ends it. Once only. A missing bucket is an error that does not wrap ErrUnavailable; a timeout does.
+- `Stop()`: idempotent; waits for the goroutines and for a callback that is running, and no callback runs after it returns. The node's key stays in the bucket (peers declare it dead after the lease), it is not deleted. Never call it from a callback.
+- `OnFence(fn)`: once when no renew has succeeded for Lease/2. Checked every Heartbeat/4 (min 5 ms), so it fires within Lease/2 + one tick of the last renew, however the connection fails (blackholed, closed, JetStream down). `OnUnfence(fn)`: when a renew succeeds again after a fence. `Fenced() bool`.
+- `OnPeerDead(fn func(nodeID string))`: once per peer that has not been seen for Lease + 2 s (`peerDeadMargin`, fixed; not configurable). "Seen" is the local receive time of a watch update with a higher revision (or a new started_at); a replayed update proves nothing. A peer heard from again is live again (logged, no callback) and can die a second time. A node never declares itself dead. Key deletions in the bucket are ignored, so the peer just ages out.
+- While this node is fenced, or its watch has not shown its own heartbeat for a Lease, nobody is declared dead and every live peer's clock restarts each tick: a node that cannot see the cell must not call the cell dead, and gives its peers a full window once it sees again.
+- `Live() []string`: sorted IDs of this node and the peers not declared dead; nil while fenced. `IsLeaderFor(deadNode) bool`: this node is running, not fenced, is not deadNode, and has the lowest ID (byte order) among the live nodes other than deadNode.
+- Callbacks run one at a time, in transition order, on one Members goroutine and never under a lock of Members. A slow callback delays the ones behind it and Stop; hand real work to your own goroutine. Register them before Start.
+- Locking: one mutex guards the state; no NATS call is made while it is held.
+
+members_test.go (package cluster, `startMemberCell` provisions a three-server cell, `memberCell.node` starts a node, optionally through a `chaos.Proxy`; heartbeat 100 ms, lease 1 s, so peers die after 3 s) covers peers seeing each other, death after lease + 2 s (never before the lease) and revival, the fence within Lease/2 + slack when the node's NATS connection is blackholed through the proxy, one OnFence and the unfence after the heal, a fenced node declaring nobody dead, the lowest node ID being the only leader, Stop being final, a missing bucket and a closed connection.
 
 ## clustertest
 
