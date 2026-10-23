@@ -1,6 +1,6 @@
 # Tether: a multi-tenant, clustered MQTT broker on mochi
 
-Status: approved in brainstorming on 2026-10-22, revised after builder review the same day; Rex settled key and role ownership and the companion dashboard. Awaiting Rex's read.
+Status: approved in brainstorming on 2026-10-22, revised after builder review the same day; Rex settled key and role ownership and the companion dashboard. Phase 1 built 2026-10-22; Phase 0 results folded in 2026-10-23.
 Home: this file lives in forge's gitignored specs folder until the new repo exists. Move it to `docs/superpowers/specs/` in that repo on day one.
 
 "Tether" is a placeholder name (my call). Rename freely; nothing below depends on it.
@@ -90,7 +90,7 @@ A **cell** is a group of stateless broker nodes plus one NATS cluster with JetSt
 | Deployment modes | **Single node**: no NATS, sessions and retained messages in mochi's own Badger storage hook (`hooks/storage/badger`), control-plane tables in SQLite or Postgres through grove. **Small cluster** (up to 3 nodes): `nats-server` embedded in each broker node. **Production cell**: external NATS cluster (3 or 5 JetStream servers) and stateless, autoscalable broker nodes **(my call)**. Embedded mode isn't used at the 1M target because broker churn would become JetStream peer churn, which needs manual `peer-remove`. |
 | NATS version | nats-server 2.11 or later (per-message TTL and limit markers are required). |
 | QoS 0 routing | **NATS subject interest.** Each node holds one core NATS subscription per distinct (tenant, filter) with at least one local subscriber, reference-counted. A publish goes out once on the subject for its topic, and NATS delivers to exactly the nodes with matching interest. No route table of our own. QoS 0 delivery is best effort, as MQTT defines it. |
-| QoS 1/2 routing and durability | Committed once to a replicated JetStream stream (R3) before PUBACK/PUBREC. Every node serving a tenant reads that tenant's log through an ordered consumer filtered to `d.<tenant>.>` and matches locally. Delivery to sessions comes only from the log, never from core NATS, so a slow consumer can't silently skip a message. |
+| QoS 1/2 routing and durability | Committed once to a replicated JetStream stream (R3) before PUBACK/PUBREC, acknowledged asynchronously from the hook (Phase 0). Every node serving a tenant reads that tenant's log through an ordered consumer filtered to `d.<tenant>.>` and matches locally. Delivery to sessions comes only from the log, never from core NATS, so a slow consumer can't silently skip a message. |
 | Session state and ownership | One JetStream KV key per session holds both the owner (node ID, epoch) and the state (subscriptions, cursor, will, QoS 2 state). Every write, including takeover, is a compare-and-set on that key's revision. A stale owner's next write fails, and it drops the connection. |
 | Node liveness | A membership heartbeat per node. A node that can't reach JetStream for half the lease drops all its clients (self-fencing). Survivors act on a node only after the full lease plus a margin. |
 | Tenant-to-cell placement | Stored in the control plane. v1: everyone is in cell 1. Phase 3: SNI routing by tenant hostname at the load balancer, with MQTT 5 server-redirect as a fallback. |
@@ -135,15 +135,15 @@ mochi keeps its own in-memory state, and the cluster layer has to live with that
 
 ### Encoding topics and client IDs
 
-One reversible encoding serves both NATS subjects and JetStream KV keys, so it must satisfy the stricter of the two: KV keys allow only `[-/_=.a-zA-Z0-9]`. Each MQTT level becomes one token; `.` separates tokens; a level made only of `[-_=a-zA-Z0-9]` passes through; any other level (UTF-8, `$`, `.`, whitespace, empty levels as in `a//b`) is written as a marker plus base64url without padding. Wildcards map `+` → `*` and `#` → `>`. Client IDs use the same encoding as a single token. The exact marker is fixed in phase 0 with a round-trip fuzz test.
+One reversible encoding serves both NATS subjects and JetStream KV keys, so it must satisfy the stricter of the two: KV keys allow only `[-/_=.a-zA-Z0-9]`. Each MQTT level becomes one token; `.` separates tokens; a level made only of `[-_=a-zA-Z0-9]` passes through; any other level (UTF-8, `$`, `.`, whitespace, empty levels as in `a//b`) is written as a marker plus base64url without padding. Wildcards map `+` → `*` and `#` → `>`. Client IDs use the same encoding as a single token. Phase 0 fixed the scheme (spike 2, `spikes/encoding/`): a level made of `[-_=a-zA-Z0-9]` that doesn't start with `=` passes through; anything else (including the empty level) becomes `=` plus unpadded base64url, so a passthrough level can never be read as an encoded one. Encoded length is at most `2N+1` bytes, so the 1 KiB topic cap is load-bearing: enforce it, and a client-ID length cap, before encoding.
 
 `a/#` in MQTT also matches `a`; NATS `>` needs at least one more token, so the node subscribes to both `a` and `a.>`.
 
 Subject layout per cell:
 
-- QoS 0: `f.<tenant>.<encoded topic>`
-- QoS 1/2 log: `d.<tenant>.<encoded topic>`
-- KV keys: `s.<tenant>.<client>` (sessions), `r.<tenant>.<encoded topic>` (retained), `n.<node>` (membership)
+- QoS 0: `f.<tenant>.<encoded topic>`, except a topic whose first level starts with `$` goes under `f.==<tenant>.<encoded topic>`. That keeps MQTT's rule (a leading wildcard never matches a `$` topic) true in NATS, where `*` would otherwise match the `$` level.
+- QoS 1/2 log: `d.<tenant>.<encoded topic>`, with `$` topics under the ordinary tenant token. Node consumers match locally with tether's `topic.Match`, which already applies the `$` rule, and spike 4 showed a consumer with two filters (`T.>` plus `==T.>`) reads about 100x slower than one (`d.<tenant>.>`), so the log keeps a single tenant prefix.
+- KV keys: `s.<tenant>.<client>` (sessions), `r.<tenant>.<encoded topic>` (retained, `$` topics under `==<tenant>`), `n.<node>` (membership)
 
 ### QoS 0 path
 
@@ -156,7 +156,7 @@ The publishing node publishes once to `f.<tenant>.<topic>`. Receiving nodes may 
 3. QoS 2: first write a pending entry into the session key (packet ID → a fresh random message ID), then publish with that random ID as `Nats-Msg-Id`, then send PUBREC. A DUP resend finds the pending entry and reuses its ID, so JetStream deduplicates it; the entry is removed on PUBREL. The JetStream duplicate window must exceed the longest takeover time.
 4. Every node serving the tenant receives the message from its ordered consumer on `d.<tenant>.>`, matches it against local subscriptions and delivers at min(publish QoS, granted QoS).
 
-If the JetStream wait happens inside a blocking hook, one client's QoS 1 publishes are serialized at about one per commit round trip (hundreds per second per client). That's fine for devices. Phase 0 confirms it, and the fallback is a mochi patch that acks asynchronously.
+Phase 0 measured both ways (spike 1). A commit inside a blocking `OnPublish` caps one client at roughly one QoS 1 message per commit (341 to 399 msgs/s with a 2 ms commit, whatever its receive maximum). Acking asynchronously needs no mochi patch: the hook returns `ErrRejectPacket`, commits in the background and writes the PUBACK itself, which reached about 3.4k msgs/s at receive maximum 10 and 17k to 23k at 100, with QoS 2 working through mochi's own PUBREL handling. **Phase 2 uses async ack.** Two consequences: the hook must enforce receive maximum itself (mochi never spends quota on a rejected packet), and with a blocking hook the message would also need `CodeSuccessIgnore` to stop mochi fanning it out locally, since the log delivers it anyway.
 
 Cost of this design: every node serving a tenant reads all of that tenant's QoS 1/2 traffic, so a big tenant spread over 10 nodes costs 10x reads. Phase 3 can pin large tenants to a subset of nodes at the load balancer, or narrow node consumers to non-overlapping filter sets. v1 accepts the fan-out because it gives gap-free delivery without a route table.
 
@@ -175,9 +175,9 @@ One log stream per cell, plus a dedicated stream for any tenant over a size thre
 
 ### Ownership, takeover and liveness
 
-- Every CONNECT, clean or persistent, takes the session key with a compare-and-set that writes a new epoch and this node's ID. That is how a second CONNECT with the same client ID anywhere in the cell displaces the first, as MQTT requires. In a 100k reconnect storm this is about 1.7k CAS per second on one R3 bucket, which phase 0 measures.
+- Every CONNECT, clean or persistent, takes the session key with a compare-and-set that writes a new epoch and this node's ID. That is how a second CONNECT with the same client ID anywhere in the cell displaces the first, as MQTT requires. Phase 0 (spike 4) measured session CAS at 1.7k, 5k and 10k per second on one R3 bucket with no failed writes and exactly one winner in 26,000 contested rounds. A lost CAS comes back as JetStream error 10071 or 10164 (most often 10164, which doesn't name the current sequence): treat both as lost, and allow only one outstanding CAS per key per node, since a second one in flight on the same key is always refused.
 - The previous owner watches the keys it owns. When the epoch changes, it disconnects the old connection with reason 0x8E (session taken over). Its next write would fail its CAS anyway. The new owner proceeds from the last persisted cursor.
-- Session expiry and MQTT 5 message expiry use per-message TTL (`Nats-TTL` on a raw publish to the KV stream, with an expected-last-subject-sequence header so it stays a CAS). nats.go's `KeyTTL` only applies on create, so the cluster layer publishes to the KV stream directly. Buckets enable limit markers so expiries show up to watchers.
+- Session expiry and MQTT 5 message expiry use per-message TTL (`Nats-TTL` on a raw publish to the KV stream, with an expected-last-subject-sequence header so it stays a CAS). nats.go's `KeyTTL` only applies on create, so the cluster layer publishes to the KV stream directly. Buckets enable limit markers so expiries show up to watchers. Spike 4 confirmed it: the marker reaches a watcher on another server about 2.0 s after a 2 s TTL write, as a purge (reason MaxAge) rather than a delete, so watchers handle both. While a marker exists, recreating the key needs the marker's sequence, not 0. TTL granularity is whole seconds.
 - Liveness doesn't depend on key expiry. Each node heartbeats its membership key every few seconds; every node watches the heartbeats and tracks the last time it saw each peer. A node that can't renew for half the lease drops all its clients. A peer unseen for the full lease plus a margin is declared dead. The lowest-ID survivor then publishes that node's pending wills (honoring MQTT 5 will delay) and clears its ownership so clients can take over elsewhere.
 
 ### Partitions
@@ -190,7 +190,9 @@ One log stream per cell, plus a dedicated stream for any tenant over a size thre
 ### Route churn
 
 - Only QoS 0 uses interest routing. A node subscribes to a filter on NATS for the first local subscriber and unsubscribes after the last, so 10,000 devices on one node subscribed to `cmd/+` cost one subscription.
-- Per-device filters (`devices/<id>/cmd`) cost one subscription per device. Phase 0 load-tests NATS interest propagation at 1M distinct filters with a reconnect storm, and that test gates the design. If it fails, the fallback is one `f.<tenant>.>` subscription per node per served tenant, with local matching, the same shape as the QoS 1/2 path.
+- Per-device filters (`devices/<id>/cmd`) cost one subscription per device. Phase 0 (spike 3) measured 1M distinct filters across a 3-server cell: interest propagated in a median 3.6 s, almost all of it the subscribing itself (route propagation added 26 to 269 ms), and a 100k-client churn storm left unaffected traffic's p99 at 0.96x baseline with no lost messages. **Interest routing stays.** The per-tenant fallback (`f.<tenant>.>` per node with local matching) remains the escape hatch; it costs about 1.9x CPU per message at 10 nodes and grows linearly with node count.
+- **NATS memory is the real limit.** Every NATS server in a cell holds every distinct QoS 0 filter, at about 1.1 KiB each (1.24 to 1.49 GiB RSS per server at 1M), and adding servers doesn't divide it. Size cell NATS memory by distinct filter count; 10M filters is 11+ GiB per server.
+- A cold start of a whole cell takes seconds to propagate interest, and QoS 0 publishes in that window miss nodes whose interest hasn't landed. QoS 0 allows that; document it.
 - QoS 1/2 routing has no churn at all: node consumers are per tenant, not per filter.
 - Reconnect storms are throttled per tenant at CONNECT (token bucket), so one tenant's storm can't flood interest propagation or the session bucket.
 
@@ -235,6 +237,44 @@ Two halves, both built as part of this project, following how every other forger
 - Health: `Extension.Health` covers NATS connectivity, JetStream availability, the self-fencing state, the control-plane DB, and keysmith/authsome reachability.
 - Metrics: forge `CounterVec` / `HistogramVec`. Tenant labels only on a short list of counters and only for the top N tenants by volume, so cardinality stays bounded; full per-tenant numbers go to ledger and the admin API.
 - Tracing: forge `messaging` package, system `mqtt`. MQTT 5 carries `traceparent` in user properties; 3.1.1 publishes start root spans.
+
+## Phase 0 results
+
+Measured 2026-10-23 on an Apple M3 Max (16 cores, 128 GiB), nats-server 2.15.1, nats.go 1.54.0, mochi v2.7.9, Go 1.26.3, with all NATS servers on one machine that was heavily loaded throughout (1-minute load average 20 to 270). Ratios carry over; absolute latencies don't. Full numbers, harnesses and raw runs are in tether's `spikes/` directory, one `RESULTS.md` per spike.
+
+### Spike 1: mochi cluster hooks (`spikes/mochi/`)
+
+All four questions are yes with hooks alone; no mochi patch.
+- Lazy session load: `OnSessionEstablish` builds an offline client the way mochi's `loadClients` does; `inheritClientSession` takes it over, session present is true, stored inflights are resent with DUP.
+- Eviction after DISCONNECT: direct `Topics`/`State`/`Clients` calls (mochi's own `UnsubscribeClient` and `ClearInflights` fire storage hooks and must not be used), guarded by ID ownership and an in-flight CONNECT count.
+- Cluster injection: one dedicated inline client per node (`NewClient(nil, LocalListener, "tether-cluster", true)`), recognised by pointer; `cl.Net.Inline` alone can't tell it from mochi's own inline client.
+- Blocking `OnPublish` caps a client at about one message per commit; async ack reaches 17k to 23k msgs/s at receive maximum 100.
+
+Decision: lazy load, guarded eviction, pointer-recognised injector, async ack. It also found a Phase 1 bug (user properties dropped for clients with Request Problem Information 0), fixed in tether `1eb296c` and drafted upstream.
+
+### Spike 2: MQTT to NATS encoding (`spikes/encoding/`)
+
+`=` plus unpadded base64url for any level outside the passthrough set; `$` topics under `==<tenant>` for QoS 0 subjects and retained keys. Five fuzz targets clean (1.35M to 3.51M execs each), 21.35M exhaustive filter/topic pairs agree, and 22,270 pairs agree against a real nats-server. Worst-case 1 KiB topic encodes to 2,083 bytes against `max_control_line` 4,096; the practical ceiling is about 1,950 bytes.
+
+Decision: adopt the scheme; cap topics at 1 KiB and client IDs before encoding; promote the encoder into the main module in Phase 2. Spike 4 then moved the log back to a single tenant prefix (see the subject layout above).
+
+### Spike 3: NATS interest at 1M filters (`spikes/interest/`)
+
+Median propagation 3.6 s (two of nine runs over 5 s, both started under heavy load); churn storm p99 0.96x baseline with interleaved windows (the plan's literal before/during comparison, 2.45x, was load-distorted); overlapping filters deliver twice and dedup to once at about 275 ns per delivery; fallback costs 1.93x CPU per message.
+
+Decision: interest routing, with NATS memory sized at about 1.1 KiB per distinct filter on every server.
+
+### Spike 4: JetStream (`spikes/jetstream/`)
+
+256 B publish-ack p50 0.34 to 0.64 ms (p99s load-distorted). 64 KiB saturates the shared SSD near 6.5k/s on this machine. Session CAS holds at 10k/s with exactly one winner. `Nats-TTL` plus expected sequence works with limit markers. QoS 2 dedup survives a leader stepdown. Catch-up from 1M behind runs at about 160k msgs/s per consumer with one filter and about 1.5k msgs/s with two.
+
+Decision: keep JetStream for the log, sessions and replay; treat 10071 and 10164 as a lost CAS; one outstanding CAS per key; single-filter log consumers.
+
+### Open after Phase 0
+
+- Bucket CAS ceiling above 10k/s, and every latency figure, need re-measuring on real multi-machine hardware before the success criteria are checked.
+- One `kv.Create` over a just-expired key failed with "key exists" at load 233 and never again in about 260 tries; likely a lagging replica answering the direct get. Watch for it in Phase 2's chaos tests.
+- Phase 3's "narrow node consumers to non-overlapping filter sets" idea hits the same multi-filter slowdown and needs rethinking.
 
 ## Reuse map
 
