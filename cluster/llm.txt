@@ -1,0 +1,50 @@
+# tether/cluster
+
+Import: github.com/xraph/tether/cluster
+
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, and the sentinel errors. Later tasks add the members, session ownership, log, retained and router code on top of `*Conn`.
+
+## Config
+
+`Config{Enabled, NodeID, Cell, Mode, URLs, Embedded, Heartbeat, Lease, Credentials, Replicas}` with snake_case yaml and json tags. `DefaultConfig()`: disabled, mode "embedded", heartbeat 2 s, lease 10 s. `Validate()` returns nil when Enabled is false. When enabled: NodeID is 1 to 64 bytes of `[-_a-zA-Z0-9]` (it becomes a KV key and a subject token), Cell matches `^[a-z0-9]{1,16}$`, Mode is "embedded" or "external", external needs a URL, embedded needs `Embedded.StoreDir`, `Embedded.Routes` needs `ClusterName`, and `ClusterName` or `Routes` needs `ClusterListen`, Lease must exceed 2 x Heartbeat, Replicas is 0 to 3.
+
+`EmbeddedConfig{ServerName, ClusterName, Listen, ClusterListen, Routes, StoreDir}`. ServerName defaults to NodeID, Listen to "127.0.0.1:-1". List every other server in Routes: JetStream sizes its meta group from the route count, so a node given one seed route may elect a leader alone.
+
+Names (all derive from Cell): `LogStream()` TETHER_LOG_<CELL>, `ControlStream()` TETHER_CTL_<CELL>, `SessionsBucket()` tether-sessions-<cell>, `RetainedBucket()` tether-retained-<cell>, `MembersBucket()` tether-members-<cell>. The KV backing streams are `KV_<bucket>`.
+
+## Connect
+
+`Connect(ctx, cfg, *slog.Logger) (*Conn, error)`. A nil logger discards. Embedded mode starts an in-process nats-server with JetStream (cluster routes when given) and connects in-process. External mode dials `URLs` (with the `Credentials` file when set). It returns once JetStream answers, or fails with an error wrapping `ErrUnavailable` when ctx ends (30 s when ctx has no deadline). The nodes of an embedded cluster only get JetStream once enough peers are up, so start them together; a node started alone waits.
+
+The connection uses `nats.NoEcho()`: a node never receives its own core NATS publishes. The router relies on it. Reconnect is unlimited, 500 ms apart.
+
+- `(*Conn).JS() jetstream.JetStream`, `NC() *nats.Conn`.
+- `Healthy(ctx) error`: connected and JetStream answers; the error wraps ErrUnavailable.
+- `Close()`: drains the connection, then shuts down the embedded server. Idempotent.
+- `Replicas() int`: the replica count Provision uses. `Config.Replicas` when set. Otherwise min(3, servers): embedded mode counts 1 + len(Routes); external mode counts max(len(URLs), 1 + servers the client discovered) when the server reports a cluster name, else 1. A deployment that advertises nothing and runs two servers should set Replicas.
+
+## Provision
+
+`Provision(ctx, c, cfg, maxSessionExpiry) error` creates or updates, so every node can call it on start:
+
+- TETHER_LOG_<CELL>: subjects `d.>`, file storage, MaxAge = maxSessionExpiry (0 = unlimited), duplicate window 2 min.
+- TETHER_CTL_<CELL>: subjects `ctl.>`, file storage, MaxAge 1 h.
+- sessions bucket: history 1, limit markers, LimitMarkerTTL 1 min.
+- retained bucket: history 1, limit markers, LimitMarkerTTL 1 min.
+- members bucket: history 1.
+
+All with `Conn.Replicas()` replicas. Placement errors that clear while a fresh cluster's meta group fills (JetStream API codes 10005, 10008) are retried until ctx ends. The subjects are not namespaced by cell, so two cells cannot share a NATS account.
+
+## Errors
+
+`ErrLostCAS` (JetStream 10071 and 10164 both mean this; callers map them), `ErrFenced`, `ErrUnavailable`. Messages start `tether/cluster: `.
+
+## clustertest
+
+Import: github.com/xraph/tether/cluster/clustertest
+
+- `Start(t, n) []string`: client URLs of an n-server in-process JetStream cluster (a plain server when n is 1), random ports, `t.TempDir` stores, ready when the meta leader knows all n peers. Stopped at test end. About 1.5 s for three servers.
+- `StartCluster(t, n) *Cluster`: same, with `Servers []*server.Server`, `URLs()` and `Stop(i)`.
+- `FreePorts(t, n) []int`, `RouteURL(port) string`: for tests that run embedded nodes as a cluster.
+
+Tests: conn_test.go covers the single and three-node embedded connect, idempotent provisioning on one and three servers, NoEcho, unavailable, and the Validate table.
