@@ -110,6 +110,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	st.sessionExpiry = sessionExpiry(cl, st.expiryCap)
 	st.expiryShortened = cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval > st.expiryCap
 
+	if h.b.cluster != nil {
+		st.pipe = newPubPipe(h.b, h.server, cl, st)
+	}
+
 	if !h.b.state.addUnlessDeleting(st, namespacedID(tenantID, cl.ID)) {
 		st.returnSlot(from)
 
@@ -121,6 +125,17 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		st.returnSlot(from)
 
 		return false
+	}
+
+	// The tenant's log reader runs before this connection gets its CONNACK,
+	// so none of its SUBSCRIBEs can come before the node's read position.
+	if h.b.cluster != nil {
+		if err := h.b.ensureReader(tenantID); err != nil {
+			h.b.state.remove(cl)
+			st.returnSlot(from)
+
+			return h.refuse(cl, log, packets.ErrServerUnavailable, "cluster log unavailable", err)
+		}
 	}
 
 	h.startExpiry(st)
@@ -359,6 +374,11 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 
 	cl.Properties.Props.TopicAliasMaximum = 0
 
+	// A clean start ends the previous session, its QoS 2 state included.
+	if h.b.cluster != nil && cl.Properties.Clean {
+		h.b.cluster.dropQoS2(cl.ID)
+	}
+
 	h.capSessionExpiry(cl, st)
 
 	h.b.state.bind(st)
@@ -393,6 +413,14 @@ func (h *hook) capSessionExpiry(cl *mqtt.Client, st *clientState) {
 // the empty filter, which mochi refuses (SUBACK 0x8F) before the ACL check.
 func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
 	if cl.Net.Inline {
+		return pk, nil
+	}
+
+	if pk.FixedHeader.Type == packets.Pubrel && h.b.cluster != nil {
+		// The end of a QoS 2 publish the pipe acked: its receive slot
+		// frees and its pending entry goes. Mochi answers PUBCOMP.
+		h.b.pubrel(cl, pk.PacketID)
+
 		return pk, nil
 	}
 
@@ -587,12 +615,24 @@ func (h *hook) withhold(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 // dropped with ErrRejectPacket: for 3.1.1 or QoS 0 mochi would publish the
 // message anyway on any other error, and for QoS 2 it would answer with a
 // PUBACK where a PUBREC belongs.
+//
+// In cluster mode a QoS 0 publish also goes to the Router, and a QoS 1 or 2
+// publish goes to the log instead of mochi (clusterlog.go): it must first fit
+// under the server's receive maximum (pubPipe.admit), then the connection's
+// pipe appends it and writes the ack once it is committed, and this returns
+// ErrRejectPacket so mochi neither acks nor delivers it. The 0x97 PUBACK
+// then goes through the pipe too, to keep the acks in order. What the
+// injector publishes keeps the publisher's client ID as its origin.
 func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, error) {
 	if cl.Net.Inline {
 		// The host's QoS 0 publishes reach the other nodes too. What the
-		// injector publishes came from another node and never goes back.
-		if n := h.b.cluster; n != nil && pk.FixedHeader.Qos == 0 && !n.isInjector(cl) {
-			n.publishInline(&pk)
+		// injector publishes came from the cell and never goes back.
+		if n := h.b.cluster; n != nil {
+			if n.isInjector(cl) {
+				injectedOrigin(&pk)
+			} else if pk.FixedHeader.Qos == 0 {
+				n.publishInline(&pk)
+			}
 		}
 
 		return pk, nil
@@ -608,10 +648,23 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		return pk, packets.ErrRejectPacket
 	}
 
+	n := h.b.cluster
+	logged := n != nil && pk.FixedHeader.Qos > 0
+
+	if logged && !st.pipe.admit() {
+		return pk, packets.ErrRejectPacket
+	}
+
 	if !h.b.deps.Limits.AllowMessage(st.tenantID, st.tenant.Load().Limits) {
 		h.b.log.Debug("tether: publish over the tenant's rate limit", slog.String("client", cl.ID), slog.String("tenant", st.tenantID))
 
 		if cl.Properties.ProtocolVersion == 5 && pk.FixedHeader.Qos == 1 {
+			if logged {
+				st.pipe.ackNow(pk.PacketID, 1, packets.ErrQuotaExceeded)
+
+				return pk, packets.ErrRejectPacket
+			}
+
 			return pk, packets.ErrQuotaExceeded
 		}
 
@@ -621,11 +674,15 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	st.counters.in.Add(1)
 	h.b.deps.Metrics.MessageIn()
 
-	// Mochi delivers to this node's subscribers once this returns; the
-	// Router takes the message to every other node with interest. QoS 1
-	// and 2 stay local until they go through the log.
-	if h.b.cluster != nil && pk.FixedHeader.Qos == 0 {
-		h.b.cluster.publish(st.tenantID, rel, &pk)
+	switch {
+	case logged:
+		h.b.commitPublish(cl, st, rel, &pk)
+
+		return pk, packets.ErrRejectPacket
+	case n != nil:
+		// Mochi delivers to this node's subscribers once this returns; the
+		// Router takes the message to every other node with interest.
+		n.publish(st.tenantID, rel, &pk)
 	}
 
 	return pk, nil
@@ -743,6 +800,8 @@ func (h *hook) OnClientExpired(cl *mqtt.Client) {
 	if tenantID, ok := tenantOfID(cl.ID); ok {
 		n.releaseAll(cl.ID, tenantID)
 	}
+
+	n.dropQoS2(cl.ID)
 }
 
 // lastHook is added after every other hook, storage included. Mochi runs
@@ -754,7 +813,8 @@ func (h *hook) OnClientExpired(cl *mqtt.Client) {
 type lastHook struct {
 	mqtt.HookBase
 
-	b *Broker
+	b      *Broker
+	server *mqtt.Server
 }
 
 // ID implements mqtt.Hook.
@@ -763,10 +823,24 @@ func (h *lastHook) ID() string { return "tether-last" }
 // Provides implements mqtt.Hook.
 func (h *lastHook) Provides(b byte) bool { return b == mqtt.OnDisconnect }
 
-// OnDisconnect releases the connection slot and drops the state.
-func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, _ bool) {
+// OnDisconnect releases the connection slot and drops the state. In cluster
+// mode it also abandons the connection's pending QoS 1 and 2 publishes
+// (unacked; the client sends them again) and, for a session that ends with
+// the connection, drops its pending QoS 2 entries, unless another connection
+// holds the session now.
+func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 	if st := h.b.state.remove(cl); st != nil {
 		st.releaseSlot()
+
+		if st.pipe != nil {
+			st.pipe.close()
+		}
+	}
+
+	if n := h.b.cluster; n != nil && expire && !cl.Net.Inline {
+		if cur, ok := h.server.Clients.Get(cl.ID); !ok || cur == cl {
+			n.dropQoS2(cl.ID)
+		}
 	}
 }
 

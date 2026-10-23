@@ -1024,7 +1024,7 @@ func TestLogMessageRoundTripThroughLog(t *testing.T) {
 
 	msg := LogMessage{
 		Tenant: testTenant, Topic: "a b/\u00e9/$x/", Payload: []byte("body\r\n"), QoS: 2, Retain: true,
-		Props: props, Origin: "node-1", PublishedAt: at,
+		Props: props, Origin: "node-1", ClientID: "dev \u00e9\r\n/1", PublishedAt: at,
 	}
 
 	seq, _, err := l.Append(tctx(t, 20*time.Second), msg, "id-1")
@@ -1042,7 +1042,7 @@ func TestLogMessageRoundTripThroughLog(t *testing.T) {
 		t.Fatalf("round trip:\n got %+v\nwant %+v", got[0], msg)
 	}
 
-	if !got[1].Props.IsZero() || got[1].Retain || got[1].Origin != "" || len(got[1].Payload) != 0 {
+	if !got[1].Props.IsZero() || got[1].Retain || got[1].Origin != "" || got[1].ClientID != "" || len(got[1].Payload) != 0 {
 		t.Fatalf("plain message: %+v", got[1])
 	}
 }
@@ -1418,5 +1418,104 @@ func TestReplayCancelWhileUnreachable(t *testing.T) {
 
 	if calls.Load() != n {
 		t.Fatal("handler called after Replay returned")
+	}
+}
+
+// Done closes once the reader's loop has exited: after Stop, and on its own
+// when the loop ends without one (here the connection closes under it).
+func TestReaderDone(t *testing.T) {
+	logs := startLogs(t, 2)
+
+	r, err := logs[0].Reader(testTenant, 0, func(LogMessage) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-r.Done():
+		t.Fatal("Done closed before Stop")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	r.Stop()
+
+	select {
+	case <-r.Done():
+	case <-time.After(20 * time.Second):
+		t.Fatal("Done not closed after Stop")
+	}
+
+	l := logs[1]
+
+	r2, err := l.Reader(testTenant, 0, func(LogMessage) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer r2.Stop()
+
+	l.c.Close()
+
+	select {
+	case <-r2.Done():
+	case <-time.After(30 * time.Second):
+		t.Fatal("Done not closed after the connection closed")
+	}
+}
+
+// Appends started one after another with AppendAsync are committed in that
+// order, while their waits overlap.
+func TestAppendAsyncKeepsOrder(t *testing.T) {
+	logs := startLogs(t, 2)
+	l := logs[1]
+
+	col := newCollector()
+
+	r, err := logs[0].Reader(testTenant, 0, col.fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer r.Stop()
+
+	const n = 200
+
+	pending := make([]*PendingAppend, n)
+
+	for i := range n {
+		p, err := l.AppendAsync(tctx(t, 20*time.Second), LogMessage{
+			Tenant: testTenant, Topic: "order", QoS: 1, Payload: []byte(fmt.Sprint(i)),
+		}, fmt.Sprintf("order-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		pending[i] = p
+	}
+
+	var last uint64
+
+	for i, p := range pending {
+		seq, dup, err := p.Wait(tctx(t, 20*time.Second))
+		if err != nil || dup {
+			t.Fatalf("append %d: seq %d dup %v err %v", i, seq, dup, err)
+		}
+
+		if seq <= last {
+			t.Fatalf("append %d got seq %d after %d", i, seq, last)
+		}
+
+		last = seq
+	}
+
+	got := col.waitFor(t, n)
+	for i, m := range got[:n] {
+		if string(m.Payload) != fmt.Sprint(i) {
+			t.Fatalf("message %d is %q", i, m.Payload)
+		}
+	}
+
+	if _, err := l.AppendAsync(tctx(t, time.Second), LogMessage{Tenant: testTenant, Topic: "x", QoS: 3}, ""); !errors.Is(err, tether.ErrInvalidInput) {
+		t.Fatalf("qos 3: %v", err)
 	}
 }

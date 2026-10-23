@@ -356,6 +356,11 @@ func TestRoutesReleased(t *testing.T) {
 	b := c.nodes[0]
 	tid := t1.ID.String()
 	nc := b.cluster.Conn.NC()
+
+	// The tenant's log reader holds NATS subscriptions of its own from the
+	// first connection on; count from there.
+	require.NoError(t, b.ensureReader(tid))
+
 	base := nc.NumSubscriptions()
 
 	routed := func(raw string) []string {
@@ -515,7 +520,7 @@ func TestDeliverRoutedDropsForeign(t *testing.T) {
 	// After Stop nothing is injected, and nothing fails.
 	require.NoError(t, b.Stop(t.Context()))
 	b.DeliverRouted(tid, "ok", []byte("late"), cluster.Props{})
-	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}), errNotInjecting))
+	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, ""), errNotInjecting))
 }
 
 // Ruling R3: the publish properties survive mochi to cluster and back.

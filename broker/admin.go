@@ -17,6 +17,7 @@ import (
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/id"
+	"github.com/xraph/tether/subject"
 	"github.com/xraph/tether/tenant"
 	"github.com/xraph/tether/topic"
 )
@@ -814,6 +815,10 @@ func (b *Broker) purgeSession(srv *mqtt.Server, cl *mqtt.Client) {
 	if b.storage != nil {
 		b.storage.OnClientExpired(cl)
 	}
+
+	if b.cluster != nil {
+		b.cluster.dropQoS2(cl.ID)
+	}
 }
 
 // Retained lists tenantID's retained messages whose topics match filter,
@@ -915,13 +920,29 @@ func (b *Broker) publish(ctx context.Context, tenantID, topicName string, payloa
 		return invalid(fmt.Sprintf("publish qos %d, want 0 or 1", qos))
 	}
 
+	if b.cluster != nil {
+		// The cell carries topics of at most 1024 bytes (ruling R13).
+		if err := subject.CheckTopic(topicName); err != nil {
+			return fmt.Errorf("tether/broker: topic %q: %w", topicName, err)
+		}
+	}
+
 	srv := b.running()
 	if srv == nil {
 		return fmt.Errorf("tether/broker: publish: %w: broker not running", tether.ErrConflict)
 	}
 
-	if err := srv.Publish(ns, slices.Clone(payload), retain, qos); err != nil {
-		return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+	switch {
+	case b.cluster != nil && qos > 0:
+		// Through the log, like a device's QoS 1 publish (ruling R21):
+		// every node delivers it from its reader, this one included.
+		if err := b.appendHost(ctx, srv, tenantID, topicName, ns, slices.Clone(payload), qos, retain); err != nil {
+			return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+		}
+	default:
+		if err := srv.Publish(ns, slices.Clone(payload), retain, qos); err != nil {
+			return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+		}
 	}
 
 	if countIn {

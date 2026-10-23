@@ -42,6 +42,7 @@ type Reader struct {
 	fn     func(LogMessage) error
 	pos    atomic.Uint64
 	stop   chan struct{}
+	done   chan struct{}
 	once   sync.Once
 
 	// fnMu is held while fn runs. Stop takes it to set stopped, which is how
@@ -109,7 +110,7 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 
 	r := &Reader{
 		l: l, tenant: tenant, cons: cons, msgs: msgs, fn: fn,
-		stop: make(chan struct{}),
+		stop: make(chan struct{}), done: make(chan struct{}),
 	}
 	r.pos.Store(start - 1)
 
@@ -146,8 +147,16 @@ func (r *Reader) Stop() {
 	})
 }
 
+// Done is closed when the reader's loop has exited, for any reason: Stop, a
+// closed connection, or an iterator that ended by itself. A reader whose Done
+// closed without a Stop delivers nothing more; start a new one from
+// Position()+1 to go on where it left off. The consumer's cleanup may still be
+// running when Done closes.
+func (r *Reader) Done() <-chan struct{} { return r.done }
+
 func (r *Reader) run() {
 	defer r.l.dropConsumer(r.cons)
+	defer close(r.done)
 
 	r.l.pump(r.msgs, r.stop, r.handle)
 }

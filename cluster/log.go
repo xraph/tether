@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,7 @@ const (
 	hdrQoS         = "Tether-QoS"
 	hdrRetain      = "Tether-Retain"
 	hdrOrigin      = "Tether-Origin"
+	hdrClient      = "Tether-Client"
 	hdrPublishedAt = "Tether-Published-At"
 
 	// ackTimeout is how long the log's publisher keeps an unanswered publish
@@ -57,6 +59,11 @@ type LogMessage struct {
 	Props Props
 	// Origin is the ID of the node that appended the message, "" when unset.
 	Origin string
+	// ClientID is the publisher's client ID within its tenant, "" for a
+	// message the host published. A node delivering the message uses it for
+	// the MQTT 5 No Local option. It travels base64url encoded, so any
+	// client ID survives.
+	ClientID string
 	// PublishedAt is when the message was published. Append fills it with the
 	// current time when it is zero. It is kept to the nanosecond, in UTC.
 	PublishedAt time.Time
@@ -164,17 +171,38 @@ func headerSafe(s string) bool {
 // that cannot be reached, or does not answer in time, gives an error wrapping
 // ErrUnavailable.
 func (l *Log) Append(ctx context.Context, msg LogMessage, msgID string) (seq uint64, dup bool, err error) {
-	m, err := encodeLogMessage(msg)
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	p, err := l.AppendAsync(ctx, msg, msgID)
 	if err != nil {
 		return 0, false, err
 	}
 
-	if !headerSafe(msgID) {
-		return 0, false, fmt.Errorf("cluster: append: message id is not a valid header value: %w", tether.ErrInvalidInput)
+	return p.Wait(ctx)
+}
+
+// PendingAppend is an append that has been sent and not yet acknowledged.
+type PendingAppend struct {
+	l   *Log
+	fut jetstream.PubAckFuture
+}
+
+// AppendAsync is Append in two steps: it sends msg and returns at once, and
+// Wait on the result waits for the commit. Calls on one Log reach the stream
+// in the order they were made, so a caller that starts its appends in order
+// gets them committed in that order (unless one fails and is sent again).
+// It checks msg and msgID as Append does. ctx bounds only the wait for the
+// publisher, which holds a send back while 4000 acks are outstanding.
+func (l *Log) AppendAsync(ctx context.Context, msg LogMessage, msgID string) (*PendingAppend, error) {
+	m, err := encodeLogMessage(msg)
+	if err != nil {
+		return nil, err
 	}
 
-	ctx, cancel := opContext(ctx)
-	defer cancel()
+	if !headerSafe(msgID) {
+		return nil, fmt.Errorf("cluster: append: message id is not a valid header value: %w", tether.ErrInvalidInput)
+	}
 
 	var opts []jetstream.PublishOpt
 	if msgID != "" {
@@ -183,16 +211,28 @@ func (l *Log) Append(ctx context.Context, msg LogMessage, msgID string) (seq uin
 
 	fut, err := l.publishAsync(ctx, m, opts)
 	if err != nil {
-		return 0, false, err
+		return nil, err
 	}
 
+	return &PendingAppend{l: l, fut: fut}, nil
+}
+
+// Wait waits for the commit of the append and returns its sequence, and dup
+// when the message ID was a repeat inside the duplicate window. A context
+// without a deadline gets 10 s. No ack in time, or a JetStream that cannot be
+// reached, gives an error wrapping ErrUnavailable; the message may still have
+// been committed, so send it again with the same message ID.
+func (p *PendingAppend) Wait(ctx context.Context) (seq uint64, dup bool, err error) {
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
 	select {
-	case ack := <-fut.Ok():
+	case ack := <-p.fut.Ok():
 		return ack.Sequence, ack.Duplicate, nil
-	case err := <-fut.Err():
-		return 0, false, l.wrapErr("append", err)
+	case err := <-p.fut.Err():
+		return 0, false, p.l.wrapErr("append", err)
 	case <-ctx.Done():
-		return 0, false, l.wrapErr("append", ctx.Err())
+		return 0, false, p.l.wrapErr("append", ctx.Err())
 	}
 }
 
@@ -253,6 +293,10 @@ func encodeLogMessage(msg LogMessage) (*nats.Msg, error) {
 		h.Set(hdrOrigin, msg.Origin)
 	}
 
+	if msg.ClientID != "" {
+		h.Set(hdrClient, base64.RawURLEncoding.EncodeToString([]byte(msg.ClientID)))
+	}
+
 	msg.Props.encode(h)
 
 	return &nats.Msg{Subject: subj, Header: h, Data: msg.Payload}, nil
@@ -274,6 +318,15 @@ func decodeLogMessage(subj string, h nats.Header, data []byte) (LogMessage, erro
 	}
 
 	msg.QoS = byte(q)
+
+	if v := h.Get(hdrClient); v != "" {
+		id, err := base64.RawURLEncoding.DecodeString(v)
+		if err != nil {
+			return LogMessage{}, fmt.Errorf("cluster: log entry %q: bad %s header: %w", subj, hdrClient, err)
+		}
+
+		msg.ClientID = string(id)
+	}
 
 	if v := h.Get(hdrPublishedAt); v != "" {
 		ns, err := strconv.ParseInt(v, 10, 64)

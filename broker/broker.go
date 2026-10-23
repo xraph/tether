@@ -75,6 +75,10 @@ type Broker struct {
 	// shorten it before Start.
 	sysInterval time.Duration
 
+	// receiveMaximum, when set before Start, replaces mochi's default
+	// Receive Maximum (1024) in the server's capabilities. Tests only.
+	receiveMaximum uint16
+
 	countersMu sync.Mutex
 	counters   map[string]*tenantCounters
 
@@ -194,6 +198,10 @@ func (b *Broker) Start(ctx context.Context) error {
 	caps.MaximumPacketSize = b.cfg.MaxPacketSize
 	caps.MaximumInflight = b.cfg.MaxInflight
 
+	if b.receiveMaximum > 0 {
+		caps.ReceiveMaximum = b.receiveMaximum
+	}
+
 	srv := mqtt.New(&mqtt.Options{
 		InlineClient: true,
 		Capabilities: caps,
@@ -208,7 +216,17 @@ func (b *Broker) Start(ctx context.Context) error {
 
 	b.server = srv
 
+	// The injector exists before the first client can connect, so a log
+	// reader started for that client has somewhere to deliver.
+	if b.cluster != nil {
+		b.cluster.attach(srv)
+	}
+
 	if err := srv.Serve(); err != nil {
+		if b.cluster != nil {
+			b.cluster.detach()
+		}
+
 		_ = srv.Close()
 		b.server = nil
 
@@ -216,7 +234,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	}
 
 	if b.cluster != nil {
-		b.cluster.attach(srv)
+		b.startReaderSweep()
 	}
 
 	interval := b.sysInterval
@@ -250,7 +268,7 @@ func (b *Broker) setup(ctx context.Context, srv *mqtt.Server) error {
 		b.storage = storage
 	}
 
-	if err := srv.AddHook(&lastHook{b: b}, nil); err != nil {
+	if err := srv.AddHook(&lastHook{b: b, server: srv}, nil); err != nil {
 		return fmt.Errorf("tether/broker: add last hook: %w", err)
 	}
 
@@ -343,8 +361,11 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// No message from another node is injected into a server that is
 		// closing. The Router closes last: the clean sessions that end
 		// during the shutdown still release their routes.
+		// The log readers stop with it; pending QoS 1 and 2 acks are
+		// abandoned as their clients disconnect.
 		if b.cluster != nil {
 			b.cluster.detach()
+			b.closeReaders()
 		}
 
 		err := shutdown(srv, ids)

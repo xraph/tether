@@ -77,6 +77,11 @@ type clientState struct {
 	// calls OnDisconnect for.
 	ended     chan struct{}
 	endedOnce sync.Once
+
+	// pipe carries the connection's QoS 1 and 2 publishes to the log
+	// (clusterlog.go). Cluster mode only; set before the state is
+	// registered and never changed.
+	pipe *pubPipe
 }
 
 // grants is one compiled set of topic grants and the roles it came from.
@@ -471,6 +476,22 @@ func (r *registry) sweepClosed(tenantID string) int {
 	}
 
 	return len(swept)
+}
+
+// liveTenants counts the open connections of each tenant.
+func (r *registry) liveTenants() map[string]int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make(map[string]int)
+
+	for cl, st := range r.byClient {
+		if !cl.Closed() {
+			out[st.tenantID]++
+		}
+	}
+
+	return out
 }
 
 // owner returns the state of the connection that owns the namespaced client

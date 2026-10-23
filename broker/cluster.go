@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
@@ -34,7 +35,9 @@ type Cluster struct {
 	// Sessions is the session store. Not used yet.
 	Sessions *cluster.Sessions
 
-	// Log is the QoS 1 and 2 message log. Not used yet.
+	// Log is the QoS 1 and 2 message log. Every QoS 1 and 2 publish goes
+	// through it, and the node delivers QoS 1 and 2 to its sessions only
+	// from it. Leave it nil and the broker makes one on Conn.
 	Log *cluster.Log
 
 	// Router moves QoS 0 messages between the nodes. Leave it nil and the
@@ -80,6 +83,32 @@ type clusterNode struct {
 	// Router call that failed. Tests read them.
 	published   atomic.Uint64
 	routeErrors atomic.Uint64
+
+	// The log side (clusterlog.go). readers holds one reader per tenant the
+	// node serves, under readersMu, which is never held across a Log call.
+	// readersClosed is set by Stop; no reader starts after it.
+	readersMu     sync.Mutex
+	readers       map[string]*tenantReader
+	readersClosed bool
+	sweepStop     chan struct{}
+	sweepDone     chan struct{}
+
+	// qos2In holds, per namespaced client ID, the message ID of each QoS 2
+	// publish whose PUBREL has not come (the session's pending entries).
+	qos2Mu sync.Mutex
+	qos2In map[string]map[uint16]string
+
+	// persistQoS2 is the seam where Task 9 writes a pending QoS 2 entry
+	// into the session record before the append. Nil: memory only.
+	persistQoS2 func(tenantID, rawID string, packetID uint16, msgID string) error
+
+	// Timings, defaults in clusterlog.go; tests shorten them before Start.
+	readerIdle, readerSweep                    time.Duration
+	appendAttempt, appendRetry, appendRetryMax time.Duration
+
+	// Counters for tests: appends committed (client and host publishes),
+	// acks written, log messages injected, readers restarted.
+	appends, acks, logDelivered, readerRestarts atomic.Uint64
 }
 
 // routeRef is one session's reference on a (tenant, filter) route. It is
@@ -108,6 +137,18 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 		Cluster: *c,
 		log:     log.With(slog.String("node", c.Config.NodeID)),
 		routes:  make(map[string]map[string]*routeRef),
+
+		readers:        make(map[string]*tenantReader),
+		qos2In:         make(map[string]map[uint16]string),
+		readerIdle:     defaultReaderIdle,
+		readerSweep:    defaultReaderSweep,
+		appendAttempt:  defaultAppendAttempt,
+		appendRetry:    defaultAppendRetry,
+		appendRetryMax: defaultAppendRetryMax,
+	}
+
+	if n.Log == nil {
+		n.Log = cluster.NewLog(c.Conn, c.Config)
 	}
 
 	if n.Router == nil {
@@ -151,16 +192,29 @@ func (n *clusterNode) isInjector(cl *mqtt.Client) bool {
 	return cl == n.injector.Load()
 }
 
+// injectedOrigin moves the publisher's client ID that inject put in an
+// injected packet into its origin, which mochi checks for No Local.
+func injectedOrigin(pk *packets.Packet) {
+	if o := pk.Connect.ClientIdentifier; o != "" {
+		pk.Origin = o
+		pk.Connect.ClientIdentifier = ""
+	}
+}
+
 // errNotInjecting is what inject returns before Start and once Stop began.
 var errNotInjecting = fmt.Errorf("tether/broker: inject: %w: broker not running", tether.ErrConflict)
 
-// inject publishes a message from another node into mochi through the
-// injector, on tenantID's namespaced name, so local delivery, the ACL check
-// on every delivery and the outbound stripping run as for any message. The
-// injector is inline: no rate limit, no message counted in, never routed
-// again. qos is the QoS mochi delivers at most; mochi treats every inline
-// publish as received at QoS 0.
-func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props) error {
+// inject publishes a message from the cell into mochi through the injector,
+// on tenantID's namespaced name, so local delivery, the ACL check on every
+// delivery and the outbound stripping run as for any message. The injector
+// is inline: no rate limit, no message counted in, never routed or appended
+// again. qos is the QoS mochi delivers at most: mochi takes an inline publish
+// of any QoS as already received, fans it out at once and keeps no inflight
+// state for the injector (its PacketID only passes mochi's validation).
+// origin, when not empty, is the namespaced client ID of the publisher, which
+// OnPublish makes the packet's origin so a No Local subscription of that
+// client skips it.
+func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props, origin string) error {
 	n := b.cluster
 
 	n.gate.RLock()
@@ -181,6 +235,11 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 		// Unused for an inline publish, but mochi's validation wants one.
 		pk.PacketID = 1
 	}
+
+	// Mochi sets the origin to the injector's ID before OnPublish, so the
+	// publisher's ID rides in a field a PUBLISH never uses and OnPublish
+	// moves it over (injectedOrigin).
+	pk.Connect.ClientIdentifier = origin
 
 	if err := n.srv.InjectPacket(n.injector.Load(), pk); err != nil {
 		return fmt.Errorf("tether/broker: inject: %w", err)
@@ -209,7 +268,7 @@ func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props clus
 		return
 	}
 
-	if err := b.inject(tenantID, name, payload, 0, props); err != nil && !errors.Is(err, errNotInjecting) {
+	if err := b.inject(tenantID, name, payload, 0, props, ""); err != nil && !errors.Is(err, errNotInjecting) {
 		b.cluster.log.Warn("tether: routed message not injected", slog.String("tenant", tenantID), slog.String("topic", name), slog.Any("error", err))
 	}
 }

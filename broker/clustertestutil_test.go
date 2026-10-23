@@ -56,6 +56,16 @@ func startCluster(t *testing.T, nodes int) *testCell {
 func startClusterWith(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Identity, perms PermLoader, before func(*Broker)) *testCell {
 	t.Helper()
 
+	return startCellVia(t, nodes, cfg, ids, perms, before, nil)
+}
+
+// startCellVia is startClusterWith where via, when not nil, may replace the
+// NATS URL node i connects to (a fault proxy in front of it).
+func startCellVia(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Identity, perms PermLoader, before func(*Broker),
+	via func(i int, url string) string,
+) *testCell {
+	t.Helper()
+
 	c := &testCell{nats: clustertest.StartCluster(t, 3)}
 	urls := c.nats.URLs()
 
@@ -79,6 +89,10 @@ func startClusterWith(t *testing.T, nodes int, cfg Config, ids map[string]*auth.
 		ccfg.Cell = "c1"
 		ccfg.Mode = cluster.ModeExternal
 		ccfg.URLs = []string{urls[i%len(urls)]}
+
+		if via != nil {
+			ccfg.URLs = []string{via(i, ccfg.URLs[0])}
+		}
 		ccfg.Replicas = 3
 		ccfg.NoDiscovery = true
 
