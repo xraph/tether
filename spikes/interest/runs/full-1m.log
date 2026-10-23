@@ -1,0 +1,454 @@
+machine: Apple M3 Max, 16 cores, 137438953472 bytes RAM, darwin/arm64, go1.26.3, nats-server 2.15.1, nats.go 1.54.0
+config: {servers:3 brokers:10 filters:100000 rate:5000 baseline:30000000000 stormDur:60000000000 gap:1000000000 churn:100000 fallbackDur:30000000000 targetsPer:100 verifyPer:1000 overlapN:10000 runs:3 mode:all out:runs/full-1m}
+load at start: { 20.43 61.92 83.83 }
+
+== run 1: interest routing ==
+  load_start                                   { 20.43 61.92 83.83 }
+  load1_start                                          20.430
+  filters_total                                   1000000.000
+  subscribe.local_flush_max_s                           3.329
+  propagation.last_sub_reachable_s                      3.331
+  propagation.lag_after_local_flush_s                   0.026
+  propagation.verify_sent                           10000.000
+  propagation.verify_received                       10000.000
+  mem.n0.num_subs                                 1000167.000
+  mem.n1.num_subs                                 1000167.000
+  mem.n2.num_subs                                 1000167.000
+  mem.idle.n0.rss_mib                                  19.312
+  mem.idle.n0.rss_after_gc_mib                         21.062
+  mem.idle.n0.heap_inuse_mib                            2.984
+  mem.idle.n1.rss_mib                                  19.375
+  mem.idle.n1.rss_after_gc_mib                         21.109
+  mem.idle.n1.heap_inuse_mib                            2.711
+  mem.idle.n2.rss_mib                                  19.734
+  mem.idle.n2.rss_after_gc_mib                         21.359
+  mem.idle.n2.heap_inuse_mib                            2.945
+  mem.loaded.n0.rss_mib                              1471.469
+  mem.loaded.n0.rss_after_gc_mib                     1473.016
+  mem.loaded.n0.heap_inuse_mib                       1087.141
+  mem.loaded.n0.heap_bytes_per_filter                1136.820
+  mem.loaded.n1.rss_mib                              1335.500
+  mem.loaded.n1.rss_after_gc_mib                     1336.484
+  mem.loaded.n1.heap_inuse_mib                       1079.133
+  mem.loaded.n1.heap_bytes_per_filter                1128.710
+  mem.loaded.n2.rss_mib                              1240.031
+  mem.loaded.n2.rss_after_gc_mib                     1241.406
+  mem.loaded.n2.heap_inuse_mib                       1070.992
+  mem.loaded.n2.heap_bytes_per_filter                1119.928
+  baseline.sent                                    149999.000
+  baseline.achieved_rate                             4999.913
+  baseline.server_cpu_us_per_msg                      111.702
+  baseline.harness_cpu_us_per_msg                      73.838
+  baseline.total_cpu_us_per_msg                       185.540
+  baseline.server_cores                                 0.558
+  baseline.load1_start                                 22.480
+  baseline.load1_end                                   20.190
+  baseline.p50_us                                      77.000
+  baseline.p99_us                                    2701.000
+  baseline.p999_us                                  24255.000
+  baseline.max_us                                   46495.000
+  baseline.received                                149999.000
+  storm.sent                                       299997.000
+  storm.achieved_rate                                4997.802
+  storm.server_cpu_us_per_msg                         101.338
+  storm.harness_cpu_us_per_msg                         64.663
+  storm.total_cpu_us_per_msg                          166.002
+  storm.server_cores                                    0.506
+  storm.load1_start                                    19.220
+  storm.load1_end                                      97.110
+  storm.sub_unsub_ops                              200000.000
+  storm.duration_max_s                                 60.018
+  storm.p50_us                                        177.000
+  storm.p99_us                                      19087.000
+  storm.p999_us                                     71423.000
+  storm.max_us                                     189951.000
+  storm.received                                   299997.000
+  storm.p99_over_baseline_p99                           7.067
+  storm.p50_over_baseline_p50                           2.299
+  storm.post_verify_churned_sent                    10000.000
+  storm.post_verify_churned_received                10000.000
+  traffic.locally_matched                          449996.000
+  slow_consumer_events                                  0.000
+  overlap.subjects                             f.ttnt_x.a.* f.ttnt_x.a f.ttnt_x.a.>
+  overlap.a/b.published                             10000.000
+  overlap.a/b.raw_deliveries                        20000.000
+  overlap.a/b.after_dedup                           10000.000
+  overlap.a.published                               10000.000
+  overlap.a.raw_deliveries                          10000.000
+  overlap.a.after_dedup                             10000.000
+  overlap.a/b/c.published                           10000.000
+  overlap.a/b/c.raw_deliveries                      10000.000
+  overlap.a/b/c.after_dedup                         10000.000
+  overlap.dedup_ns_per_delivery                       478.686
+  load_end                                     { 130.33 75.69 85.89 }
+  load1_end                                           130.330
+
+== run 1: per-tenant fallback ==
+  load_start                                   { 155.97 82.98 88.35 }
+  load1_start                                         155.970
+  mem.loaded.n0.rss_mib                                21.078
+  mem.loaded.n0.rss_after_gc_mib                       21.312
+  mem.loaded.n0.heap_inuse_mib                          2.695
+  mem.loaded.n1.rss_mib                                21.234
+  mem.loaded.n1.rss_after_gc_mib                       21.391
+  mem.loaded.n1.heap_inuse_mib                          2.812
+  mem.loaded.n2.rss_mib                                21.484
+  mem.loaded.n2.rss_after_gc_mib                       21.625
+  mem.loaded.n2.heap_inuse_mib                          3.016
+  fallback.sent                                    149998.000
+  fallback.achieved_rate                             4999.886
+  fallback.server_cpu_us_per_msg                      139.247
+  fallback.harness_cpu_us_per_msg                     111.283
+  fallback.total_cpu_us_per_msg                       250.530
+  fallback.server_cores                                 0.696
+  fallback.load1_start                                158.210
+  fallback.load1_end                                  149.920
+  fallback.p50_us                                     391.000
+  fallback.p99_us                                   55583.000
+  fallback.p999_us                                 185855.000
+  fallback.max_us                                  338175.000
+  fallback.received                               1499980.000
+  fallback.locally_matched                         149998.000
+  fallback.locally_unmatched                      1349982.000
+  fallback.deliveries_per_msg                          10.000
+  slow_consumer_events                                  0.000
+  load_end                                     { 147.60 90.65 90.96 }
+  load1_end                                           147.600
+
+== run 2: interest routing ==
+  load_start                                   { 147.60 90.65 90.96 }
+  load1_start                                         147.600
+  filters_total                                   1000000.000
+  subscribe.local_flush_max_s                           6.739
+  propagation.last_sub_reachable_s                      6.806
+  propagation.lag_after_local_flush_s                   0.269
+  propagation.verify_sent                           10000.000
+  propagation.verify_received                       10000.000
+  mem.n0.num_subs                                 1000167.000
+  mem.n1.num_subs                                 1000167.000
+  mem.n2.num_subs                                 1000167.000
+  mem.idle.n0.rss_mib                                  19.641
+  mem.idle.n0.rss_after_gc_mib                         21.281
+  mem.idle.n0.heap_inuse_mib                            3.023
+  mem.idle.n1.rss_mib                                  19.344
+  mem.idle.n1.rss_after_gc_mib                         21.172
+  mem.idle.n1.heap_inuse_mib                            2.703
+  mem.idle.n2.rss_mib                                  19.469
+  mem.idle.n2.rss_after_gc_mib                         21.219
+  mem.idle.n2.heap_inuse_mib                            2.844
+  mem.loaded.n0.rss_mib                              1487.578
+  mem.loaded.n0.rss_after_gc_mib                     1488.984
+  mem.loaded.n0.heap_inuse_mib                       1088.273
+  mem.loaded.n0.heap_bytes_per_filter                1137.967
+  mem.loaded.n1.rss_mib                              1325.047
+  mem.loaded.n1.rss_after_gc_mib                     1326.953
+  mem.loaded.n1.heap_inuse_mib                       1079.789
+  mem.loaded.n1.heap_bytes_per_filter                1129.406
+  mem.loaded.n2.rss_mib                              1387.906
+  mem.loaded.n2.rss_after_gc_mib                     1389.484
+  mem.loaded.n2.heap_inuse_mib                       1078.531
+  mem.loaded.n2.heap_bytes_per_filter                1127.940
+  baseline.sent                                    149999.000
+  baseline.achieved_rate                             4999.915
+  baseline.server_cpu_us_per_msg                       58.899
+  baseline.harness_cpu_us_per_msg                      39.394
+  baseline.total_cpu_us_per_msg                        98.293
+  baseline.server_cores                                 0.294
+  baseline.load1_start                                150.300
+  baseline.load1_end                                  140.420
+  baseline.p50_us                                     846.000
+  baseline.p99_us                                   16767.000
+  baseline.p999_us                                  36991.000
+  baseline.max_us                                   69247.000
+  baseline.received                                149999.000
+  storm.sent                                       299998.000
+  storm.achieved_rate                                4999.312
+  storm.server_cpu_us_per_msg                          75.735
+  storm.harness_cpu_us_per_msg                         48.354
+  storm.total_cpu_us_per_msg                          124.089
+  storm.server_cores                                    0.379
+  storm.load1_start                                   138.060
+  storm.load1_end                                     157.520
+  storm.sub_unsub_ops                              200000.000
+  storm.duration_max_s                                 60.008
+  storm.p50_us                                        783.000
+  storm.p99_us                                      41119.000
+  storm.p999_us                                    130751.000
+  storm.max_us                                     228607.000
+  storm.received                                   299998.000
+  storm.p99_over_baseline_p99                           2.452
+  storm.p50_over_baseline_p50                           0.926
+  storm.post_verify_churned_sent                    10000.000
+  storm.post_verify_churned_received                10000.000
+  traffic.locally_matched                          449997.000
+  slow_consumer_events                                  0.000
+  overlap.subjects                             f.ttnt_x.a.* f.ttnt_x.a f.ttnt_x.a.>
+  overlap.a/b.published                             10000.000
+  overlap.a/b.raw_deliveries                        20000.000
+  overlap.a/b.after_dedup                           10000.000
+  overlap.a.published                               10000.000
+  overlap.a.raw_deliveries                          10000.000
+  overlap.a.after_dedup                             10000.000
+  overlap.a/b/c.published                           10000.000
+  overlap.a/b/c.raw_deliveries                      10000.000
+  overlap.a/b/c.after_dedup                         10000.000
+  overlap.dedup_ns_per_delivery                       288.495
+  load_end                                     { 152.83 107.87 97.56 }
+  load1_end                                           152.830
+
+== run 2: per-tenant fallback ==
+  load_start                                   { 152.83 107.87 97.56 }
+  load1_start                                         152.830
+  mem.loaded.n0.rss_mib                                21.203
+  mem.loaded.n0.rss_after_gc_mib                       21.453
+  mem.loaded.n0.heap_inuse_mib                          2.734
+  mem.loaded.n1.rss_mib                                21.562
+  mem.loaded.n1.rss_after_gc_mib                       21.734
+  mem.loaded.n1.heap_inuse_mib                          3.023
+  mem.loaded.n2.rss_mib                                21.469
+  mem.loaded.n2.rss_after_gc_mib                       21.703
+  mem.loaded.n2.heap_inuse_mib                          2.953
+  fallback.sent                                    149999.000
+  fallback.achieved_rate                             4999.919
+  fallback.server_cpu_us_per_msg                      101.717
+  fallback.harness_cpu_us_per_msg                      83.090
+  fallback.total_cpu_us_per_msg                       184.807
+  fallback.server_cores                                 0.509
+  fallback.load1_start                                152.830
+  fallback.load1_end                                  140.050
+  fallback.p50_us                                     863.000
+  fallback.p99_us                                   27311.000
+  fallback.p999_us                                  70783.000
+  fallback.max_us                                  111103.000
+  fallback.received                               1499990.000
+  fallback.locally_matched                         149999.000
+  fallback.locally_unmatched                      1349991.000
+  fallback.deliveries_per_msg                          10.000
+  slow_consumer_events                                  0.000
+  load_end                                     { 138.28 109.51 98.59 }
+  load1_end                                           138.280
+
+== run 3: interest routing ==
+  load_start                                   { 138.28 109.51 98.59 }
+  load1_start                                         138.280
+  filters_total                                   1000000.000
+  subscribe.local_flush_max_s                           3.541
+  propagation.last_sub_reachable_s                      3.542
+  propagation.lag_after_local_flush_s                   0.047
+  propagation.verify_sent                           10000.000
+  propagation.verify_received                       10000.000
+  mem.n0.num_subs                                 1000167.000
+  mem.n1.num_subs                                 1000167.000
+  mem.n2.num_subs                                 1000167.000
+  mem.idle.n0.rss_mib                                  19.594
+  mem.idle.n0.rss_after_gc_mib                         21.328
+  mem.idle.n0.heap_inuse_mib                            2.750
+  mem.idle.n1.rss_mib                                  19.812
+  mem.idle.n1.rss_after_gc_mib                         21.594
+  mem.idle.n1.heap_inuse_mib                            2.898
+  mem.idle.n2.rss_mib                                  19.219
+  mem.idle.n2.rss_after_gc_mib                         20.953
+  mem.idle.n2.heap_inuse_mib                            2.672
+  mem.loaded.n0.rss_mib                              1444.984
+  mem.loaded.n0.rss_after_gc_mib                     1446.734
+  mem.loaded.n0.heap_inuse_mib                       1085.695
+  mem.loaded.n0.heap_bytes_per_filter                1135.550
+  mem.loaded.n1.rss_mib                              1378.531
+  mem.loaded.n1.rss_after_gc_mib                     1379.281
+  mem.loaded.n1.heap_inuse_mib                       1079.430
+  mem.loaded.n1.heap_bytes_per_filter                1128.825
+  mem.loaded.n2.rss_mib                              1225.297
+  mem.loaded.n2.rss_after_gc_mib                     1226.266
+  mem.loaded.n2.heap_inuse_mib                       1073.820
+  mem.loaded.n2.heap_bytes_per_filter                1123.181
+  baseline.sent                                    149999.000
+  baseline.achieved_rate                             4999.914
+  baseline.server_cpu_us_per_msg                       90.331
+  baseline.harness_cpu_us_per_msg                      62.021
+  baseline.total_cpu_us_per_msg                       152.352
+  baseline.server_cores                                 0.452
+  baseline.load1_start                                138.180
+  baseline.load1_end                                  106.880
+  baseline.p50_us                                     173.000
+  baseline.p99_us                                   17567.000
+  baseline.p999_us                                  75391.000
+  baseline.max_us                                  124735.000
+  baseline.received                                149999.000
+  storm.sent                                       299999.000
+  storm.achieved_rate                                4999.422
+  storm.server_cpu_us_per_msg                         112.317
+  storm.harness_cpu_us_per_msg                         75.819
+  storm.total_cpu_us_per_msg                          188.136
+  storm.server_cores                                    0.562
+  storm.load1_start                                   105.690
+  storm.load1_end                                      68.410
+  storm.sub_unsub_ops                              200000.000
+  storm.duration_max_s                                 60.007
+  storm.p50_us                                        154.000
+  storm.p99_us                                       8679.000
+  storm.p999_us                                     22559.000
+  storm.max_us                                      38591.000
+  storm.received                                   299999.000
+  storm.p99_over_baseline_p99                           0.494
+  storm.p50_over_baseline_p50                           0.890
+  storm.post_verify_churned_sent                    10000.000
+  storm.post_verify_churned_received                10000.000
+  traffic.locally_matched                          449998.000
+  slow_consumer_events                                  0.000
+  overlap.subjects                             f.ttnt_x.a.* f.ttnt_x.a f.ttnt_x.a.>
+  overlap.a/b.published                             10000.000
+  overlap.a/b.raw_deliveries                        20000.000
+  overlap.a/b.after_dedup                           10000.000
+  overlap.a.published                               10000.000
+  overlap.a.raw_deliveries                          10000.000
+  overlap.a.after_dedup                             10000.000
+  overlap.a/b/c.published                           10000.000
+  overlap.a/b/c.raw_deliveries                      10000.000
+  overlap.a/b/c.after_dedup                         10000.000
+  overlap.dedup_ns_per_delivery                       263.193
+  load_end                                     { 68.41 94.62 94.09 }
+  load1_end                                            68.410
+
+== run 3: per-tenant fallback ==
+  load_start                                   { 68.86 94.27 93.97 }
+  load1_start                                          68.860
+  mem.loaded.n0.rss_mib                                21.641
+  mem.loaded.n0.rss_after_gc_mib                       21.797
+  mem.loaded.n0.heap_inuse_mib                          3.031
+  mem.loaded.n1.rss_mib                                21.453
+  mem.loaded.n1.rss_after_gc_mib                       21.719
+  mem.loaded.n1.heap_inuse_mib                          3.039
+  mem.loaded.n2.rss_mib                                21.688
+  mem.loaded.n2.rss_after_gc_mib                       21.859
+  mem.loaded.n2.heap_inuse_mib                          3.031
+  fallback.sent                                    149999.000
+  fallback.achieved_rate                             4999.919
+  fallback.server_cpu_us_per_msg                      237.345
+  fallback.harness_cpu_us_per_msg                     233.614
+  fallback.total_cpu_us_per_msg                       470.959
+  fallback.server_cores                                 1.187
+  fallback.load1_start                                 68.860
+  fallback.load1_end                                   56.380
+  fallback.p50_us                                     132.000
+  fallback.p99_us                                    2701.000
+  fallback.p999_us                                   9423.000
+  fallback.max_us                                   17839.000
+  fallback.received                               1499990.000
+  fallback.locally_matched                         149999.000
+  fallback.locally_unmatched                      1349991.000
+  fallback.deliveries_per_msg                          10.000
+  slow_consumer_events                                  0.000
+  load_end                                     { 56.38 88.87 92.03 }
+  load1_end                                            56.380
+
+== interest routing: 3 runs ==
+metric                                              run 1        run 2        run 3       median
+load1_start                                        20.430      147.600      138.280      138.280
+filters_total                                 1000000.000  1000000.000  1000000.000  1000000.000
+subscribe.local_flush_max_s                         3.329        6.739        3.541        3.541
+propagation.last_sub_reachable_s                    3.331        6.806        3.542        3.542
+propagation.lag_after_local_flush_s                 0.026        0.269        0.047        0.047
+propagation.verify_sent                         10000.000    10000.000    10000.000    10000.000
+propagation.verify_received                     10000.000    10000.000    10000.000    10000.000
+mem.n0.num_subs                               1000167.000  1000167.000  1000167.000  1000167.000
+mem.n1.num_subs                               1000167.000  1000167.000  1000167.000  1000167.000
+mem.n2.num_subs                               1000167.000  1000167.000  1000167.000  1000167.000
+mem.idle.n0.rss_mib                                19.312       19.641       19.594       19.594
+mem.idle.n0.rss_after_gc_mib                       21.062       21.281       21.328       21.281
+mem.idle.n0.heap_inuse_mib                          2.984        3.023        2.750        2.984
+mem.idle.n1.rss_mib                                19.375       19.344       19.812       19.375
+mem.idle.n1.rss_after_gc_mib                       21.109       21.172       21.594       21.172
+mem.idle.n1.heap_inuse_mib                          2.711        2.703        2.898        2.711
+mem.idle.n2.rss_mib                                19.734       19.469       19.219       19.469
+mem.idle.n2.rss_after_gc_mib                       21.359       21.219       20.953       21.219
+mem.idle.n2.heap_inuse_mib                          2.945        2.844        2.672        2.844
+mem.loaded.n0.rss_mib                            1471.469     1487.578     1444.984     1471.469
+mem.loaded.n0.rss_after_gc_mib                   1473.016     1488.984     1446.734     1473.016
+mem.loaded.n0.heap_inuse_mib                     1087.141     1088.273     1085.695     1087.141
+mem.loaded.n0.heap_bytes_per_filter              1136.820     1137.967     1135.550     1136.820
+mem.loaded.n1.rss_mib                            1335.500     1325.047     1378.531     1335.500
+mem.loaded.n1.rss_after_gc_mib                   1336.484     1326.953     1379.281     1336.484
+mem.loaded.n1.heap_inuse_mib                     1079.133     1079.789     1079.430     1079.430
+mem.loaded.n1.heap_bytes_per_filter              1128.710     1129.406     1128.825     1128.825
+mem.loaded.n2.rss_mib                            1240.031     1387.906     1225.297     1240.031
+mem.loaded.n2.rss_after_gc_mib                   1241.406     1389.484     1226.266     1241.406
+mem.loaded.n2.heap_inuse_mib                     1070.992     1078.531     1073.820     1073.820
+mem.loaded.n2.heap_bytes_per_filter              1119.928     1127.940     1123.181     1123.181
+baseline.sent                                  149999.000   149999.000   149999.000   149999.000
+baseline.achieved_rate                           4999.913     4999.915     4999.914     4999.914
+baseline.server_cpu_us_per_msg                    111.702       58.899       90.331       90.331
+baseline.harness_cpu_us_per_msg                    73.838       39.394       62.021       62.021
+baseline.total_cpu_us_per_msg                     185.540       98.293      152.352      152.352
+baseline.server_cores                               0.558        0.294        0.452        0.452
+baseline.load1_start                               22.480      150.300      138.180      138.180
+baseline.load1_end                                 20.190      140.420      106.880      106.880
+baseline.p50_us                                    77.000      846.000      173.000      173.000
+baseline.p99_us                                  2701.000    16767.000    17567.000    16767.000
+baseline.p999_us                                24255.000    36991.000    75391.000    36991.000
+baseline.max_us                                 46495.000    69247.000   124735.000    69247.000
+baseline.received                              149999.000   149999.000   149999.000   149999.000
+storm.sent                                     299997.000   299998.000   299999.000   299998.000
+storm.achieved_rate                              4997.802     4999.312     4999.422     4999.312
+storm.server_cpu_us_per_msg                       101.338       75.735      112.317      101.338
+storm.harness_cpu_us_per_msg                       64.663       48.354       75.819       64.663
+storm.total_cpu_us_per_msg                        166.002      124.089      188.136      166.002
+storm.server_cores                                  0.506        0.379        0.562        0.506
+storm.load1_start                                  19.220      138.060      105.690      105.690
+storm.load1_end                                    97.110      157.520       68.410       97.110
+storm.sub_unsub_ops                            200000.000   200000.000   200000.000   200000.000
+storm.duration_max_s                               60.018       60.008       60.007       60.008
+storm.p50_us                                      177.000      783.000      154.000      177.000
+storm.p99_us                                    19087.000    41119.000     8679.000    19087.000
+storm.p999_us                                   71423.000   130751.000    22559.000    71423.000
+storm.max_us                                   189951.000   228607.000    38591.000   189951.000
+storm.received                                 299997.000   299998.000   299999.000   299998.000
+storm.p99_over_baseline_p99                         7.067        2.452        0.494        2.452
+storm.p50_over_baseline_p50                         2.299        0.926        0.890        0.926
+storm.post_verify_churned_sent                  10000.000    10000.000    10000.000    10000.000
+storm.post_verify_churned_received              10000.000    10000.000    10000.000    10000.000
+traffic.locally_matched                        449996.000   449997.000   449998.000   449997.000
+slow_consumer_events                                0.000        0.000        0.000        0.000
+overlap.a/b.published                           10000.000    10000.000    10000.000    10000.000
+overlap.a/b.raw_deliveries                      20000.000    20000.000    20000.000    20000.000
+overlap.a/b.after_dedup                         10000.000    10000.000    10000.000    10000.000
+overlap.a.published                             10000.000    10000.000    10000.000    10000.000
+overlap.a.raw_deliveries                        10000.000    10000.000    10000.000    10000.000
+overlap.a.after_dedup                           10000.000    10000.000    10000.000    10000.000
+overlap.a/b/c.published                         10000.000    10000.000    10000.000    10000.000
+overlap.a/b/c.raw_deliveries                    10000.000    10000.000    10000.000    10000.000
+overlap.a/b/c.after_dedup                       10000.000    10000.000    10000.000    10000.000
+overlap.dedup_ns_per_delivery                     478.686      288.495      263.193      288.495
+load1_end                                         130.330      152.830       68.410      130.330
+
+== per-tenant fallback: 3 runs ==
+metric                                              run 1        run 2        run 3       median
+load1_start                                       155.970      152.830       68.860      152.830
+mem.loaded.n0.rss_mib                              21.078       21.203       21.641       21.203
+mem.loaded.n0.rss_after_gc_mib                     21.312       21.453       21.797       21.453
+mem.loaded.n0.heap_inuse_mib                        2.695        2.734        3.031        2.734
+mem.loaded.n1.rss_mib                              21.234       21.562       21.453       21.453
+mem.loaded.n1.rss_after_gc_mib                     21.391       21.734       21.719       21.719
+mem.loaded.n1.heap_inuse_mib                        2.812        3.023        3.039        3.023
+mem.loaded.n2.rss_mib                              21.484       21.469       21.688       21.484
+mem.loaded.n2.rss_after_gc_mib                     21.625       21.703       21.859       21.703
+mem.loaded.n2.heap_inuse_mib                        3.016        2.953        3.031        3.016
+fallback.sent                                  149998.000   149999.000   149999.000   149999.000
+fallback.achieved_rate                           4999.886     4999.919     4999.919     4999.919
+fallback.server_cpu_us_per_msg                    139.247      101.717      237.345      139.247
+fallback.harness_cpu_us_per_msg                   111.283       83.090      233.614      111.283
+fallback.total_cpu_us_per_msg                     250.530      184.807      470.959      250.530
+fallback.server_cores                               0.696        0.509        1.187        0.696
+fallback.load1_start                              158.210      152.830       68.860      152.830
+fallback.load1_end                                149.920      140.050       56.380      140.050
+fallback.p50_us                                   391.000      863.000      132.000      391.000
+fallback.p99_us                                 55583.000    27311.000     2701.000    27311.000
+fallback.p999_us                               185855.000    70783.000     9423.000    70783.000
+fallback.max_us                                338175.000   111103.000    17839.000   111103.000
+fallback.received                             1499980.000  1499990.000  1499990.000  1499990.000
+fallback.locally_matched                       149998.000   149999.000   149999.000   149999.000
+fallback.locally_unmatched                    1349982.000  1349991.000  1349991.000  1349991.000
+fallback.deliveries_per_msg                        10.000       10.000       10.000       10.000
+slow_consumer_events                                0.000        0.000        0.000        0.000
+load1_end                                         147.600      138.280       56.380      138.280
+
+load at end: { 56.38 88.87 92.03 }

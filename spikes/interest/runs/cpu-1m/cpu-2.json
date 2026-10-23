@@ -1,0 +1,36 @@
+{
+  "keys": [
+    "load1_start",
+    "paired.interest.idle_server_cores",
+    "paired.interest.server_cpu_us_per_msg",
+    "paired.interest.harness_cpu_us_per_msg",
+    "paired.interest.total_cpu_us_per_msg",
+    "paired.interest.net_of_idle_cpu_us_per_msg",
+    "paired.fallback.idle_server_cores",
+    "paired.fallback.server_cpu_us_per_msg",
+    "paired.fallback.harness_cpu_us_per_msg",
+    "paired.fallback.total_cpu_us_per_msg",
+    "paired.fallback.net_of_idle_cpu_us_per_msg",
+    "paired.fallback_over_interest_net_cpu",
+    "load1_end"
+  ],
+  "vals": {
+    "load1_end": 61.42,
+    "load1_start": 73.83,
+    "paired.fallback.harness_cpu_us_per_msg": 170.52213044260884,
+    "paired.fallback.idle_server_cores": 0.0006657,
+    "paired.fallback.net_of_idle_cpu_us_per_msg": 353.57495149902996,
+    "paired.fallback.server_cpu_us_per_msg": 183.2135242704854,
+    "paired.fallback.total_cpu_us_per_msg": 353.7356547130943,
+    "paired.fallback_over_interest_net_cpu": 1.925836153537945,
+    "paired.interest.harness_cpu_us_per_msg": 74.8967579351587,
+    "paired.interest.idle_server_cores": 0.000761,
+    "paired.interest.net_of_idle_cpu_us_per_msg": 183.59555191103823,
+    "paired.interest.server_cpu_us_per_msg": 109.73561471229425,
+    "paired.interest.total_cpu_us_per_msg": 184.63237264745294
+  },
+  "note": {
+    "load_end": "{ 61.42 54.66 63.38 }",
+    "load_start": "{ 73.83 52.87 64.04 }"
+  }
+}

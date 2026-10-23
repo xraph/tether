@@ -1,0 +1,96 @@
+machine: Apple M3 Max, 16 cores, 137438953472 bytes RAM, darwin/arm64, go1.26.3, nats-server 2.15.1, nats.go 1.54.0
+config: {servers:3 brokers:10 filters:100000 rate:5000 baseline:30000000000 stormDur:60000000000 gap:1000000000 churn:100000 fallbackDur:30000000000 window:10000000000 targetsPer:100 pairs:4 verifyPer:1000 overlapN:10000 runs:3 mode:cpu out:runs/cpu-1m}
+load at start: { 31.78 43.23 62.80 }
+
+== run 1: paired cpu ==
+  load_start                                   { 31.78 43.23 62.80 }
+  load1_start                                          31.780
+  window 0 interest server 66.4 us/msg, harness 42.4 us/msg, load1 33.5
+  window 0 fallback server 113.2 us/msg, harness 92.0 us/msg, load1 37.4
+  window 1 fallback server 95.6 us/msg, harness 76.2 us/msg, load1 46.6
+  window 1 interest server 52.0 us/msg, harness 34.1 us/msg, load1 53.5
+  window 2 interest server 53.5 us/msg, harness 34.8 us/msg, load1 60.8
+  window 2 fallback server 95.8 us/msg, harness 75.5 us/msg, load1 71.1
+  window 3 fallback server 126.6 us/msg, harness 103.8 us/msg, load1 73.8
+  window 3 interest server 64.6 us/msg, harness 41.4 us/msg, load1 72.6
+  paired.interest.idle_server_cores                     0.001
+  paired.interest.server_cpu_us_per_msg                59.071
+  paired.interest.harness_cpu_us_per_msg               38.123
+  paired.interest.total_cpu_us_per_msg                 97.194
+  paired.interest.net_of_idle_cpu_us_per_msg           96.980
+  paired.fallback.idle_server_cores                     0.001
+  paired.fallback.server_cpu_us_per_msg               104.490
+  paired.fallback.harness_cpu_us_per_msg               84.111
+  paired.fallback.total_cpu_us_per_msg                188.601
+  paired.fallback.net_of_idle_cpu_us_per_msg          188.390
+  paired.fallback_over_interest_net_cpu                 1.943
+  load_end                                     { 72.60 52.28 63.90 }
+  load1_end                                            72.600
+
+== run 2: paired cpu ==
+  load_start                                   { 73.83 52.87 64.04 }
+  load1_start                                          73.830
+  window 0 interest server 102.9 us/msg, harness 70.8 us/msg, load1 62.7
+  window 0 fallback server 192.8 us/msg, harness 181.4 us/msg, load1 60.2
+  window 1 fallback server 147.4 us/msg, harness 129.2 us/msg, load1 65.3
+  window 1 interest server 127.9 us/msg, harness 88.1 us/msg, load1 61.0
+  window 2 interest server 89.2 us/msg, harness 59.5 us/msg, load1 60.5
+  window 2 fallback server 173.6 us/msg, harness 159.7 us/msg, load1 58.1
+  window 3 fallback server 215.0 us/msg, harness 211.1 us/msg, load1 66.0
+  window 3 interest server 116.5 us/msg, harness 78.9 us/msg, load1 61.4
+  paired.interest.idle_server_cores                     0.001
+  paired.interest.server_cpu_us_per_msg               109.736
+  paired.interest.harness_cpu_us_per_msg               74.897
+  paired.interest.total_cpu_us_per_msg                184.632
+  paired.interest.net_of_idle_cpu_us_per_msg          183.596
+  paired.fallback.idle_server_cores                     0.001
+  paired.fallback.server_cpu_us_per_msg               183.214
+  paired.fallback.harness_cpu_us_per_msg              170.522
+  paired.fallback.total_cpu_us_per_msg                353.736
+  paired.fallback.net_of_idle_cpu_us_per_msg          353.575
+  paired.fallback_over_interest_net_cpu                 1.926
+  load_end                                     { 61.42 54.66 63.38 }
+  load1_end                                            61.420
+
+== run 3: paired cpu ==
+  load_start                                   { 61.42 54.66 63.38 }
+  load1_start                                          61.420
+  window 0 interest server 66.8 us/msg, harness 42.9 us/msg, load1 55.8
+  window 0 fallback server 112.6 us/msg, harness 93.2 us/msg, load1 58.1
+  window 1 fallback server 97.5 us/msg, harness 79.0 us/msg, load1 65.2
+  window 1 interest server 62.4 us/msg, harness 42.3 us/msg, load1 66.7
+  window 2 interest server 123.0 us/msg, harness 84.5 us/msg, load1 61.1
+  window 2 fallback server 209.8 us/msg, harness 200.5 us/msg, load1 65.1
+  window 3 fallback server 155.0 us/msg, harness 142.3 us/msg, load1 60.6
+  window 3 interest server 130.6 us/msg, harness 90.9 us/msg, load1 60.3
+  paired.interest.idle_server_cores                     0.001
+  paired.interest.server_cpu_us_per_msg                94.903
+  paired.interest.harness_cpu_us_per_msg               63.683
+  paired.interest.total_cpu_us_per_msg                158.586
+  paired.interest.net_of_idle_cpu_us_per_msg          158.379
+  paired.fallback.idle_server_cores                     0.001
+  paired.fallback.server_cpu_us_per_msg               133.791
+  paired.fallback.harness_cpu_us_per_msg              117.771
+  paired.fallback.total_cpu_us_per_msg                251.562
+  paired.fallback.net_of_idle_cpu_us_per_msg          251.395
+  paired.fallback_over_interest_net_cpu                 1.587
+  load_end                                     { 60.32 56.29 62.93 }
+  load1_end                                            60.320
+
+== paired cpu: 3 runs ==
+metric                                              run 1        run 2        run 3       median
+load1_start                                        31.780       73.830       61.420       61.420
+paired.interest.idle_server_cores                   0.001        0.001        0.001        0.001
+paired.interest.server_cpu_us_per_msg              59.071      109.736       94.903       94.903
+paired.interest.harness_cpu_us_per_msg             38.123       74.897       63.683       63.683
+paired.interest.total_cpu_us_per_msg               97.194      184.632      158.586      158.586
+paired.interest.net_of_idle_cpu_us_per_msg         96.980      183.596      158.379      158.379
+paired.fallback.idle_server_cores                   0.001        0.001        0.001        0.001
+paired.fallback.server_cpu_us_per_msg             104.490      183.214      133.791      133.791
+paired.fallback.harness_cpu_us_per_msg             84.111      170.522      117.771      117.771
+paired.fallback.total_cpu_us_per_msg              188.601      353.736      251.562      251.562
+paired.fallback.net_of_idle_cpu_us_per_msg        188.390      353.575      251.395      251.395
+paired.fallback_over_interest_net_cpu               1.943        1.926        1.587        1.926
+load1_end                                          72.600       61.420       60.320       61.420
+
+load at end: { 60.32 56.29 62.93 }
