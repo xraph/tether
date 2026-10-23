@@ -1,0 +1,130 @@
+machine: Apple M3 Max, 16 cores, 137438953472 bytes RAM, darwin/arm64, go1.26.3, nats-server 2.15.1, nats.go 1.54.0; load at start: { 81.21 67.00 75.25 }
+=== RUN   TestCASOneWinner
+=== RUN   TestCASOneWinner/kv.Update
+    cas_test.go:158: 1000 rounds in 291ms (3435 rounds/s): A won 366, B won 634, both won 0, neither 0; loser error codes map[10071:2 10164:998]
+=== RUN   TestCASOneWinner/raw_publish
+    cas_test.go:158: 1000 rounds in 307ms (3260 rounds/s): A won 404, B won 596, both won 0, neither 0; loser error codes map[10071:13 10164:987]
+--- PASS: TestCASOneWinner (0.72s)
+    --- PASS: TestCASOneWinner/kv.Update (0.29s)
+    --- PASS: TestCASOneWinner/raw_publish (0.31s)
+=== RUN   TestCASPipelinedOnOneKey
+    cas_test.go:247: 200 pairs: 200 stored, 200 second writes refused, codes map[10164:200]
+--- PASS: TestCASPipelinedOnOneKey (0.15s)
+=== RUN   TestDedupWindow
+    dedup_test.go:97: window 2s: duplicate at +1.908s (last), stored again at +2.01s as seq 3 (first was 1), 6 probes
+--- PASS: TestDedupWindow (2.11s)
+=== RUN   TestDedupSurvivesLeaderChange
+    dedup_test.go:172: leader n1 -> n2; resend after the change: duplicate=true seq=1 (first 1)
+--- PASS: TestDedupSurvivesLeaderChange (0.22s)
+=== RUN   TestTTLExpiryReachesWatcher
+    ttl_test.go:132: KV_SESS: allow_msg_ttl=true subject_delete_marker_ttl=3s max_msgs_per_subject=1
+=== RUN   TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher
+    ttl_test.go:159: put seq 1; marker seq 2 seen by the watcher 1.996s after the ack, op KeyValuePurgeOp; marker headers map[Nats-Marker-Reason:[MaxAge] Nats-Rollup:[sub] Nats-Sequence:[2] Nats-Stream:[KV_SESS] Nats-Subject:[$KV.SESS.s.ttnt_x.dev-1] Nats-TTL:[3s] Nats-Time-Stamp:[2026-10-23T05:34:46.889647Z]]
+    ttl_test.go:179: marker 2.001s after the stream stored the put; marker's own stream timestamp 2s after it
+=== RUN   TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected
+    ttl_test.go:214: s1=3 s2=4; stale CAS and create-over-live both refused with 10071
+=== RUN   TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry
+    ttl_test.go:254: first write 5, renewal 6 at +1.203s; marker 7 at +3.259s after the first write, +2.057s after the renewal
+=== RUN   TestTTLExpiryReachesWatcher/writing_after_expiry
+    ttl_test.go:299: expected 0 while the marker is present: nats: nats: API error: code=400 err_code=10071 description=wrong last sequence: 9
+    ttl_test.go:306: key4 put 8, marker 9, CAS from the marker's sequence gave 10
+    ttl_test.go:347: key6 marker 13 gone 3.058s after it appeared (LimitMarkerTTL 3s); expected-0 create then gave 14
+    ttl_test.go:351: key6 watcher saw [{op:0 rev:11 at:{wall:14028389991019440016 ext:12973588334 loc:0x105f78e00} created:{wall:155941000 ext:63928330492 loc:0x105f78e00}} {op:2 rev:13 at:{wall:14028389993168139664 ext:14974798167 loc:0x105f78e00} created:{wall:157798000 ext:63928330494 loc:0x105f78e00}}]
+--- PASS: TestTTLExpiryReachesWatcher (12.44s)
+    --- PASS: TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher (2.01s)
+    --- PASS: TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected (0.00s)
+    --- PASS: TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry (3.26s)
+    --- PASS: TestTTLExpiryReachesWatcher/writing_after_expiry (7.06s)
+=== RUN   TestTTLNeedsMarkersBucket
+    ttl_test.go:374: Nats-TTL on a bucket without markers: nats: nats: API error: code=400 err_code=10166 description=per-message TTL is disabled (code 10166)
+--- PASS: TestTTLNeedsMarkersBucket (0.13s)
+=== RUN   TestCreateAfterExpiry
+    ttl_test.go:471: 20 of 20 Creates succeeded on the first try, 0 never
+--- PASS: TestCreateAfterExpiry (2.38s)
+=== RUN   TestCASOneWinner
+=== RUN   TestCASOneWinner/kv.Update
+    cas_test.go:158: 1000 rounds in 271ms (3692 rounds/s): A won 864, B won 136, both won 0, neither 0; loser error codes map[10071:21 10164:979]
+=== RUN   TestCASOneWinner/raw_publish
+    cas_test.go:158: 1000 rounds in 248ms (4028 rounds/s): A won 866, B won 134, both won 0, neither 0; loser error codes map[10071:17 10164:983]
+--- PASS: TestCASOneWinner (0.64s)
+    --- PASS: TestCASOneWinner/kv.Update (0.27s)
+    --- PASS: TestCASOneWinner/raw_publish (0.25s)
+=== RUN   TestCASPipelinedOnOneKey
+    cas_test.go:247: 200 pairs: 200 stored, 200 second writes refused, codes map[10164:200]
+--- PASS: TestCASPipelinedOnOneKey (0.14s)
+=== RUN   TestDedupWindow
+    dedup_test.go:97: window 2s: duplicate at +1.909s (last), stored again at +2.011s as seq 3 (first was 1), 6 probes
+--- PASS: TestDedupWindow (2.12s)
+=== RUN   TestDedupSurvivesLeaderChange
+    dedup_test.go:172: leader n1 -> n2; resend after the change: duplicate=true seq=1 (first 1)
+--- PASS: TestDedupSurvivesLeaderChange (0.23s)
+=== RUN   TestTTLExpiryReachesWatcher
+    ttl_test.go:132: KV_SESS: allow_msg_ttl=true subject_delete_marker_ttl=3s max_msgs_per_subject=1
+=== RUN   TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher
+    ttl_test.go:159: put seq 1; marker seq 2 seen by the watcher 2s after the ack, op KeyValuePurgeOp; marker headers map[Nats-Marker-Reason:[MaxAge] Nats-Rollup:[sub] Nats-Sequence:[2] Nats-Stream:[KV_SESS] Nats-Subject:[$KV.SESS.s.ttnt_x.dev-1] Nats-TTL:[3s] Nats-Time-Stamp:[2026-10-23T05:35:04.983471Z]]
+    ttl_test.go:179: marker 2s after the stream stored the put; marker's own stream timestamp 2s after it
+=== RUN   TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected
+    ttl_test.go:214: s1=3 s2=4; stale CAS and create-over-live both refused with 10071
+=== RUN   TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry
+    ttl_test.go:254: first write 5, renewal 6 at +1.203s; marker 7 at +3.254s after the first write, +2.051s after the renewal
+=== RUN   TestTTLExpiryReachesWatcher/writing_after_expiry
+    ttl_test.go:299: expected 0 while the marker is present: nats: nats: API error: code=400 err_code=10071 description=wrong last sequence: 9
+    ttl_test.go:306: key4 put 8, marker 9, CAS from the marker's sequence gave 10
+    ttl_test.go:347: key6 marker 13 gone 3.086s after it appeared (LimitMarkerTTL 3s); expected-0 create then gave 14
+    ttl_test.go:351: key6 watcher saw [{op:0 rev:11 at:{wall:14028390010439190848 ext:31065928792 loc:0x105f78e00} created:{wall:246823000 ext:63928330510 loc:0x105f78e00}} {op:2 rev:13 at:{wall:14028390012835236496 ext:33314484417 loc:0x105f78e00} created:{wall:497538000 ext:63928330512 loc:0x105f78e00}}]
+--- PASS: TestTTLExpiryReachesWatcher (12.73s)
+    --- PASS: TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher (2.00s)
+    --- PASS: TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected (0.00s)
+    --- PASS: TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry (3.26s)
+    --- PASS: TestTTLExpiryReachesWatcher/writing_after_expiry (7.34s)
+=== RUN   TestTTLNeedsMarkersBucket
+    ttl_test.go:374: Nats-TTL on a bucket without markers: nats: nats: API error: code=400 err_code=10166 description=per-message TTL is disabled (code 10166)
+--- PASS: TestTTLNeedsMarkersBucket (0.13s)
+=== RUN   TestCreateAfterExpiry
+    ttl_test.go:471: 20 of 20 Creates succeeded on the first try, 0 never
+--- PASS: TestCreateAfterExpiry (2.38s)
+=== RUN   TestCASOneWinner
+=== RUN   TestCASOneWinner/kv.Update
+    cas_test.go:158: 1000 rounds in 377ms (2650 rounds/s): A won 773, B won 227, both won 0, neither 0; loser error codes map[10071:88 10164:912]
+=== RUN   TestCASOneWinner/raw_publish
+    cas_test.go:158: 1000 rounds in 725ms (1379 rounds/s): A won 740, B won 260, both won 0, neither 0; loser error codes map[10071:131 10164:869]
+--- PASS: TestCASOneWinner (1.25s)
+    --- PASS: TestCASOneWinner/kv.Update (0.38s)
+    --- PASS: TestCASOneWinner/raw_publish (0.73s)
+=== RUN   TestCASPipelinedOnOneKey
+    cas_test.go:247: 200 pairs: 200 stored, 200 second writes refused, codes map[10164:200]
+--- PASS: TestCASPipelinedOnOneKey (0.36s)
+=== RUN   TestDedupWindow
+    dedup_test.go:97: window 2s: duplicate at +1.912s (last), stored again at +2.013s as seq 3 (first was 1), 6 probes
+--- PASS: TestDedupWindow (2.13s)
+=== RUN   TestDedupSurvivesLeaderChange
+    dedup_test.go:172: leader n0 -> n1; resend after the change: duplicate=true seq=1 (first 1)
+--- PASS: TestDedupSurvivesLeaderChange (0.27s)
+=== RUN   TestTTLExpiryReachesWatcher
+    ttl_test.go:132: KV_SESS: allow_msg_ttl=true subject_delete_marker_ttl=3s max_msgs_per_subject=1
+=== RUN   TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher
+    ttl_test.go:159: put seq 1; marker seq 2 seen by the watcher 2.001s after the ack, op KeyValuePurgeOp; marker headers map[Nats-Marker-Reason:[MaxAge] Nats-Rollup:[sub] Nats-Sequence:[2] Nats-Stream:[KV_SESS] Nats-Subject:[$KV.SESS.s.ttnt_x.dev-1] Nats-TTL:[3s] Nats-Time-Stamp:[2026-10-23T05:35:24.242884Z]]
+    ttl_test.go:179: marker 2.001s after the stream stored the put; marker's own stream timestamp 2.001s after it
+=== RUN   TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected
+    ttl_test.go:214: s1=3 s2=4; stale CAS and create-over-live both refused with 10071
+=== RUN   TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry
+    ttl_test.go:254: first write 5, renewal 6 at +1.203s; marker 7 at +3.25s after the first write, +2.047s after the renewal
+=== RUN   TestTTLExpiryReachesWatcher/writing_after_expiry
+    ttl_test.go:299: expected 0 while the marker is present: nats: nats: API error: code=400 err_code=10071 description=wrong last sequence: 9
+    ttl_test.go:306: key4 put 8, marker 9, CAS from the marker's sequence gave 10
+    ttl_test.go:347: key6 marker 13 gone 3.061s after it appeared (LimitMarkerTTL 3s); expected-0 create then gave 14
+    ttl_test.go:351: key6 watcher saw [{op:0 rev:11 at:{wall:14028390031092797504 ext:50318380667 loc:0x105f78e00} created:{wall:500468000 ext:63928330529 loc:0x105f78e00}} {op:2 rev:13 at:{wall:14028390033240786152 ext:52318878459 loc:0x105f78e00} created:{wall:501918000 ext:63928330531 loc:0x105f78e00}}]
+--- PASS: TestTTLExpiryReachesWatcher (12.45s)
+    --- PASS: TestTTLExpiryReachesWatcher/expiry_delivers_a_marker_to_a_watcher (2.01s)
+    --- PASS: TestTTLExpiryReachesWatcher/stale_expected_sequence_is_rejected (0.00s)
+    --- PASS: TestTTLExpiryReachesWatcher/a_CAS_with_a_new_TTL_renews_the_expiry (3.25s)
+    --- PASS: TestTTLExpiryReachesWatcher/writing_after_expiry (7.07s)
+=== RUN   TestTTLNeedsMarkersBucket
+    ttl_test.go:374: Nats-TTL on a bucket without markers: nats: nats: API error: code=400 err_code=10166 description=per-message TTL is disabled (code 10166)
+--- PASS: TestTTLNeedsMarkersBucket (0.13s)
+=== RUN   TestCreateAfterExpiry
+    ttl_test.go:471: 20 of 20 Creates succeeded on the first try, 0 never
+--- PASS: TestCreateAfterExpiry (2.38s)
+PASS
+load at end: { 44.83 58.84 71.62 }
+ok  	github.com/xraph/tether/spikes/jetstream	58.109s

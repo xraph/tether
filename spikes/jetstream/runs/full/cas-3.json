@@ -1,0 +1,71 @@
+[
+  {
+    "cell": "cas sync 1700/s",
+    "target_per_s": 1700,
+    "achieved_per_s": 1699,
+    "acked": 15291,
+    "p50_ms": 0.412,
+    "p90_ms": 1.361,
+    "p99_ms": 12.263,
+    "max_ms": 35.487,
+    "load1_mean": 31.706666666666667
+  },
+  {
+    "cell": "cas async 1700/s",
+    "target_per_s": 1700,
+    "achieved_per_s": 1699,
+    "acked": 15291,
+    "p50_ms": 0.377,
+    "p90_ms": 0.987,
+    "p99_ms": 7.159,
+    "max_ms": 20.767,
+    "load1_mean": 31.596666666666668
+  },
+  {
+    "cell": "cas sync 5000/s",
+    "target_per_s": 5000,
+    "achieved_per_s": 4966.777777777777,
+    "acked": 44701,
+    "p50_ms": 0.43,
+    "p90_ms": 4.851,
+    "p99_ms": 34.303,
+    "max_ms": 153.855,
+    "errors": {
+      "no free worker": 285
+    },
+    "load1_mean": 31.143333333333334
+  },
+  {
+    "cell": "cas async 5000/s",
+    "target_per_s": 5000,
+    "achieved_per_s": 4998.777777777777,
+    "acked": 44989,
+    "p50_ms": 0.418,
+    "p90_ms": 2.425,
+    "p99_ms": 9.839,
+    "max_ms": 24.831,
+    "load1_mean": 31.12
+  },
+  {
+    "cell": "cas sync 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 9998.777777777777,
+    "acked": 89989,
+    "p50_ms": 0.355,
+    "p90_ms": 1.02,
+    "p99_ms": 5.551,
+    "max_ms": 10.967,
+    "load1_mean": 31.526666666666667
+  },
+  {
+    "cell": "cas async 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 9998.666666666666,
+    "acked": 89988,
+    "p50_ms": 0.37,
+    "p90_ms": 1.831,
+    "p99_ms": 11.071,
+    "max_ms": 60.927,
+    "load1_mean": 31.48
+  }
+]

@@ -1,0 +1,395 @@
+machine: Apple M3 Max, 16 cores, 137438953472 bytes RAM, darwin/arm64, go1.26.3, nats-server 2.15.1, nats.go 1.54.0
+config: {runs:3 window:3000000000 rounds:3 modes:publish,cas,catchup out:runs/full sizes:256,65536 rates:1000,10000,50000 casRates:1700,5000,10000 casKeys:60000 workers:64 perTenant:1000000 tenants:10}
+load at start: { 55.34 95.77 116.38 }
+
+== run 1: starting cluster (load { 55.34 95.77 116.38 }) ==
+  stream LOG leader n0, replicas [n1(current=true) n2(current=false)]
+  round 1 sync 64KiB 1000/s             3.0s load 52.2
+  round 1 async 64KiB 10000/s           4.1s load 52.2
+  round 1 sync 64KiB 10000/s            3.1s load 51.9
+  round 1 async 64KiB 50000/s           9.9s load 52.9
+  round 1 sync 64KiB 50000/s            3.1s load 53.7
+  round 1 async 256B 1000/s             3.0s load 53.7
+  round 1 sync 256B 1000/s              3.0s load 52.7
+  round 1 async 256B 10000/s            3.0s load 52.7
+  round 1 sync 256B 10000/s             3.0s load 51.5
+  round 1 async 256B 50000/s            3.0s load 50.6
+  round 1 sync 256B 50000/s             3.0s load 50.6
+  round 1 async 64KiB 1000/s            3.0s load 47.9
+  round 2 async 256B 1000/s             3.0s load 45.9
+  round 2 sync 256B 1000/s              3.0s load 45.9
+  round 2 async 256B 10000/s            3.0s load 46.1
+  round 2 sync 256B 10000/s             3.0s load 46.1
+  round 2 async 256B 50000/s            3.0s load 50.5
+  round 2 sync 256B 50000/s             3.0s load 49.3
+  round 2 async 64KiB 1000/s            3.0s load 49.3
+  round 2 sync 64KiB 1000/s             3.0s load 46.5
+  round 2 async 64KiB 10000/s           4.7s load 50.1
+  round 2 sync 64KiB 10000/s            3.1s load 50.1
+  round 2 async 64KiB 50000/s          10.1s load 48.6
+  round 2 sync 64KiB 50000/s            3.1s load 51.0
+  round 3 sync 256B 50000/s             3.0s load 52.4
+  round 3 async 64KiB 1000/s            3.0s load 52.4
+  round 3 sync 64KiB 1000/s             3.0s load 49.9
+  round 3 async 64KiB 10000/s           4.5s load 53.5
+  round 3 sync 64KiB 10000/s            3.0s load 53.5
+  round 3 async 64KiB 50000/s          16.4s load 61.0
+  round 3 sync 64KiB 50000/s            3.1s load 61.0
+  round 3 async 256B 1000/s             3.0s load 63.3
+  round 3 sync 256B 1000/s              3.0s load 63.3
+  round 3 async 256B 10000/s            3.0s load 62.4
+  round 3 sync 256B 10000/s             3.0s load 60.1
+  round 3 async 256B 50000/s            3.0s load 60.1
+
+run 1: publish-ack latency
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  async 256B 1000/s               1000        999     0.751     4.855    13.167      33.5    54.2  map[]
+  sync 256B 1000/s                1000        999     0.631     3.593    37.887      75.6    54.3  map[]
+  async 256B 10000/s             10000       9998     0.655     6.303    33.567     143.6    54.0  map[]
+  sync 256B 10000/s              10000       9926     0.586     4.767    22.047      82.7    53.7  map[no free worker:651]
+  async 256B 50000/s             50000      49995     1.016    12.151    72.959     128.9    52.6  map[]
+  sync 256B 50000/s              50000      43281     0.829     3.957    17.519     235.5    50.7  map[no free worker:60399]
+  async 64KiB 1000/s              1000        999     1.116    68.415   379.135     457.2    50.8  map[]
+  sync 64KiB 1000/s               1000        999     0.705     1.957     9.663      24.4    52.4  map[]
+  async 64KiB 10000/s            10000       9150   862.207  1086.463  1181.695    1227.8    49.5  map[]
+  sync 64KiB 10000/s             10000       5881    30.511    43.743    73.215     162.6    52.0  map[no free worker:37059]
+  async 64KiB 50000/s            50000      26002   790.527   986.623  1330.175    1425.4    51.9  map[api-10167:6297 nats: stalled with too many outstanding async pu:4]
+  sync 64KiB 50000/s             50000       5411    31.503    50.879   118.207     177.3    54.2  map[no free worker:401272]
+  created 60000 session keys in 593ms; bucket SESS, 60000 values
+  KV_SESS leader n0, replicas [n1(current=true) n2(current=true)]
+  round 1 cas async 1700/s              3.0s load 57.5
+  round 1 cas sync 5000/s               3.0s load 57.7
+  round 1 cas async 5000/s              3.0s load 57.7
+  round 1 cas sync 10000/s              3.0s load 56.6
+  round 1 cas async 10000/s             3.0s load 56.6
+  round 1 cas sync 1700/s               3.0s load 55.7
+  round 2 cas sync 1700/s               3.0s load 56.4
+  round 2 cas async 1700/s              3.0s load 56.4
+  round 2 cas sync 5000/s               3.0s load 56.9
+  round 2 cas async 5000/s              3.0s load 56.9
+  round 2 cas sync 10000/s              3.0s load 55.8
+  round 2 cas async 10000/s             3.0s load 53.1
+  round 3 cas async 10000/s             3.0s load 53.1
+  round 3 cas sync 1700/s               3.0s load 53.5
+  round 3 cas async 1700/s              3.0s load 53.5
+  round 3 cas sync 5000/s               3.0s load 55.3
+  round 3 cas async 5000/s              3.0s load 57.4
+  round 3 cas sync 10000/s              3.0s load 57.4
+
+run 1: session CAS
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  cas sync 1700/s                 1700       1699     0.782     6.847    29.343      62.7    55.1  map[]
+  cas async 1700/s                1700       1699     0.641     5.071    14.007      23.3    56.7  map[]
+  cas sync 5000/s                 5000       4980     1.097     8.671    36.447     107.5    55.8  map[no free worker:167]
+  cas async 5000/s                5000       4999     0.571     4.183    13.535      30.8    56.6  map[]
+  cas sync 10000/s               10000       9952     0.481     5.059    16.911      74.9    57.3  map[no free worker:406]
+  cas async 10000/s              10000       9998     0.357     0.914     5.691      24.8    55.1  map[]
+  filling 10000000 messages (10 tenants x 1000000, 128 B) ...
+  filled 10000000 messages in 1m23.302s (120046 msgs/s, 6 stalled retries, load 57.4 -> 83.5); 1791 MiB per replica; leader n2, replicas [n0(current=true) n1(current=true)]
+  tenant 0: 990000 ordinary + 10000 `$` = 1000000
+  one tenant, 1 filter, pull 10k     990000 msgs in 5.089s (194547/s), first after 6.097ms, load 81.4
+  unfiltered, first 1/tenants        1000091 msgs in 2.281s (438428/s), first after 5.561ms, load 79.4
+  TenantAll 2 filters, first 20k     20000 msgs in 12.062s (1658/s), first after 4.579ms, load 73.8
+  TenantAll 2 filters, plain, first 20k 20000 msgs in 11.716s (1707/s), first after 9.453ms, load 63.6
+  10 tenants parallel, 1 filter      9900000 msgs in 22.902s (432286/s), first after 3.685ms, load 60.2
+  one tenant, 1 filter d.T.>         990000 msgs in 6.042s (163866/s), first after 4.657ms, load 61.0
+
+run 1: catch-up
+  variant                              messages     msgs/s    seconds first msg ms    load
+  one tenant, 1 filter d.T.>             990000     163866       6.04          4.7    61.0
+  one tenant, 1 filter, pull 10k         990000     194547       5.09          6.1    81.4
+  unfiltered, first 1/tenants           1000091     438428       2.28          5.6    79.4
+  TenantAll 2 filters, first 20k          20000       1658      12.06          4.6    73.8
+  TenantAll 2 filters, plain, first 20k      20000       1707      11.72          9.5    63.6
+  10 tenants parallel, 1 filter         9900000     432286      22.90          3.7    60.2
+  10 subjects/tenant, 1 filter(s)    227220 msgs/s
+  10 subjects/tenant, 2 filter(s)    71847 msgs/s
+  100 subjects/tenant, 1 filter(s)   156016 msgs/s
+  100 subjects/tenant, 2 filter(s)   9871 msgs/s
+  1000 subjects/tenant, 1 filter(s)  88754 msgs/s
+  1000 subjects/tenant, 2 filter(s)  1334 msgs/s
+
+run 1: multi-filter scaling
+  variant                              messages     msgs/s    seconds first msg ms    load
+  10 subjects/tenant, 1 filter(s)          5113     227220       0.02          3.6    60.6
+  10 subjects/tenant, 2 filter(s)          5006      71847       0.07          3.8    60.6
+  100 subjects/tenant, 1 filter(s)         5005     156016       0.03          8.2    60.6
+  100 subjects/tenant, 2 filter(s)         5000       9871       0.51          3.6    60.6
+  1000 subjects/tenant, 1 filter(s)        5018      88754       0.06         13.2    60.5
+  1000 subjects/tenant, 2 filter(s)        5000       1334       3.75          5.1    60.5
+
+== run 2: starting cluster (load { 60.46 73.94 98.63 }) ==
+  stream LOG leader n2, replicas [n0(current=true) n1(current=false)]
+  round 1 async 256B 10000/s            3.0s load 58.4
+  round 1 sync 256B 10000/s             3.0s load 58.4
+  round 1 async 256B 50000/s            3.0s load 58.3
+  round 1 sync 256B 50000/s             3.0s load 58.3
+  round 1 async 64KiB 1000/s            3.0s load 55.8
+  round 1 sync 64KiB 1000/s             3.0s load 53.2
+  round 1 async 64KiB 10000/s           4.0s load 53.2
+  round 1 sync 64KiB 10000/s            3.0s load 51.4
+  round 1 async 64KiB 50000/s           6.0s load 49.1
+  round 1 sync 64KiB 50000/s            3.0s load 47.6
+  round 1 async 256B 1000/s             3.0s load 47.6
+  round 1 sync 256B 1000/s              3.0s load 46.0
+  round 2 sync 64KiB 1000/s             3.0s load 45.5
+  round 2 async 64KiB 10000/s           4.1s load 45.5
+  round 2 sync 64KiB 10000/s            3.0s load 44.7
+  round 2 async 64KiB 50000/s           9.7s load 45.5
+  round 2 sync 64KiB 50000/s            3.0s load 45.4
+  round 2 async 256B 1000/s             3.0s load 45.4
+  round 2 sync 256B 1000/s              3.0s load 43.8
+  round 2 async 256B 10000/s            3.0s load 43.8
+  round 2 sync 256B 10000/s             3.0s load 41.7
+  round 2 async 256B 50000/s            3.0s load 39.3
+  round 2 sync 256B 50000/s             3.0s load 39.3
+  round 2 async 64KiB 1000/s            3.0s load 37.4
+  round 3 async 256B 1000/s             3.0s load 37.4
+  round 3 sync 256B 1000/s              3.0s load 36.0
+  round 3 async 256B 10000/s            3.0s load 35.3
+  round 3 sync 256B 10000/s             3.0s load 35.3
+  round 3 async 256B 50000/s            3.0s load 37.2
+  round 3 sync 256B 50000/s             3.0s load 37.2
+  round 3 async 64KiB 1000/s            3.0s load 36.2
+  round 3 sync 64KiB 1000/s             3.0s load 34.9
+  round 3 async 64KiB 10000/s           3.9s load 34.9
+  round 3 sync 64KiB 10000/s            3.1s load 34.6
+  round 3 async 64KiB 50000/s           5.6s load 39.0
+  round 3 sync 64KiB 50000/s            3.1s load 40.8
+
+run 2: publish-ack latency
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  async 256B 1000/s               1000        999     0.505     1.510     7.547      30.0    43.5  map[]
+  sync 256B 1000/s                1000        999     0.487     3.071    10.071      26.4    43.5  map[]
+  async 256B 10000/s             10000       9998     0.335     1.930    10.887      34.2    45.4  map[]
+  sync 256B 10000/s              10000       9999     0.375     2.713    12.111      26.1    45.8  map[]
+  async 256B 50000/s             50000      49996     0.638    10.079    38.175      68.9    45.1  map[]
+  sync 256B 50000/s              50000      44706     0.591     2.671    17.199     277.5    44.9  map[no free worker:47605]
+  async 64KiB 1000/s              1000        999     0.836     5.091    47.455      95.9    44.9  map[]
+  sync 64KiB 1000/s               1000        999     0.755     3.063    15.959      65.8    46.0  map[]
+  async 64KiB 10000/s            10000       8860   772.095  1017.855  1213.439    1250.3    44.5  map[]
+  sync 64KiB 10000/s             10000       6577    26.223    39.007    76.159     206.3    44.5  map[no free worker:30763]
+  async 64KiB 50000/s            50000      16835   758.271  1071.103  1261.567    1370.1    43.6  map[api-10167:6901 nats: stalled with too many outstanding async pu:1]
+  sync 64KiB 50000/s             50000       6433    26.783    43.135    73.791     138.5    44.5  map[no free worker:392041]
+  created 60000 session keys in 791ms; bucket SESS, 60000 values
+  KV_SESS leader n1, replicas [n0(current=true) n2(current=true)]
+  round 1 cas sync 5000/s               3.0s load 42.4
+  round 1 cas async 5000/s              3.0s load 42.4
+  round 1 cas sync 10000/s              3.0s load 45.7
+  round 1 cas async 10000/s             3.0s load 45.7
+  round 1 cas sync 1700/s               3.0s load 48.6
+  round 1 cas async 1700/s              3.0s load 51.6
+  round 2 cas async 1700/s              3.0s load 51.6
+  round 2 cas sync 5000/s               3.0s load 57.4
+  round 2 cas async 5000/s              3.0s load 57.4
+  round 2 cas sync 10000/s              3.0s load 69.0
+  round 2 cas async 10000/s             3.0s load 72.5
+  round 2 cas sync 1700/s               3.0s load 72.5
+  round 3 cas sync 1700/s               3.0s load 76.5
+  round 3 cas async 1700/s              3.0s load 76.5
+  round 3 cas sync 5000/s               3.0s load 80.9
+  round 3 cas async 5000/s              3.0s load 88.6
+  round 3 cas sync 10000/s              3.0s load 88.6
+  round 3 cas async 10000/s             3.0s load 87.2
+
+run 2: session CAS
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  cas sync 1700/s                 1700       1699     4.927    17.215    35.775      73.3    63.5  map[]
+  cas async 1700/s                1700       1699     5.311    17.727    36.607      51.2    58.9  map[]
+  cas sync 5000/s                 5000       4992     2.493    14.991    44.159      96.2    56.3  map[no free worker:6]
+  cas async 5000/s                5000       4996     3.689    17.167    43.199      85.5    60.2  map[]
+  cas sync 10000/s               10000       9713     4.779    20.143    42.527      87.8    62.8  map[no free worker:2572]
+  cas async 10000/s              10000       9985     7.903    25.967   134.911     217.3    67.8  map[]
+  filling 10000000 messages (10 tenants x 1000000, 128 B) ...
+  filled 10000000 messages in 55.188s (181198 msgs/s, 0 stalled retries, load 87.2 -> 59.5); 1791 MiB per replica; leader n1, replicas [n0(current=true) n2(current=true)]
+  tenant 0: 990000 ordinary + 10000 `$` = 1000000
+  unfiltered, first 1/tenants        1000015 msgs in 1.791s (558358/s), first after 6.222ms, load 59.5
+  TenantAll 2 filters, first 20k     20000 msgs in 13.142s (1522/s), first after 4.732ms, load 54.5
+  TenantAll 2 filters, plain, first 20k 20000 msgs in 14.785s (1353/s), first after 41.148ms, load 46.5
+  10 tenants parallel, 1 filter      9900000 msgs in 21.353s (463625/s), first after 5.171ms, load 43.2
+  one tenant, 1 filter d.T.>         990000 msgs in 4.96s (199617/s), first after 3.453ms, load 42.1
+  one tenant, 1 filter, pull 10k     990000 msgs in 5.148s (192293/s), first after 4.372ms, load 41.5
+
+run 2: catch-up
+  variant                              messages     msgs/s    seconds first msg ms    load
+  one tenant, 1 filter d.T.>             990000     199617       4.96          3.5    42.1
+  one tenant, 1 filter, pull 10k         990000     192293       5.15          4.4    41.5
+  unfiltered, first 1/tenants           1000015     558358       1.79          6.2    59.5
+  TenantAll 2 filters, first 20k          20000       1522      13.14          4.7    54.5
+  TenantAll 2 filters, plain, first 20k      20000       1353      14.79         41.1    46.5
+  10 tenants parallel, 1 filter         9900000     463625      21.35          5.2    43.2
+  10 subjects/tenant, 1 filter(s)    263778 msgs/s
+  10 subjects/tenant, 2 filter(s)    67322 msgs/s
+  100 subjects/tenant, 1 filter(s)   147326 msgs/s
+  100 subjects/tenant, 2 filter(s)   10902 msgs/s
+  1000 subjects/tenant, 1 filter(s)  124008 msgs/s
+  1000 subjects/tenant, 2 filter(s)  1259 msgs/s
+
+run 2: multi-filter scaling
+  variant                              messages     msgs/s    seconds first msg ms    load
+  10 subjects/tenant, 1 filter(s)          5016     263778       0.02          3.4    41.6
+  10 subjects/tenant, 2 filter(s)          5005      67322       0.07          3.4    41.6
+  100 subjects/tenant, 1 filter(s)         5009     147326       0.03          3.4    45.2
+  100 subjects/tenant, 2 filter(s)         5000      10902       0.46          2.2    45.2
+  1000 subjects/tenant, 1 filter(s)        5005     124008       0.04          5.4    45.2
+  1000 subjects/tenant, 2 filter(s)        5000       1259       3.97          4.4    45.0
+
+== run 3: starting cluster (load { 44.74 58.73 83.94 }) ==
+  stream LOG leader n1, replicas [n0(current=false) n2(current=true)]
+  round 1 sync 64KiB 10000/s            3.0s load 43.5
+  round 1 async 64KiB 50000/s           5.7s load 44.2
+  round 1 sync 64KiB 50000/s            3.1s load 42.9
+  round 1 async 256B 1000/s             3.0s load 42.9
+  round 1 sync 256B 1000/s              3.0s load 40.5
+  round 1 async 256B 10000/s            3.0s load 40.5
+  round 1 sync 256B 10000/s             3.0s load 38.6
+  round 1 async 256B 50000/s            3.0s load 39.7
+  round 1 sync 256B 50000/s             3.0s load 39.7
+  round 1 async 64KiB 1000/s            3.0s load 38.2
+  round 1 sync 64KiB 1000/s             3.0s load 38.2
+  round 1 async 64KiB 10000/s           3.8s load 37.9
+  round 2 async 256B 10000/s            3.0s load 36.5
+  round 2 sync 256B 10000/s             3.0s load 36.5
+  round 2 async 256B 50000/s            3.0s load 35.9
+  round 2 sync 256B 50000/s             3.0s load 35.4
+  round 2 async 64KiB 1000/s            3.0s load 35.4
+  round 2 sync 64KiB 1000/s             3.0s load 34.0
+  round 2 async 64KiB 10000/s           4.0s load 33.9
+  round 2 sync 64KiB 10000/s            3.0s load 33.9
+  round 2 async 64KiB 50000/s           9.7s load 33.5
+  round 2 sync 64KiB 50000/s            3.1s load 33.4
+  round 2 async 256B 1000/s             3.0s load 33.4
+  round 2 sync 256B 1000/s              3.0s load 31.6
+  round 3 sync 64KiB 1000/s             3.0s load 30.0
+  round 3 async 64KiB 10000/s           3.6s load 30.0
+  round 3 sync 64KiB 10000/s            3.2s load 29.7
+  round 3 async 64KiB 50000/s          12.1s load 29.8
+  round 3 sync 64KiB 50000/s            3.0s load 32.2
+  round 3 async 256B 1000/s             3.0s load 31.3
+  round 3 sync 256B 1000/s              3.0s load 31.3
+  round 3 async 256B 10000/s            3.0s load 30.3
+  round 3 sync 256B 10000/s             3.0s load 30.3
+  round 3 async 256B 50000/s            3.0s load 29.8
+  round 3 sync 256B 50000/s             3.0s load 29.8
+  round 3 async 64KiB 1000/s            3.0s load 29.8
+
+run 3: publish-ack latency
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  async 256B 1000/s               1000        999     0.484     2.009     7.703      33.9    36.2  map[]
+  sync 256B 1000/s                1000        999     0.389     1.432     9.327      31.8    35.9  map[]
+  async 256B 10000/s             10000       9999     0.298     0.585     3.863      14.4    36.6  map[]
+  sync 256B 10000/s              10000       9998     0.333     2.413    11.199      35.5    35.8  map[]
+  async 256B 50000/s             50000      49992     0.513     3.443    19.855      73.9    35.1  map[]
+  sync 256B 50000/s              50000      46829     0.615     3.131    12.623      73.1    35.1  map[no free worker:28506]
+  async 64KiB 1000/s              1000        999     0.775     3.247    12.183      24.1    35.0  map[]
+  sync 64KiB 1000/s               1000        999     0.589     1.638    15.959      65.2    35.1  map[]
+  async 64KiB 10000/s            10000       9546   643.583   814.079   881.663     892.4    34.1  map[]
+  sync 64KiB 10000/s             10000       7036    25.439    34.175    68.287     328.4    36.2  map[no free worker:26649]
+  async 64KiB 50000/s            50000      21059   760.319   866.303  3035.135    3090.4    35.7  map[api-10167:4746 nats: stalled with too many outstanding async pu:9]
+  sync 64KiB 50000/s             50000       7002    26.575    33.727    55.999      93.9    35.8  map[no free worker:386945]
+  created 60000 session keys in 581ms; bucket SESS, 60000 values
+  KV_SESS leader n2, replicas [n0(current=true) n1(current=true)]
+  round 1 cas async 5000/s              3.0s load 31.0
+  round 1 cas sync 10000/s              3.0s load 31.0
+  round 1 cas async 10000/s             3.0s load 31.0
+  round 1 cas sync 1700/s               3.0s load 29.9
+  round 1 cas async 1700/s              3.0s load 29.9
+  round 1 cas sync 5000/s               3.0s load 29.5
+  round 2 cas sync 5000/s               3.0s load 30.5
+  round 2 cas async 5000/s              3.0s load 30.5
+  round 2 cas sync 10000/s              3.0s load 31.0
+  round 2 cas async 10000/s             3.0s load 31.0
+  round 2 cas sync 1700/s               3.0s load 30.9
+  round 2 cas async 1700/s              3.0s load 34.0
+  round 3 cas async 1700/s              3.0s load 34.0
+  round 3 cas sync 5000/s               3.0s load 33.1
+  round 3 cas async 5000/s              3.0s load 33.1
+  round 3 cas sync 10000/s              3.0s load 32.5
+  round 3 cas async 10000/s             3.0s load 33.2
+  round 3 cas sync 1700/s               3.0s load 33.2
+
+run 3: session CAS
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  cas sync 1700/s                 1700       1699     0.412     1.361    12.263      35.5    31.7  map[]
+  cas async 1700/s                1700       1699     0.377     0.987     7.159      20.8    31.6  map[]
+  cas sync 5000/s                 5000       4967     0.430     4.851    34.303     153.9    31.1  map[no free worker:285]
+  cas async 5000/s                5000       4999     0.418     2.425     9.839      24.8    31.1  map[]
+  cas sync 10000/s               10000       9999     0.355     1.020     5.551      11.0    31.5  map[]
+  cas async 10000/s              10000       9999     0.370     1.831    11.071      60.9    31.5  map[]
+  filling 10000000 messages (10 tenants x 1000000, 128 B) ...
+  filled 10000000 messages in 58.468s (171035 msgs/s, 1 stalled retries, load 33.2 -> 49.0); 1791 MiB per replica; leader n2, replicas [n0(current=true) n1(current=true)]
+  tenant 0: 990000 ordinary + 10000 `$` = 1000000
+  TenantAll 2 filters, first 20k     20000 msgs in 13.344s (1499/s), first after 4.502ms, load 45.9
+  TenantAll 2 filters, plain, first 20k 20007 msgs in 13.319s (1502/s), first after 4.458ms, load 40.8
+  10 tenants parallel, 1 filter      9900000 msgs in 35.334s (280184/s), first after 22.219ms, load 46.1
+  one tenant, 1 filter d.T.>         990000 msgs in 24.875s (39799/s), first after 7.362ms, load 61.9
+  one tenant, 1 filter, pull 10k     990000 msgs in 22.896s (43239/s), first after 42.656ms, load 81.2
+  unfiltered, first 1/tenants        1000233 msgs in 18.851s (53061/s), first after 41.833ms, load 94.0
+
+run 3: catch-up
+  variant                              messages     msgs/s    seconds first msg ms    load
+  one tenant, 1 filter d.T.>             990000      39799      24.88          7.4    61.9
+  one tenant, 1 filter, pull 10k         990000      43239      22.90         42.7    81.2
+  unfiltered, first 1/tenants           1000233      53061      18.85         41.8    94.0
+  TenantAll 2 filters, first 20k          20000       1499      13.34          4.5    45.9
+  TenantAll 2 filters, plain, first 20k      20007       1502      13.32          4.5    40.8
+  10 tenants parallel, 1 filter         9900000     280184      35.33         22.2    46.1
+  10 subjects/tenant, 1 filter(s)    57525 msgs/s
+  10 subjects/tenant, 2 filter(s)    23753 msgs/s
+  100 subjects/tenant, 1 filter(s)   23777 msgs/s
+  100 subjects/tenant, 2 filter(s)   3159 msgs/s
+  1000 subjects/tenant, 1 filter(s)  118060 msgs/s
+  1000 subjects/tenant, 2 filter(s)  790 msgs/s
+
+run 3: multi-filter scaling
+  variant                              messages     msgs/s    seconds first msg ms    load
+  10 subjects/tenant, 1 filter(s)          5269      57525       0.09         38.5    96.2
+  10 subjects/tenant, 2 filter(s)          5018      23753       0.21         26.4    96.2
+  100 subjects/tenant, 1 filter(s)         5049      23777       0.21         40.6    99.1
+  100 subjects/tenant, 2 filter(s)         5000       3159       1.58          6.4    99.1
+  1000 subjects/tenant, 1 filter(s)        5002     118060       0.04          3.5    99.1
+  1000 subjects/tenant, 2 filter(s)        5004        790       6.33          3.5    96.7
+
+publish-ack latency, median of 3 runs
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  async 256B 1000/s               1000        999     0.505     2.009     7.703      33.5    43.5  map[]
+  sync 256B 1000/s                1000        999     0.487     3.071    10.071      31.8    43.5  map[]
+  async 256B 10000/s             10000       9998     0.335     1.930    10.887      34.2    45.4  map[]
+  sync 256B 10000/s              10000       9998     0.375     2.713    12.111      35.5    45.8  map[]
+  async 256B 50000/s             50000      49995     0.638    10.079    38.175      73.9    45.1  map[]
+  sync 256B 50000/s              50000      44706     0.615     3.131    17.199     235.5    44.9  map[]
+  async 64KiB 1000/s              1000        999     0.836     5.091    47.455      95.9    44.9  map[]
+  sync 64KiB 1000/s               1000        999     0.705     1.957    15.959      65.2    46.0  map[]
+  async 64KiB 10000/s            10000       9150   772.095  1017.855  1181.695    1227.8    44.5  map[]
+  sync 64KiB 10000/s             10000       6577    26.223    39.007    73.215     206.3    44.5  map[]
+  async 64KiB 50000/s            50000      21059   760.319   986.623  1330.175    1425.4    43.6  map[]
+  sync 64KiB 50000/s             50000       6433    26.783    43.135    73.791     138.5    44.5  map[]
+
+session CAS, median of 3 runs
+  cell                        target/s achieved/s    p50 ms    p90 ms    p99 ms    max ms    load  errors
+  cas sync 1700/s                 1700       1699     0.782     6.847    29.343      62.7    55.1  map[]
+  cas async 1700/s                1700       1699     0.641     5.071    14.007      23.3    56.7  map[]
+  cas sync 5000/s                 5000       4980     1.097     8.671    36.447     107.5    55.8  map[]
+  cas async 5000/s                5000       4999     0.571     4.183    13.535      30.8    56.6  map[]
+  cas sync 10000/s               10000       9952     0.481     5.059    16.911      74.9    57.3  map[]
+  cas async 10000/s              10000       9998     0.370     1.831    11.071      60.9    55.1  map[]
+
+catch-up, median of 3 runs
+  variant                              messages     msgs/s    seconds first msg ms    load
+  one tenant, 1 filter d.T.>             990000     163866       6.04          4.7    61.0
+  one tenant, 1 filter, pull 10k         990000     192293       5.15          6.1    81.2
+  unfiltered, first 1/tenants           1000091     438428       2.28          6.2    79.4
+  TenantAll 2 filters, first 20k          20000       1522      13.14          4.6    54.5
+  TenantAll 2 filters, plain, first 20k      20000       1502      13.32          9.5    46.5
+  10 tenants parallel, 1 filter         9900000     432286      22.90          5.2    46.1
+
+multi-filter scaling, median of 3 runs
+  variant                              messages     msgs/s    seconds first msg ms    load
+  10 subjects/tenant, 1 filter(s)          5113     227220       0.02          3.6    60.6
+  10 subjects/tenant, 2 filter(s)          5006      67322       0.07          3.8    60.6
+  100 subjects/tenant, 1 filter(s)         5005     147326       0.03          8.2    60.6
+  100 subjects/tenant, 2 filter(s)         5000       9871       0.51          3.6    60.6
+  1000 subjects/tenant, 1 filter(s)        5018     118060       0.04          5.4    60.5
+  1000 subjects/tenant, 2 filter(s)        5000       1259       3.97          4.4    60.5
+
+load at end: { 94.22 63.61 74.56 }

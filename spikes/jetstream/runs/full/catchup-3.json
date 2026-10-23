@@ -1,0 +1,68 @@
+[
+  {
+    "cell": "one tenant, 1 filter d.T.\u003e",
+    "target_per_s": 990000,
+    "achieved_per_s": 39798.78611404475,
+    "acked": 0,
+    "p50_ms": 24.875130542,
+    "p90_ms": 7.361,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 61.885000000000005
+  },
+  {
+    "cell": "one tenant, 1 filter, pull 10k",
+    "target_per_s": 990000,
+    "achieved_per_s": 43238.750568259275,
+    "acked": 0,
+    "p50_ms": 22.89612875,
+    "p90_ms": 42.655,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 81.215
+  },
+  {
+    "cell": "unfiltered, first 1/tenants",
+    "target_per_s": 1000233,
+    "achieved_per_s": 53061.09512580088,
+    "acked": 0,
+    "p50_ms": 18.850590958,
+    "p90_ms": 41.833,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 93.965
+  },
+  {
+    "cell": "TenantAll 2 filters, first 20k",
+    "target_per_s": 20000,
+    "achieved_per_s": 1498.8511540100008,
+    "acked": 0,
+    "p50_ms": 13.343553125,
+    "p90_ms": 4.502,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 45.86
+  },
+  {
+    "cell": "TenantAll 2 filters, plain, first 20k",
+    "target_per_s": 20007,
+    "achieved_per_s": 1502.159142600267,
+    "acked": 0,
+    "p50_ms": 13.3188285,
+    "p90_ms": 4.457,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 40.83
+  },
+  {
+    "cell": "10 tenants parallel, 1 filter",
+    "target_per_s": 9900000,
+    "achieved_per_s": 280183.7267996686,
+    "acked": 0,
+    "p50_ms": 35.333957875,
+    "p90_ms": 22.219,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 46.055
+  }
+]

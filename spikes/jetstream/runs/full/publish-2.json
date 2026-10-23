@@ -1,0 +1,147 @@
+[
+  {
+    "cell": "async 256B 1000/s",
+    "target_per_s": 1000,
+    "achieved_per_s": 999,
+    "acked": 8991,
+    "p50_ms": 0.505,
+    "p90_ms": 1.51,
+    "p99_ms": 7.547,
+    "max_ms": 30.031,
+    "load1_mean": 43.48
+  },
+  {
+    "cell": "sync 256B 1000/s",
+    "target_per_s": 1000,
+    "achieved_per_s": 999,
+    "acked": 8991,
+    "p50_ms": 0.487,
+    "p90_ms": 3.071,
+    "p99_ms": 10.071,
+    "max_ms": 26.351,
+    "load1_mean": 43.48
+  },
+  {
+    "cell": "async 256B 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 9998,
+    "acked": 89982,
+    "p50_ms": 0.335,
+    "p90_ms": 1.93,
+    "p99_ms": 10.887,
+    "max_ms": 34.239,
+    "load1_mean": 45.43
+  },
+  {
+    "cell": "sync 256B 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 9998.888888888889,
+    "acked": 89990,
+    "p50_ms": 0.375,
+    "p90_ms": 2.713,
+    "p99_ms": 12.111,
+    "max_ms": 26.127,
+    "load1_mean": 45.81666666666666
+  },
+  {
+    "cell": "async 256B 50000/s",
+    "target_per_s": 50000,
+    "achieved_per_s": 49995.88888888889,
+    "acked": 449963,
+    "p50_ms": 0.638,
+    "p90_ms": 10.079,
+    "p99_ms": 38.175,
+    "max_ms": 68.927,
+    "load1_mean": 45.126666666666665
+  },
+  {
+    "cell": "sync 256B 50000/s",
+    "target_per_s": 50000,
+    "achieved_per_s": 44706.333333333336,
+    "acked": 402357,
+    "p50_ms": 0.591,
+    "p90_ms": 2.671,
+    "p99_ms": 17.199,
+    "max_ms": 277.503,
+    "errors": {
+      "no free worker": 47605
+    },
+    "load1_mean": 44.93000000000001
+  },
+  {
+    "cell": "async 64KiB 1000/s",
+    "target_per_s": 1000,
+    "achieved_per_s": 999,
+    "acked": 8991,
+    "p50_ms": 0.836,
+    "p90_ms": 5.091,
+    "p99_ms": 47.455,
+    "max_ms": 95.935,
+    "load1_mean": 44.93000000000001
+  },
+  {
+    "cell": "sync 64KiB 1000/s",
+    "target_per_s": 1000,
+    "achieved_per_s": 999,
+    "acked": 8991,
+    "p50_ms": 0.755,
+    "p90_ms": 3.063,
+    "p99_ms": 15.959,
+    "max_ms": 65.791,
+    "load1_mean": 46.00666666666666
+  },
+  {
+    "cell": "async 64KiB 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 8860.222222222223,
+    "acked": 79742,
+    "p50_ms": 772.095,
+    "p90_ms": 1017.855,
+    "p99_ms": 1213.439,
+    "max_ms": 1250.303,
+    "load1_mean": 44.53666666666667
+  },
+  {
+    "cell": "sync 64KiB 10000/s",
+    "target_per_s": 10000,
+    "achieved_per_s": 6577.333333333333,
+    "acked": 59196,
+    "p50_ms": 26.223,
+    "p90_ms": 39.007,
+    "p99_ms": 76.159,
+    "max_ms": 206.335,
+    "errors": {
+      "no free worker": 30763
+    },
+    "load1_mean": 44.53666666666667
+  },
+  {
+    "cell": "async 64KiB 50000/s",
+    "target_per_s": 50000,
+    "achieved_per_s": 16835.222222222223,
+    "acked": 151517,
+    "p50_ms": 758.271,
+    "p90_ms": 1071.103,
+    "p99_ms": 1261.567,
+    "max_ms": 1370.111,
+    "errors": {
+      "api-10167": 6901,
+      "nats: stalled with too many outstanding async pu": 1
+    },
+    "load1_mean": 43.56
+  },
+  {
+    "cell": "sync 64KiB 50000/s",
+    "target_per_s": 50000,
+    "achieved_per_s": 6433.111111111111,
+    "acked": 57898,
+    "p50_ms": 26.783,
+    "p90_ms": 43.135,
+    "p99_ms": 73.791,
+    "max_ms": 138.495,
+    "errors": {
+      "no free worker": 392041
+    },
+    "load1_mean": 44.52333333333333
+  }
+]

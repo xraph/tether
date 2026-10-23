@@ -1,0 +1,68 @@
+[
+  {
+    "cell": "10 subjects/tenant, 1 filter(s)",
+    "target_per_s": 5113,
+    "achieved_per_s": 227219.6219630762,
+    "acked": 0,
+    "p50_ms": 0.022502458,
+    "p90_ms": 3.633,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.58
+  },
+  {
+    "cell": "10 subjects/tenant, 2 filter(s)",
+    "target_per_s": 5006,
+    "achieved_per_s": 71847.13501583651,
+    "acked": 0,
+    "p50_ms": 0.069675708,
+    "p90_ms": 3.776,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.58
+  },
+  {
+    "cell": "100 subjects/tenant, 1 filter(s)",
+    "target_per_s": 5005,
+    "achieved_per_s": 156015.80095613215,
+    "acked": 0,
+    "p50_ms": 0.032080084,
+    "p90_ms": 8.196,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.58
+  },
+  {
+    "cell": "100 subjects/tenant, 2 filter(s)",
+    "target_per_s": 5000,
+    "achieved_per_s": 9871.386534044406,
+    "acked": 0,
+    "p50_ms": 0.506514458,
+    "p90_ms": 3.561,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.58
+  },
+  {
+    "cell": "1000 subjects/tenant, 1 filter(s)",
+    "target_per_s": 5018,
+    "achieved_per_s": 88753.55082740576,
+    "acked": 0,
+    "p50_ms": 0.056538583,
+    "p90_ms": 13.242,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.46
+  },
+  {
+    "cell": "1000 subjects/tenant, 2 filter(s)",
+    "target_per_s": 5000,
+    "achieved_per_s": 1333.709973029717,
+    "acked": 0,
+    "p50_ms": 3.748941,
+    "p90_ms": 5.144,
+    "p99_ms": 0,
+    "max_ms": 0,
+    "load1_mean": 60.46
+  }
+]
