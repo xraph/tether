@@ -702,6 +702,23 @@ func TestSlotReleasedWhenConnackWriteFails(t *testing.T) {
 		t.Fatal("broker never closed the failed handshake")
 	}
 
+	// writeFailConn.Close signals closed inside mochi's Client.Stop, before
+	// Stop cancels the client's context, so a dial now can still beat
+	// Closed() and find a slot the sweep does not yet see as leaked. Wait
+	// until the leaked client is registered and reports Closed.
+	require.Eventually(t, func() bool {
+		b.state.mu.RLock()
+		defer b.state.mu.RUnlock()
+
+		for cl, st := range b.state.byClient {
+			if st.tenantID == ta.ID.String() {
+				return cl.Closed()
+			}
+		}
+
+		return false
+	}, waitTimeout, time.Millisecond, "the leaked client never reported Closed")
+
 	_, _, err = connect5(t, b.Addr().String(), "next", "a", true)
 	require.NoError(t, err, "the leaked slot is swept and reused")
 
