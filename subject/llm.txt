@@ -1,0 +1,22 @@
+# tether/subject
+
+Import: github.com/xraph/tether/subject
+
+Pure package (no mochi, no nats at runtime; nats-server is a test-only dependency). Turns MQTT topics, filters and client IDs into NATS subjects and JetStream KV keys, and back. Everything that names a subject or a key on the wire between broker nodes goes through here. Errors wrap `tether.ErrInvalidInput`.
+
+Encoding: a topic splits on "/" and each level becomes one token, joined with ".". A level of `[-_=a-zA-Z0-9]` that does not start with "=" passes through. Anything else (empty, UTF-8, "$", ".", "*", ">", space, NUL, a leading "=") becomes "=" plus unpadded base64url; the empty level is the token "=". Depth is preserved, so MQTT "+" is NATS "*". A topic of N bytes encodes to at most 2N+1 bytes.
+
+- `EncodeLevel(level) string`, `DecodeLevel(token) (string, error)`: one level or client ID. DecodeLevel is strict (canonical base64, alphabet checked, a payload that would pass through is refused), so each token has one reading.
+- `QoS0(tenant, topic) string`: `f.<tenant>.<levels>`. A topic whose first level starts with "$" goes under `f.==<tenant>.<levels>`.
+- `QoS0Filters(tenant, filter) []string`: subjects for an MQTT filter, each with the `f.` prefix. A trailing "#" gives two subjects, the parent and `parent.>`; a lone "#" gives only `>`. A filter starting with "+" or "#" is built in the ordinary space and cannot reach "$" topics; one starting with a literal "$" level is built in the `==<tenant>` space. Pass a filter with any `$share/<group>/` prefix already stripped.
+- `Log(tenant, topic) string`: `d.<tenant>.<levels>` for the QoS 1/2 stream. "$" topics stay under the plain tenant token. `LogTenantAll(tenant) string`: `d.<tenant>.>`, the one filter that reads everything a tenant logged.
+- `SessionKey(tenant, clientID) string`: `<tenant>.<client id as one token>`. No `s.` prefix, the sessions bucket is its own.
+- `RetainedKey(tenant, topic) string`: `<tenant>.<levels>`, `==<tenant>.<levels>` for "$" topics. `RetainedKeyFilter(tenant, filter) []string`: the key filters for a filter, same two-key rule and "$" rule as `QoS0Filters`, no prefix. No `r.` prefix, the retained bucket is its own.
+- `DecodeLog(subj) (tenant, topic, err)`, `DecodeRetainedKey(key) (tenant, topic, err)`: exact inverses. They refuse anything the encoders could not have produced (wrong prefix, `==` tenant in the log, a "$" topic in the wrong space, a level holding "/", an empty tenant, a topic over the cap).
+- `CheckTopic(topic) error`, `CheckClientID(clientID) error`: the size limits, `MaxTopicBytes` 1024 and `MaxClientIDBytes` 256, counted before encoding. They apply to filters too.
+
+Refusal: the string-returning encoders cannot return an error, so an empty tenant, a topic or filter over 1024 bytes, or a client ID over 256 bytes gives "" (nil for the filter functions). An empty string is not a valid subject or key, so a caller that forgets to check fails closed at the NATS call. Call `CheckTopic` / `CheckClientID` first when you need the reason (the broker does this at PUBLISH and SUBSCRIBE and answers 0x90).
+
+All names are valid NATS subjects and match the KV key rule `^[-/_=\.a-zA-Z0-9]+$`; filters are valid KV watch patterns. The tenant is encoded like a level, so any non-empty string is safe, but in practice it is a `ttnt_` TypeID and passes through.
+
+Tests: `TestEquivalenceExhaustive` compares MQTT matching to NATS matching over 21 million filter/topic pairs (skipped with `-short`); `server_test.go` runs the same comparison and a 1024-byte worst case against an embedded nats-server. Fuzz targets (fuzz_test.go): `FuzzRoundTrip`, `FuzzKVKeySafe`, `FuzzSubjectValid`, `FuzzWildcardEquivalence` (also cross-checks nats-server's `SubjectMatchesFilter`), `FuzzDecodeCanonical`. Its corpus under testdata/fuzz holds the two decoder bugs the spike found (`=000v` decoding to a level with "/", and "\r" skipped by base64).
