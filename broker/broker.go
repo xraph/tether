@@ -75,6 +75,11 @@ type Broker struct {
 	// shorten it before Start.
 	sysInterval time.Duration
 
+	// disconnectHold, when set before Start, runs in lastHook.OnDisconnect
+	// before (removed false) and after (removed true) the state is removed,
+	// so a test can hold a connection in either window. Tests only.
+	disconnectHold func(cl *mqtt.Client, removed bool)
+
 	// receiveMaximum, when set before Start, replaces mochi's default
 	// Receive Maximum (1024) in the server's capabilities. Tests only.
 	receiveMaximum uint16

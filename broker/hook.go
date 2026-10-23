@@ -379,17 +379,10 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 		h.b.cluster.dropQoS2(cl.ID)
 	}
 
-	// A takeover: mochi clones the old connection's inflight map right
-	// after this hook, before the old connection ends. Its pipe is
-	// abandoned now, so no PUBREC of an uncommitted publish is cloned.
-	if h.b.cluster != nil {
-		if prev := h.b.state.owner(cl.ID); prev != nil && prev != st && prev.pipe != nil {
-			prev.pipe.close()
-		}
-	}
-
 	h.capSessionExpiry(cl, st)
 
+	// bind also abandons the pipe of a connection this one takes over
+	// (clientState.closePipe), before mochi clones its inflight map.
 	h.b.state.bind(st)
 }
 
@@ -854,12 +847,20 @@ func (h *lastHook) Provides(b byte) bool { return b == mqtt.OnDisconnect }
 // the connection, drops its pending QoS 2 entries, unless another connection
 // holds the session now.
 func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
-	if st := h.b.state.remove(cl); st != nil {
-		st.releaseSlot()
+	if hold := h.b.disconnectHold; hold != nil {
+		hold(cl, false)
+	}
 
-		if st.pipe != nil {
-			st.pipe.close()
-		}
+	// remove closes the pipe before the state leaves the ID's ownership
+	// (clientState.closePipe).
+	st := h.b.state.remove(cl)
+
+	if hold := h.b.disconnectHold; hold != nil {
+		hold(cl, true)
+	}
+
+	if st != nil {
+		st.releaseSlot()
 	}
 
 	if n := h.b.cluster; n != nil && expire && !cl.Net.Inline {

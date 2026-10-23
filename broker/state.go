@@ -175,6 +175,19 @@ func (st *clientState) stopTimers() {
 	st.stopRetry()
 }
 
+// closePipe abandons the connection's pending QoS 1 and 2 publishes and
+// removes their uncommitted PUBREC reservations (cluster mode; nil-safe and
+// idempotent). The registry calls it before a state stops being the owner of
+// its namespaced ID (bind, remove, sweepClosed): once a CONNECT for the ID
+// can no longer find this connection, mochi may clone its inflight map into
+// the new connection (inheritClientSession), so no reservation of an
+// uncommitted message may be left in it by then.
+func (st *clientState) closePipe() {
+	if st.pipe != nil {
+		st.pipe.close()
+	}
+}
+
 // markEnded closes ended. Safe to call more than once.
 func (st *clientState) markEnded() {
 	st.endedOnce.Do(func() { close(st.ended) })
@@ -368,6 +381,13 @@ func (r *registry) bind(st *clientState) {
 	r.mu.Lock()
 
 	prev := r.byID[st.cl.ID]
+
+	if prev != nil && prev != st {
+		// A takeover: mochi clones prev's inflight map right after the
+		// hook that called bind.
+		prev.closePipe()
+	}
+
 	r.byID[st.cl.ID] = st
 
 	stale := prev != nil && prev != st && prev.cl.Closed()
@@ -422,11 +442,13 @@ func (r *registry) remove(cl *mqtt.Client) *clientState {
 		}
 
 		delete(r.closing, cl)
+		c.st.closePipe()
 		c.st.markEnded()
 
 		return c.st
 	}
 
+	st.closePipe()
 	delete(r.byClient, cl)
 
 	if r.byID[cl.ID] == st {
@@ -458,6 +480,7 @@ func (r *registry) sweepClosed(tenantID string) int {
 			continue
 		}
 
+		st.closePipe()
 		delete(r.byClient, cl)
 
 		if r.byID[cl.ID] == st {

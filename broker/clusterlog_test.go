@@ -13,6 +13,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
+	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether/acl"
@@ -864,4 +865,120 @@ func TestACLRefusalAckedInOrder(t *testing.T) {
 	eventually(t, "the 3.1.1 client to be disconnected", func() bool { return !v3.IsConnectionOpen() })
 
 	noMoreMsgs(t, sub)
+}
+
+// A reconnect that comes while the old connection is ending never inherits
+// a PUBREC for a message that is not committed, whichever way the old
+// connection's state leaves the ID: its own OnDisconnect (held right after
+// the state is removed) or a sweep of closed connections at the tenant's
+// connection limit (held before OnDisconnect runs at all). The registry
+// closes the pipe before the state stops owning the ID, so mochi's clone of
+// the offline session's inflight map has no reservation in it.
+func TestQoS2NoPubrecInDisconnectWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		removed bool // hold after the state is removed, else before
+		limits  tenant.Limits
+	}{
+		{name: "after remove", removed: true},
+		{name: "swept at the connection limit", removed: false, limits: tenant.Limits{MaxConnections: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) { disconnectWindow(t, tc.removed, tc.limits) })
+	}
+}
+
+func disconnectWindow(t *testing.T, holdRemoved bool, limits tenant.Limits) {
+	t1 := newTenant(limits)
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	nsID := namespacedID(t1.ID.String(), "win")
+
+	var (
+		proxy   *chaos.Proxy
+		armed   atomic.Bool
+		reached = make(chan struct{})
+		release = make(chan struct{})
+	)
+
+	c := startCellVia(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.disconnectHold = func(cl *mqtt.Client, removed bool) {
+				if removed == holdRemoved && cl.ID == nsID && armed.CompareAndSwap(true, false) {
+					close(reached)
+					<-release
+				}
+			}
+		},
+		func(_ int, url string) string {
+			p, err := chaos.NewProxy(strings.TrimPrefix(url, "nats://"))
+			require.NoError(t, err)
+			t.Cleanup(p.Close)
+
+			proxy = p
+
+			return "nats://" + p.Addr()
+		})
+	a := c.nodes[0]
+
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	expiry := uint32(3600)
+	connect := &packets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: "win", CleanStart: false, KeepAlive: 30,
+		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: &packets.Properties{SessionExpiryInterval: &expiry},
+	}
+
+	inflight := func() int {
+		cl, ok := a.server.Clients.Get(nsID)
+		if !ok {
+			return -1
+		}
+
+		return cl.State.Inflight.Len()
+	}
+
+	conn := rawConnect(t, c.addr(0), connect)
+
+	proxy.SetMode(chaos.Both, chaos.Blackhole)
+
+	writePacket(t, conn, &packets.Publish{Topic: "w/x", QoS: 2, PacketID: 3, Payload: []byte("x"), Properties: &packets.Properties{}})
+	eventually(t, "the reservation", func() bool { return inflight() == 1 })
+
+	armed.Store(true)
+	require.NoError(t, conn.Close())
+
+	select {
+	case <-reached:
+	case <-time.After(logWait):
+		t.Fatal("the old connection never reached the held window")
+	}
+
+	// The old connection's OnDisconnect is held; the reconnect inherits the
+	// offline session from mochi now.
+	conn = rawConnect(t, c.addr(0), connect)
+	require.Zero(t, inflight(), "the reconnect inherited an uncommitted PUBREC")
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
+
+	if cp, err := packets.ReadPacket(conn); err == nil {
+		t.Fatalf("the reconnect was sent %v", cp)
+	}
+
+	close(release)
+	proxy.SetMode(chaos.Both, chaos.Pass)
+
+	writePacket(t, conn, &packets.Publish{Topic: "w/x", QoS: 2, PacketID: 3, Duplicate: true, Payload: []byte("x"), Properties: &packets.Properties{}})
+
+	rec := readLog(t, conn)
+	require.Equal(t, packets.PUBREC, rec.Type)
+	require.Equal(t, byte(0), rec.Content.(*packets.Pubrec).ReasonCode)
+
+	writePacket(t, conn, &packets.Pubrel{PacketID: 3, Properties: &packets.Properties{}})
+	require.Equal(t, packets.PUBCOMP, readLog(t, conn).Type)
 }

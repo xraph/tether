@@ -431,9 +431,10 @@ func newPubPipe(b *Broker, srv *mqtt.Server, cl *mqtt.Client, st *clientState) *
 // reservation of every QoS 2 publish whose commit was not seen is removed
 // from the client's inflight map, so neither this connection nor one that
 // inherits the session (mochi clones the inflight map at a takeover, which
-// is why OnSessionEstablish closes the old connection's pipe first) ever
+// is why bind closes the old connection's pipe first) ever
 // sends a PUBREC for a message that may not be in the log. The client sends
-// those publishes again. Idempotent.
+// those publishes again. The registry calls it (clientState.closePipe)
+// before the state stops owning its client ID. Idempotent.
 func (p *pubPipe) close() {
 	p.mu.Lock()
 
@@ -779,7 +780,9 @@ func (p *pubPipe) ack(it *pubItem) bool {
 // pipe. The tenant is the connection's and the topic tenant-relative; the
 // payload is copied. A QoS 2 publish takes its message ID from the session's
 // pending entry (qos2MsgID), so a DUP resend is stored once, and reserves its
-// packet ID (pubPipe.reserve). Nothing is queued once the pipe is abandoned.
+// packet ID (pubPipe.reserve); a QoS 2 publish read after the pipe was
+// abandoned is neither reserved nor queued. A QoS 1 one is queued and never
+// acked, since the abandoned pipe's goroutines have ended.
 func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk *packets.Packet) {
 	n := b.cluster
 	qos := pk.FixedHeader.Qos
