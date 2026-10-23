@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/cluster
 
-Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. Later tasks add the members, retained and router code.
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. The QoS 0 router (route.go, dedup.go) sits on `*Conn` too. Later tasks add the members and retained code.
 
 ## Config
 
@@ -70,6 +70,21 @@ The cell's QoS 1 and 2 messages live in one JetStream stream, `Config.LogStream(
 - `Log.consumers` (atomic) counts the server consumers the Log created, and `Log.heartbeat` sets the pull heartbeat (0 = nats.go default, 5 s); tests read and set them.
 
 `Props` encoding (props.go, unexported `encode(nats.Header)` and `decode(nats.Header) error`): headers only for present properties. `Tether-Prop-User` is base64url (unpadded) of frames, per property uvarint(len key) key uvarint(len value) value, so order, duplicate keys, CR/LF and non-UTF-8 bytes survive. `-Content-Type`, `-Response-Topic` and `-Correlation-Data` are base64url of the raw bytes. `-Message-Expiry` and `-Payload-Format` are decimal numbers (the latter present means non-nil, so a pointer to 0 survives). A header that does not parse is an error from decode.
+
+## Router
+
+QoS 0 messages cross nodes by NATS subject interest, on core NATS (no JetStream). `NewRouter(c *Conn, nodeID string, deliver func(tenant, topic string, payload []byte, props Props)) *Router`. Each node holds one core subscription set per distinct (tenant, filter) with local subscribers and publishes every message once; NATS delivers it to each node with interest. Local delivery stays with the broker: the connection is NoEcho, so a node never receives its own publishes. Two Routers in one test process need two `Connect` connections.
+
+- `Subscribe(tenant, filter) error`: one reference. The first one subscribes `subject.QoS0Filters(tenant, filter)` (two subjects for a trailing `#`: the parent and `parent.>`), later ones only count. `Unsubscribe(tenant, filter) error`: drops one; the last unsubscribes. An Unsubscribe with no matching Subscribe returns an error wrapping `tether.ErrNotFound` and changes nothing.
+- Validation: the filter goes through `subject.CheckTopic` and `topic.Valid(filter, true, 1024)`, and an empty tenant is refused. `$share/...` filters are refused (Task 12 routes them). All of these wrap `tether.ErrInvalidInput`, and nothing is ever subscribed for a refused filter. A NATS failure wraps `ErrUnavailable` when it is a connection or timeout error.
+- `Publish(tenant, topic string, payload []byte, props Props) error`: `subject.CheckTopic`, then `topic.Valid(topic, false, 1024)` (no wildcards, no NUL, not empty), then one `PublishMsg` on `subject.QoS0(tenant, topic)`. Headers: `Tether-Id` = `<node id>:<counter>` (the counter is atomic and starts at the clock reading at NewRouter, so a restarted node does not repeat ids inside the dedup window) and the `Tether-Prop-*` headers of `Props` (`Props.encode`). It does not wait; a message nobody has interest in is dropped by NATS.
+- Receiving: tenant and topic come from the subject through `subject.DecodeQoS0` (an undecodable subject is logged at Warn and dropped). Props come from `Props.decode`; a header that does not parse is logged at Warn and the message is delivered with empty Props. A message without `Tether-Id` (a publisher that is not a Tether node) is delivered without deduplication and logged at Debug.
+- Dedup (dedup.go): a message that matches two of a node's subscriptions (`a/+` and `a/#` for `a/b`) arrives twice. The second is dropped by `Tether-Id` within 2 s. 16 shards of id -> first seen, each also keeping its ids in arrival order so expired ids fall off the front on every insert (no sweeper goroutine). Capped at 2^18 ids; at the cap the oldest go first, so a burst larger than that can let a duplicate through. Memory follows the message rate times 2 s.
+- deliver runs on NATS dispatch goroutines, one per subscription, so calls for different subscriptions can overlap. A slow deliver delays its subscription and past the nats.go pending limits NATS drops (QoS 0 allows it). Keep it short: hand off to the broker's queues. payload and props belong to deliver.
+- Locking: the router's map lock (`Router.mu`) guards the route table, `closed` and each route's pin count, and is never held across a NATS call. Each route has its own mutex that serializes that key's first subscribe and last unsubscribe, so concurrent Subscribe/Unsubscribe on one key keep refs and subscriptions in step while other keys proceed. A route is pinned while anyone holds or waits for it and removed when idle with no references.
+- `Close()`: unsubscribes everything, idempotent, does not close the Conn. After it Subscribe, Unsubscribe and Publish return an error wrapping `ErrUnavailable`. A Subscribe racing Close never leaves a subscription behind (the route is marked dead under its mutex).
+
+route_test.go (package cluster, `startRouteNodes` gives n nodes, each with its own connection, on a three-server cell; `ready(a, b)` waits for b's interest to reach a's server with a probe subscription, which routes keep in order) covers routing across nodes, overlap dedup over three filters, `a/#` matching `a`, the `$` rule, tenant isolation, refcounts, NoEcho, the Props round trip, a foreign publisher, invalid input, Close, concurrent Subscribe/Unsubscribe and Close racing Subscribe under -race, and the dedup window and bounds with a fake clock.
 
 ## clustertest
 

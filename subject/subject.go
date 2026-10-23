@@ -393,6 +393,18 @@ func DecodeLog(subj string) (tenant, topic string, err error) {
 	return decode(name, false)
 }
 
+// DecodeQoS0 is the exact inverse of [QoS0]: it takes the "f." prefix off and
+// reads the tenant and topic back, "==<tenant>" space included. It rejects
+// anything QoS0 could not have produced. Errors wrap tether.ErrInvalidInput.
+func DecodeQoS0(subj string) (tenant, topic string, err error) {
+	name, ok := strings.CutPrefix(subj, qos0Prefix)
+	if !ok {
+		return "", "", invalid("qos 0 subject %q does not start with %q", subj, qos0Prefix)
+	}
+
+	return decode(name, true)
+}
+
 // DecodeRetainedKey is the exact inverse of [RetainedKey]. It rejects anything
 // RetainedKey could not have produced. Errors wrap tether.ErrInvalidInput.
 func DecodeRetainedKey(key string) (tenant, topic string, err error) {

@@ -61,6 +61,13 @@ func FuzzRoundTrip(f *testing.F) {
 			t.Fatalf("log (%q,%q) -> %q -> (%q,%q), %v", tenant, name, subj, gotTenant, gotTopic, err)
 		}
 
+		q0 := QoS0(tenant, name)
+
+		gotTenant, gotTopic, err = DecodeQoS0(q0)
+		if err != nil || gotTenant != tenant || gotTopic != name {
+			t.Fatalf("qos0 (%q,%q) -> %q -> (%q,%q), %v", tenant, name, q0, gotTenant, gotTopic, err)
+		}
+
 		key := RetainedKey(tenant, name)
 
 		gotTenant, gotTopic, err = DecodeRetainedKey(key)
@@ -246,6 +253,12 @@ func FuzzDecodeCanonical(f *testing.F) {
 		if tenant, name, err := DecodeRetainedKey(s); err == nil {
 			if got := RetainedKey(tenant, name); got != s {
 				t.Fatalf("key %q decoded to (%q,%q) which encodes to %q", s, tenant, name, got)
+			}
+		}
+
+		if tenant, name, err := DecodeQoS0("f." + s); err == nil {
+			if got := QoS0(tenant, name); got != "f."+s {
+				t.Fatalf("qos0 subject %q decoded to (%q,%q) which encodes to %q", "f."+s, tenant, name, got)
 			}
 		}
 

@@ -64,6 +64,13 @@ func TestEncodeTable(t *testing.T) {
 				t.Fatalf("DecodeRetainedKey(%q) = %q, %q, %v", key, tenant, got, err)
 			}
 
+			qos0 := QoS0(tenantID, tc.topic)
+
+			tenant, got, err = DecodeQoS0(qos0)
+			if err != nil || tenant != tenantID || got != tc.topic {
+				t.Fatalf("DecodeQoS0(%q) = %q, %q, %v", qos0, tenant, got, err)
+			}
+
 			// The log keeps "$" topics under the plain tenant token.
 			logSubj := Log(tenantID, tc.topic)
 			if want := "d." + tenantID + "." + tc.want; logSubj != want {
@@ -318,6 +325,19 @@ func TestDecodeRejects(t *testing.T) {
 		if tenant, got, err := DecodeLog(subj); err == nil {
 			t.Errorf("DecodeLog(%q) = %q, %q, want an error", subj, tenant, got)
 		}
+	}
+
+	// DecodeQoS0 shares the retained key's "$" space rule and wants its prefix.
+	for _, subj := range []string{"", "f.", "f.t", "d.t.a", "t.a", "f.==t.a", "f.t.=JFNZUw", "f.t.a.*", "f.t.>", "f.t.=Lw", "f.=.a"} {
+		if tenant, got, err := DecodeQoS0(subj); err == nil {
+			t.Errorf("DecodeQoS0(%q) = %q, %q, want an error", subj, tenant, got)
+		} else if !errors.Is(err, tether.ErrInvalidInput) {
+			t.Errorf("DecodeQoS0(%q) error %v does not wrap ErrInvalidInput", subj, err)
+		}
+	}
+
+	if tenant, got, err := DecodeQoS0("f.==t.=JFNZUw"); err != nil || tenant != "t" || got != "$SYS" {
+		t.Errorf("DecodeQoS0 reads the == space: %q, %q, %v", tenant, got, err)
 	}
 
 	if _, got, err := DecodeLog("d.t.=JFNZUw"); err != nil || got != "$SYS" {
