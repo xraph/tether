@@ -374,8 +374,9 @@ type RoleInfo struct {
 // Create makes a role in t's root namespace and returns it. The slug must be
 // 1 to 63 characters of a-z, 0-9, "_" and "-", starting with a letter or
 // digit; every filter must pass topic.Valid as a filter and not be a shared
-// subscription; a parent that does not exist is an error. All of those wrap [tether.ErrInvalidInput], and
-// nothing is written. A slug the tenant already uses is [tether.ErrConflict].
+// subscription; a parent that does not exist is an error. All of those wrap
+// [tether.ErrInvalidInput], and nothing is written. A slug the tenant already
+// uses is [tether.ErrConflict].
 //
 // Warden's store writes fire no plugin hooks and do not touch its decision
 // cache, so Create emits OnRoleCreated itself and clears the tenant's cached

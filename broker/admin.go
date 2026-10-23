@@ -328,11 +328,11 @@ func (b *Broker) startRetry(srv *mqtt.Server, st *clientState) {
 	go b.retryReload(srv, st, stop)
 }
 
-// retryReload retries a reload that failed on an outage: after retryBase, then doubling up to retryMax, until it succeeds or
-// retryWindow has passed since the first failure. If it is still failing
-// then, the connection is disconnected with 0x88 server unavailable, so it
-// authorizes again when it reconnects instead of keeping grants that may
-// have been revoked.
+// retryReload retries a reload that failed on an outage: after retryBase,
+// then doubling up to retryMax, until it succeeds or retryWindow has passed
+// since the first failure. If it is still failing then, the connection is
+// disconnected with 0x88 server unavailable, so it authorizes again when it
+// reconnects instead of keeping grants that may have been revoked.
 //
 // It ends early when stop is closed (a later reload succeeded, or the
 // connection's state was dropped) or the broker stops.
