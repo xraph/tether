@@ -580,3 +580,37 @@ func TestUnsubscribedKeepsHeldFilters(t *testing.T) {
 
 	require.Equal(t, []string{"a/b"}, b.cluster.routed(nsID))
 }
+
+// A reload's prune can remove a subscription between mochi storing it and
+// OnSubscribed taking its reference; the prune then finds nothing to
+// release. OnSubscribed sees the filter gone and gives the reference back,
+// so no route and no NATS interest outlive the subscription.
+func TestSubscribedAfterPruneLeavesNoRoute(t *testing.T) {
+	c := startCluster(t, 1)
+	b := c.nodes[0]
+	tid := c.t1.ID.String()
+	nsID := namespacedID(tid, "sub")
+
+	_, _, err := connect5(t, c.addr(0), "sub", "u1", true)
+	require.NoError(t, err)
+
+	cl, ok := b.server.Clients.Get(nsID)
+	require.True(t, ok)
+
+	nc := b.cluster.Conn.NC()
+	base := nc.NumSubscriptions()
+	filter := topic.Namespace(tid, "x/y")
+
+	// Mochi's Add, then the prune: gone from the session, its release found
+	// no reference. OnSubscribed runs after both.
+	cl.State.Subscriptions.Add(filter, packets.Subscription{Filter: filter})
+	b.unsubscribe(b.server, cl, func(f string) bool { return f == filter })
+	require.Empty(t, b.cluster.routed(nsID))
+
+	h := &hook{b: b, server: b.server}
+	h.OnSubscribed(cl, packets.Packet{Filters: packets.Subscriptions{{Filter: filter}}}, []byte{1})
+
+	require.Empty(t, b.cluster.routed(nsID))
+	require.Equal(t, base, nc.NumSubscriptions())
+	require.Zero(t, b.cluster.routeErrors.Load())
+}

@@ -641,7 +641,8 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 // subscribe fails is refused there: its code becomes 0x80 (unspecified
 // error, also the 3.1.1 failure code), mochi's subscription is removed, and
 // mochi skips its retained messages. The failure is logged at Warn and
-// counted (routeErrors).
+// counted (routeErrors). A filter the session no longer holds once its
+// reference is taken (a prune got there first) gives the reference back.
 func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	n := h.b.cluster
 	if n == nil || cl.Net.Inline {
@@ -653,10 +654,12 @@ func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 		return
 	}
 
-	for i, sub := range pk.Filters {
-		if i >= len(reasonCodes) || reasonCodes[i] >= packets.ErrUnspecifiedError.Code {
+	for i, code := range reasonCodes {
+		if i >= len(pk.Filters) || code >= packets.ErrUnspecifiedError.Code {
 			continue
 		}
+
+		sub := pk.Filters[i]
 
 		rel, ok := routedFilter(tenantID, sub.Filter)
 		if !ok {
@@ -665,6 +668,15 @@ func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 
 		err := n.subscribe(cl.ID, tenantID, rel)
 		if err == nil {
+			// Mochi stored the subscription before calling this, so a prune
+			// on another goroutine (a reload) can have removed it in
+			// between and found no reference to release. The reference is
+			// registered now, so a later prune finds it; this catches an
+			// earlier one. release is idempotent, so both may run.
+			if _, held := cl.State.Subscriptions.Get(sub.Filter); !held {
+				n.release(cl.ID, tenantID, []string{rel})
+			}
+
 			continue
 		}
 
