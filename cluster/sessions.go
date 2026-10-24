@@ -56,7 +56,14 @@ type SessionRecord struct {
 	QoS2In map[uint16]string `json:"qos2_in,omitempty"`
 	// QoS2Out maps the packet IDs of outbound QoS 2 deliveries to their state.
 	QoS2Out map[uint16]OutRecord `json:"qos2_out,omitempty"`
-	// QoS2Done lists the log sequences above Cursor of outbound QoS 2
+	// DoneThrough is the log sequence up to which every message of the
+	// tenant has been dealt with for the session except those in Pending:
+	// delivered and acknowledged, or not matching. Cursor is at most it.
+	DoneThrough uint64 `json:"done_through,omitempty"`
+	// Pending lists the log sequences of the outbound QoS 1 and 2
+	// deliveries in flight (bounded by the client's inflight window).
+	Pending []uint64 `json:"pending,omitempty"`
+	// QoS2Done lists the log sequences above DoneThrough of outbound QoS 2
 	// deliveries the client has completed, so a node that resumes the session
 	// does not send them again. Their packet IDs may be in use again already.
 	QoS2Done []uint64 `json:"qos2_done,omitempty"`
