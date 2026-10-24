@@ -175,6 +175,7 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 			return nil, err
 		}
 
+		n.b = b
 		b.cluster = n
 	}
 

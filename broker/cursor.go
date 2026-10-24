@@ -73,8 +73,14 @@ type tenantTrack struct {
 	// session goes live exactly between two messages.
 	mu sync.Mutex
 
-	// livePos is the sequence of the last message the reader handed over.
+	// livePos is the sequence of the last message the reader handed over,
+	// or where it started. lastMsg is the sequence of the last message it
+	// handed over, 0 before the first: a replay must have seen at least
+	// that much of what it covers (cluster.Log.Replay cuts its range at the
+	// tenant's last message as read when it starts, which can lag the
+	// reader).
 	livePos atomic.Uint64
+	lastMsg atomic.Uint64
 
 	sessions map[*session]struct{} // mu: tracked sessions
 	waiting  map[*session]struct{} // mu: sessions ahead of the reader
@@ -125,9 +131,11 @@ func (n *clusterNode) advanceLive(tenantID string, pos uint64) {
 	}
 }
 
-// cursorLocked is s's cursor given the tenant's live position lp, read
-// before s.mu was taken. s.mu is held.
-func (s *session) cursorLocked(lp uint64) uint64 {
+// baseLocked is how far s has dealt with its tenant's log apart from the
+// deliveries still in flight: the replay position, or the tenant's live
+// position lp (read before s.mu was taken) for a live session, never past a
+// pin. s.mu is held.
+func (s *session) baseLocked(lp uint64) uint64 {
 	c := s.pos
 	if s.mode == modeLive {
 		c = max(lp, s.liveFloor)
@@ -137,29 +145,137 @@ func (s *session) cursorLocked(lp uint64) uint64 {
 		c = min(c, s.pin)
 	}
 
+	return c
+}
+
+// cursorLocked is s's cursor: baseLocked held below every delivery in
+// flight. s.mu is held.
+func (s *session) cursorLocked(lp uint64) uint64 {
+	c := s.baseLocked(lp)
+
 	for _, seq := range s.out {
+		c = min(c, seq-1)
+	}
+
+	for seq := range s.queued {
 		c = min(c, seq-1)
 	}
 
 	return c
 }
 
-// freeze fixes s's cursor where it is now, for a session that is ending: it
-// no longer follows the tenant's live position. The tenant's lock is held.
+// freeze fixes s's position where it is now, for a session that is ending:
+// it no longer follows the tenant's live position. The tenant's lock is held.
 func (s *session) freeze() {
 	lp := s.tt.livePos.Load()
 
 	s.mu.Lock()
-	s.pos = s.cursorLocked(lp)
+	s.pos = s.baseLocked(lp)
 	s.mode = modeReplay
 	s.mu.Unlock()
 }
 
-// pinLocked keeps s's cursor at or below c. s.mu is held.
-func (s *session) pinLocked(c uint64) {
+// pinLocked keeps s's cursor at or below c. It reports true when the caller
+// must start a repin (Broker.repin) once s.mu is released: a live session
+// that missed a message goes back to replaying from the pin, so the pin
+// clears instead of holding the cursor for the rest of the connection.
+// s.mu is held.
+func (s *session) pinLocked(c uint64) bool {
 	if !s.pinned || c < s.pin {
 		s.pinned, s.pin = true, c
 	}
+
+	if s.mode == modeLive && !s.repinning {
+		s.repinning = true
+
+		return true
+	}
+
+	return false
+}
+
+// repin takes a live session that missed a message (it is pinned) back to
+// replaying from its pin: out of mochi's index under the tenant's lock, the
+// deliveries still in flight and those completed since the pin marked as not
+// to be sent again, then the usual replay, which waits for the client's
+// window and goes live again when it has caught up. The pin clears.
+func (b *Broker) repin(s *session) {
+	n := b.cluster
+	tt := s.tt
+
+	tt.mu.Lock()
+
+	if _, ok := tt.sessions[s]; !ok {
+		tt.mu.Unlock()
+
+		return
+	}
+
+	cl := n.client(s)
+
+	s.mu.Lock()
+	s.repinning = false
+
+	if s.mode != modeLive || !s.pinned {
+		s.mu.Unlock()
+		tt.mu.Unlock()
+
+		return
+	}
+
+	s.mode = modeReplay
+	s.pos = s.pin
+	s.replaySeen = s.pin
+	s.pinned = false
+	s.skipThrough, s.redo, s.flipFloor = 0, nil, 0
+	s.skip = make(map[uint64]struct{})
+
+	for _, seq := range s.out {
+		if seq > s.pos {
+			s.skip[seq] = struct{}{}
+		}
+	}
+
+	for seq := range s.afterPin {
+		if seq > s.pos {
+			s.skip[seq] = struct{}{}
+		}
+	}
+
+	for seq := range s.qos2Done {
+		if seq > s.pos {
+			s.skip[seq] = struct{}{}
+		}
+	}
+
+	s.afterPin = nil
+	s.mu.Unlock()
+
+	for _, sub := range cl.State.Subscriptions.GetAll() {
+		if n.mochi.Topics.Unsubscribe(sub.Filter, cl.ID) {
+			atomic.AddInt64(&n.mochi.Info.Subscriptions, -1)
+		}
+	}
+
+	tt.mu.Unlock()
+
+	n.repins.Add(1)
+	n.log.Info("tether: session missed a message, replaying it from its cursor", slog.String("client", s.nsID))
+
+	b.startReplay(s, cl)
+}
+
+// noteFull marks s as one whose inflight map is full, so the next message
+// injected pins it (pinFull): mochi drops a delivery that does not fit
+// without telling any hook.
+func (n *clusterNode) noteFull(s *session, cl *mqtt.Client) {
+	if cl.State.Inflight.Len() < n.maxInflight {
+		return
+	}
+
+	s.tt.fullMu.Lock()
+	s.tt.full[s] = struct{}{}
+	s.tt.fullMu.Unlock()
 }
 
 // tagSeq marks pk with its log sequence. mochi copies the field into every
@@ -192,6 +308,7 @@ func (b *Broker) deliverLog(tenantID string, m cluster.LogMessage) error {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 	defer tt.livePos.Store(m.Seq)
+	defer tt.lastMsg.Store(m.Seq)
 
 	n.flipWaiting(tt, m.Seq)
 
@@ -212,7 +329,9 @@ func (b *Broker) deliverLog(tenantID string, m cluster.LogMessage) error {
 
 	err := b.inject(m.Tenant, m.Topic, m.Payload, m.QoS, m.Props, origin, m.Seq)
 	if err != nil {
-		n.pinAll(tt, m.Seq)
+		// At Stop (errNotInjecting) the sessions are ending: pinned, not
+		// replayed.
+		n.pinAll(tt, m.Seq, !errors.Is(err, errNotInjecting))
 
 		if errors.Is(err, errNotInjecting) {
 			return nil
@@ -230,18 +349,40 @@ func (b *Broker) deliverLog(tenantID string, m cluster.LogMessage) error {
 // that the message seq passes. tt.mu is held.
 func (n *clusterNode) flipWaiting(tt *tenantTrack, seq uint64) {
 	for s := range tt.waiting {
+		if _, ok := tt.sessions[s]; !ok {
+			delete(tt.waiting, s)
+
+			continue
+		}
+
 		s.mu.Lock()
-		pos := s.pos
+		pos, seen := s.pos, s.replaySeen
+		missed := seq <= pos && seq > seen
+
+		if missed {
+			// A message of the tenant inside the range the replay covered
+			// that it never saw: back to replaying from what it saw.
+			s.mode, s.pos = modeReplay, seen
+		}
 		s.mu.Unlock()
 
-		if pos < seq {
+		switch {
+		case pos < seq:
 			n.flip(tt, s)
+		case missed:
+			delete(tt.waiting, s)
+
+			go n.b.startReplay(s, n.client(s))
 		}
 	}
 }
 
-// pinFull holds below seq the cursor of every session whose inflight map is
-// full, since mochi drops what does not fit. tt.mu is held.
+// pinFull holds below seq the cursor of every live session whose inflight
+// map is full, since mochi drops what does not fit, and sends it back to
+// replaying (repin). The map fills from mochi's deliveries (onQosPublish),
+// the replay (deliverDirect), a takeover's clone (established) and inbound
+// QoS 2 reservations (commitPublish); each notes it (noteFull). tt.mu is
+// held.
 func (n *clusterNode) pinFull(tt *tenantTrack, seq uint64) {
 	tt.fullMu.Lock()
 	defer tt.fullMu.Unlock()
@@ -255,20 +396,30 @@ func (n *clusterNode) pinFull(tt *tenantTrack, seq uint64) {
 		}
 
 		s.mu.Lock()
-		s.pinLocked(seq - 1)
+		repin := s.mode == modeLive && s.pinLocked(seq-1)
 		s.mu.Unlock()
+
+		if repin {
+			go n.b.repin(s)
+		}
 	}
 }
 
-// pinAll holds below seq the cursor of every live session of tt. tt.mu is
-// held.
-func (n *clusterNode) pinAll(tt *tenantTrack, seq uint64) {
+// pinAll holds below seq the cursor of every live session of tt, and sends
+// them back to replaying when replay says so. tt.mu is held.
+func (n *clusterNode) pinAll(tt *tenantTrack, seq uint64, replay bool) {
 	for s := range tt.sessions {
 		s.mu.Lock()
-		if s.mode == modeLive {
-			s.pinLocked(seq - 1)
+		repin := s.mode == modeLive && s.pinLocked(seq-1) && replay
+
+		if !replay {
+			s.repinning = false
 		}
 		s.mu.Unlock()
+
+		if repin {
+			go n.b.repin(s)
+		}
 	}
 }
 
@@ -278,15 +429,19 @@ func (n *clusterNode) flip(tt *tenantTrack, s *session) {
 	srv := n.mochi
 	cl := n.client(s)
 
+	delete(tt.waiting, s)
+
+	if _, ok := tt.sessions[s]; !ok {
+		return // the session ended meanwhile
+	}
+
 	s.mu.Lock()
 	s.mode = modeLive
 	s.liveFloor = s.pos
 	loaded := s.loaded
 	s.loaded = nil
-	s.skip = nil
+	s.skip, s.skipThrough, s.redo = nil, 0, nil
 	s.mu.Unlock()
-
-	delete(tt.waiting, s)
 
 	for f, sub := range loaded {
 		if _, ok := cl.State.Subscriptions.Get(f); !ok {
@@ -301,6 +456,7 @@ func (n *clusterNode) flip(tt *tenantTrack, s *session) {
 	}
 
 	n.replaysDone.Add(1)
+	n.noteFull(s, cl)
 }
 
 // holdOut takes subs out of mochi's topic index for a session that is not
@@ -347,8 +503,13 @@ func (b *Broker) startReplay(s *session, cl *mqtt.Client) {
 	done := make(chan struct{})
 
 	s.mu.Lock()
+	oldCancel := s.replayCancel
 	s.replayCancel, s.replayDone = cancel, done
 	s.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel() // a replay that ended waiting
+	}
 
 	go b.runReplay(ctx, s, cl, done)
 }
@@ -368,9 +529,78 @@ func (n *clusterNode) stopReplay(s *session) {
 	<-done
 }
 
+// replayBuffer bounds the replayed packets of one session waiting for its
+// writer.
+const replayBuffer = 64
+
+// replayOut is one replay's writer: the replay hands it packets (replayOne)
+// and it sends them on its own goroutine, so a client that stops reading
+// holds up its own session and not the tenant's shared replay consumer
+// (Log.Replay runs every call's fn on one goroutine). It also takes the
+// packet ID and the inflight entry of each QoS 1 or 2 packet: mochi's
+// NextPacketID needs the client's lock, which a blocked write holds.
+type replayOut struct {
+	n       *clusterNode
+	s       *session
+	cl      *mqtt.Client
+	q       chan packets.Packet
+	pending atomic.Int64 // queued or being written
+	failed  atomic.Bool  // a write failed: the connection is gone
+}
+
+func newReplayOut(n *clusterNode, s *session, cl *mqtt.Client) *replayOut {
+	return &replayOut{n: n, s: s, cl: cl, q: make(chan packets.Packet, replayBuffer)}
+}
+
+// run sends until q is closed. A write that blocks blocks only this.
+func (ro *replayOut) run() {
+	for pk := range ro.q {
+		if !ro.failed.Load() && !ro.send(pk) {
+			ro.failed.Store(true)
+		}
+
+		ro.pending.Add(-1)
+	}
+}
+
+// send registers a QoS 1 or 2 packet in the client's inflight map and the
+// session's deliveries (it was queued until now, holding the cursor) and
+// writes it. False when the connection is gone or out of packet IDs; a packet
+// not sent stays queued, so the cursor stays below it.
+func (ro *replayOut) send(pk packets.Packet) bool {
+	s, cl := ro.s, ro.cl
+
+	if pk.FixedHeader.Qos > 0 {
+		seq, _ := seqOf(pk)
+
+		id, err := cl.NextPacketID()
+		if err != nil {
+			return false
+		}
+
+		pk.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
+
+		if cl.State.Inflight.Set(pk) {
+			atomic.AddInt64(&ro.n.mochi.Info.Inflight, 1)
+		}
+
+		s.mu.Lock()
+		s.out[pk.PacketID] = seq
+		delete(s.queued, seq)
+		s.mu.Unlock()
+
+		cl.State.Inflight.DecreaseSendQuota()
+		ro.n.noteFull(s, cl)
+	}
+
+	return cl.WritePacket(pk) == nil
+}
+
 // runReplay replays the log for s from its position to the reader's, again
 // and again, until it has caught up, and then makes s live (or leaves it
-// waiting, out of the index, for the reader to pass it).
+// waiting, out of the index, for the reader to pass it). It goes live only
+// once its writer has written everything it replayed, so no live message
+// overtakes a replayed one.
 func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, done chan<- struct{}) {
 	defer close(done)
 
@@ -378,10 +608,26 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 	tt := s.tt
 	delay := replayPoll
 
+	ro := newReplayOut(n, s, cl)
+	defer close(ro.q)
+
+	go ro.run()
+
 	for ctx.Err() == nil {
+		if !b.drain(ctx, ro) {
+			return
+		}
+
 		tt.mu.Lock()
 
+		if _, ok := tt.sessions[s]; !ok {
+			tt.mu.Unlock()
+
+			return
+		}
+
 		lp := tt.livePos.Load()
+		last := tt.lastMsg.Load()
 
 		s.mu.Lock()
 		pos, floor := s.pos, s.flipFloor
@@ -408,10 +654,25 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 		target := max(lp, floor)
 
 		err := n.Log.Replay(ctx, s.tenantID, pos+1, target, func(m cluster.LogMessage) error {
-			return b.replayOne(s, cl, m)
+			return b.replayOne(s, cl, ro, m)
 		})
 
+		s.mu.Lock()
+		short := err == nil && last > pos && s.replaySeen < last
+		s.mu.Unlock()
+
 		switch {
+		case short:
+			// The replay ended before a message the reader has already
+			// handed over: its view of the log lagged. Again from where it
+			// got to.
+			n.replayRetries.Add(1)
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(replayPoll):
+			}
 		case err == nil:
 			s.mu.Lock()
 			s.pos = max(s.pos, target)
@@ -421,7 +682,9 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 		case ctx.Err() != nil || errors.Is(err, errClientGone):
 			return
 		case errors.Is(err, errBackpressure):
-			b.waitWindow(ctx, s, cl)
+			// This session has left the shared replay; it starts its own
+			// again from its position once it has room.
+			b.waitRoom(ctx, s, cl, ro)
 		default:
 			n.log.Warn("tether: session replay failed, retrying", slog.String("client", s.nsID), slog.Any("error", err))
 
@@ -436,12 +699,30 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 	}
 }
 
-// waitWindow waits until cl has room for another delivery, or ctx ends.
-func (b *Broker) waitWindow(ctx context.Context, s *session, cl *mqtt.Client) {
+// drain waits until ro has written everything queued. False when the
+// connection is gone or ctx ended.
+func (b *Broker) drain(ctx context.Context, ro *replayOut) bool {
+	tick := time.NewTicker(replayPoll / 4)
+	defer tick.Stop()
+
+	for ro.pending.Load() > 0 && !ro.failed.Load() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-tick.C:
+		}
+	}
+
+	return !ro.failed.Load() && ctx.Err() == nil
+}
+
+// waitRoom waits until cl has room for another delivery and ro for another
+// packet, or the connection or ctx ends.
+func (b *Broker) waitRoom(ctx context.Context, s *session, cl *mqtt.Client, ro *replayOut) {
 	tick := time.NewTicker(replayPoll)
 	defer tick.Stop()
 
-	for b.windowFull(s, cl) && !cl.Closed() {
+	for (b.windowFull(s, cl) || ro.pending.Load() >= replayBuffer) && !cl.Closed() && !ro.failed.Load() {
 		select {
 		case <-ctx.Done():
 			return
@@ -450,30 +731,52 @@ func (b *Broker) waitWindow(ctx context.Context, s *session, cl *mqtt.Client) {
 	}
 }
 
-// windowFull reports whether cl cannot take another QoS 1 or 2 delivery now:
-// its inflight map is full, or as many deliveries as its Receive Maximum are
-// unacknowledged.
+// windowFull reports whether cl cannot take another QoS 1 or 2 delivery now,
+// counting those queued for the replay's writer: its inflight map would be
+// full, or as many deliveries as its Receive Maximum would be unacknowledged.
 func (b *Broker) windowFull(s *session, cl *mqtt.Client) bool {
 	n := b.cluster
-	if cl.State.Inflight.Len() >= n.maxInflight {
-		return true
-	}
+	inflight := cl.State.Inflight.Len()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.recvMax > 0 && len(s.out) >= s.recvMax
+	queued := len(s.queued)
+
+	return inflight+queued >= n.maxInflight || s.recvMax > 0 && len(s.out)+queued >= s.recvMax
 }
 
-// replayOne sends m to s if it matches, and moves s's position past it.
-func (b *Broker) replayOne(s *session, cl *mqtt.Client, m cluster.LogMessage) error {
+// replayOne hands m to ro if it matches s, and moves s's position past it.
+// A full buffer returns errBackpressure at once: this session leaves the
+// shared replay rather than hold it.
+func (b *Broker) replayOne(s *session, cl *mqtt.Client, ro *replayOut, m cluster.LogMessage) error {
+	if ro.failed.Load() {
+		return errClientGone
+	}
+
 	s.mu.Lock()
+	s.replaySeen = max(s.replaySeen, m.Seq)
 	_, skip := s.skip[m.Seq]
+	if !skip && m.Seq <= s.skipThrough {
+		_, again := s.redo[m.Seq]
+		skip = !again
+	}
 	s.mu.Unlock()
 
 	if !skip {
-		if err := b.deliverDirect(s, cl, m); err != nil {
+		if ro.pending.Load() >= replayBuffer {
+			return errBackpressure
+		}
+
+		pk, send, err := b.deliverDirect(s, cl, m)
+		if err != nil {
 			return err
+		}
+
+		if send {
+			ro.pending.Add(1)
+			ro.q <- pk // room: pending < replayBuffer, one producer
+			b.cluster.replayed.Add(1)
 		}
 	}
 
@@ -484,29 +787,30 @@ func (b *Broker) replayOne(s *session, cl *mqtt.Client, m cluster.LogMessage) er
 	return nil
 }
 
-// deliverDirect sends one replayed message to cl, the way mochi's
+// deliverDirect prepares one replayed message for cl, the way mochi's
 // publishToClient would for the session's matching subscriptions: No Local,
 // the read ACL, the lower QoS, subscription identifiers, message expiry, a
-// packet ID and an inflight entry for QoS 1 and 2. It returns errBackpressure
-// when the client has no room (nothing is sent) and errClientGone when the
-// connection has ended.
-func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage) error {
+// packet ID and an inflight entry for QoS 1 and 2. send is false when nothing
+// is owed. It returns errBackpressure when the client has no room (nothing is
+// prepared) and errClientGone when the connection has ended. The caller's
+// writer sends the packet.
+func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage) (pk packets.Packet, send bool, err error) {
 	n := b.cluster
 	srv := n.mochi
 
 	st := b.state.get(cl)
 	if st == nil || cl.Closed() {
-		return errClientGone
+		return pk, false, errClientGone
 	}
 
 	if m.Tenant != s.tenantID || topic.Valid(m.Topic, false, subject.MaxTopicBytes) != nil || hasSysPrefix(m.Topic) ||
 		m.QoS < 1 || m.QoS > 2 {
-		return nil
+		return pk, false, nil
 	}
 
 	sub, ids, ok := s.match(cl, m.Topic)
 	if !ok {
-		return nil
+		return pk, false, nil
 	}
 
 	origin := ""
@@ -517,7 +821,7 @@ func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage
 	ns := topic.Namespace(s.tenantID, m.Topic)
 
 	if sub.NoLocal && origin == cl.ID || !b.canRead(s.tenantID, st.acl(), ns) {
-		return nil
+		return pk, false, nil
 	}
 
 	now := time.Now()
@@ -537,7 +841,7 @@ func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage
 	if m.Props.MessageExpiry > 0 && !m.PublishedAt.IsZero() {
 		exp := m.PublishedAt.Add(time.Duration(m.Props.MessageExpiry) * time.Second)
 		if !exp.After(now) {
-			return nil // expired: the client is owed nothing
+			return pk, false, nil // expired: the client is owed nothing
 		}
 
 		out.Expiry = exp.Unix()
@@ -547,34 +851,20 @@ func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage
 
 	if out.FixedHeader.Qos > 0 {
 		if b.windowFull(s, cl) {
-			return errBackpressure
+			return pk, false, errBackpressure
 		}
 
-		id, err := cl.NextPacketID()
-		if err != nil {
-			return errBackpressure
-		}
-
-		out.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
-
-		if cl.State.Inflight.Set(out) {
-			atomic.AddInt64(&srv.Info.Inflight, 1)
-		}
-
+		// The writer takes its packet ID; until then it holds the cursor.
 		s.mu.Lock()
-		s.out[out.PacketID] = m.Seq
+		if s.queued == nil {
+			s.queued = make(map[uint64]struct{})
+		}
+
+		s.queued[m.Seq] = struct{}{}
 		s.mu.Unlock()
-
-		cl.State.Inflight.DecreaseSendQuota()
 	}
 
-	if err := cl.WritePacket(out); err != nil {
-		return errClientGone
-	}
-
-	n.replayed.Add(1)
-
-	return nil
+	return out, true, nil
 }
 
 // match merges the subscriptions of s (those on cl and those still held out
@@ -641,10 +931,12 @@ func (n *clusterNode) onQosPublish(cl *mqtt.Client, pk packets.Packet) {
 
 	s.mu.Lock()
 
+	repin := false
+
 	if old, ok := s.out[pk.PacketID]; ok && old != seq {
 		// mochi reused a packet ID it had dropped from the map: the older
 		// delivery can no longer be told complete.
-		s.pinLocked(min(old, seq) - 1)
+		repin = s.pinLocked(min(old, seq) - 1)
 	}
 
 	s.out[pk.PacketID] = seq
@@ -661,11 +953,11 @@ func (n *clusterNode) onQosPublish(cl *mqtt.Client, pk packets.Packet) {
 
 	s.mu.Unlock()
 
-	if cl.State.Inflight.Len() >= n.maxInflight {
-		s.tt.fullMu.Lock()
-		s.tt.full[s] = struct{}{}
-		s.tt.fullMu.Unlock()
+	if repin {
+		go n.b.repin(s)
 	}
+
+	n.noteFull(s, cl)
 }
 
 // onPublishDropped is OnPublishDropped: mochi could not queue a delivery and
@@ -682,13 +974,17 @@ func (n *clusterNode) onPublishDropped(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	s.mu.Lock()
-	s.pinLocked(seq - 1)
+	repin := s.pinLocked(seq - 1)
 
 	if s.out[pk.PacketID] == seq {
 		delete(s.out, pk.PacketID)
 	}
 
 	s.mu.Unlock()
+
+	if repin {
+		go n.b.repin(s)
+	}
 }
 
 // onQosDropped is OnQosDropped for the session's current connection: mochi
@@ -729,6 +1025,20 @@ func (n *clusterNode) onAck(cl *mqtt.Client, id uint16, comp bool) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if seq, ok := s.out[id]; ok && s.pinned && seq > s.pin {
+		// Completed after a pin: the repin's replay must not send it again.
+		if s.afterPin == nil {
+			s.afterPin = make(map[uint64]struct{})
+		}
+
+		s.afterPin[seq] = struct{}{}
+	}
+
+	if seq, ok := s.out[id]; ok {
+		// Dealt with: a resumed record's pending entry is settled.
+		delete(s.redo, seq)
+	}
 
 	delete(s.out, id)
 

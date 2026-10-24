@@ -132,6 +132,7 @@ type clusterNode struct {
 	maxInflight int
 
 	watchStop            func()
+	quit                 chan struct{} // closed when the watch stops
 	flushStop, flushDone chan struct{}
 	// flushInterval is how often changed records are written; tests may
 	// shorten it before Start.
@@ -141,6 +142,21 @@ type clusterNode struct {
 	// written, sessions lost to another node, Acquire retries after a lost
 	// race, messages sent by replays, replays that went live.
 	evictions, sessionWrites, takeovers, casRetries, replayed, replaysDone atomic.Uint64
+	// repins counts live sessions sent back to replaying after a pin;
+	// ownedEvents the owned-keys watch's reports.
+	repins, ownedEvents atomic.Uint64
+	// replayRetries counts replays that ended short of the reader's last
+	// message and went again.
+	replayRetries atomic.Uint64
+
+	// b is the broker, for the work a session starts on its own (repin).
+	b *Broker
+
+	// Test seams, set before Start: afterAcquire runs in a CONNECT right
+	// after its key is acquired, before the session is registered;
+	// loadHook runs first in loadSession and fails it with its error.
+	afterAcquire func()
+	loadHook     func() error
 }
 
 // routeRef is one session's reference on a (tenant, filter) route. It is

@@ -160,7 +160,7 @@ func TestReplayHandsOverToLiveInOrder(t *testing.T) {
 			}
 
 			require.NotZero(t, c.nodes[node].cluster.replayed.Load(), "nothing was replayed")
-			require.NotZero(t, c.nodes[node].cluster.replaysDone.Load(), "no replay went live")
+			eventually(t, "the replay to go live", func() bool { return c.nodes[node].cluster.replaysDone.Load() > 0 })
 		})
 	}
 }
@@ -188,18 +188,23 @@ func (s *rawSession) count(payload string) int {
 }
 
 // rawConn is one connection of a rawSession: it answers QoS 1 and 2
-// deliveries as a conforming client does (unless noAck), and records its
-// CONNACK and any DISCONNECT.
+// deliveries as a conforming client does (or holds the answers back while
+// noAck is set, until releaseAcks), and records its CONNACK and any
+// DISCONNECT. With connackOnly it stops reading after the CONNACK, a client
+// whose socket fills up.
 type rawConn struct {
-	conn    net.Conn
-	sess    *rawSession
-	noAck   bool
-	wmu     sync.Mutex
-	connack chan *packets.Connack
-	pong    chan struct{}
-	gotDisc atomic.Int32 // 0 none, else reason+1
-	done    chan struct{}
-	pubs    atomic.Int64
+	conn        net.Conn
+	sess        *rawSession
+	noAck       atomic.Bool
+	connackOnly bool
+	heldMu      sync.Mutex
+	heldAcks    []io.WriterTo
+	wmu         sync.Mutex
+	connack     chan *packets.Connack
+	pong        chan struct{}
+	gotDisc     atomic.Int32 // 0 none, else reason+1
+	done        chan struct{}
+	pubs        atomic.Int64
 }
 
 // dialRaw connects to addr as clientID (user u1, persistent, a one-hour
@@ -210,10 +215,28 @@ func dialRaw(t *testing.T, addr, clientID string, sess *rawSession, noAck bool) 
 	conn, err := dial(t, addr)
 	require.NoError(t, err)
 
+	return startRaw(t, conn, clientID, sess, noAck, false)
+}
+
+// dialRawStalled is dialRaw for a client that reads its CONNACK and then
+// nothing more.
+func dialRawStalled(t *testing.T, addr, clientID string, sess *rawSession) *rawConn {
+	t.Helper()
+
+	conn, err := dial(t, addr)
+	require.NoError(t, err)
+
+	return startRaw(t, conn, clientID, sess, true, true)
+}
+
+func startRaw(t *testing.T, conn net.Conn, clientID string, sess *rawSession, noAck, connackOnly bool) *rawConn {
+	t.Helper()
+
 	rc := &rawConn{
-		conn: conn, sess: sess, noAck: noAck,
+		conn: conn, sess: sess, connackOnly: connackOnly,
 		connack: make(chan *packets.Connack, 1), pong: make(chan struct{}, 8), done: make(chan struct{}),
 	}
+	rc.noAck.Store(noAck)
 
 	t.Cleanup(func() {
 		_ = conn.Close()
@@ -244,6 +267,10 @@ func (rc *rawConn) read() {
 		switch p := cp.Content.(type) {
 		case *packets.Connack:
 			rc.connack <- p
+
+			if rc.connackOnly {
+				return
+			}
 		case *packets.Pingresp:
 			rc.pong <- struct{}{}
 		case *packets.Disconnect:
@@ -287,15 +314,39 @@ func (rc *rawConn) onPublish(p *packets.Publish) {
 
 	s.mu.Unlock()
 
-	if rc.noAck {
-		return
-	}
+	var ack io.WriterTo
 
 	switch p.QoS {
 	case 1:
-		rc.send(&packets.Puback{PacketID: p.PacketID, Properties: &packets.Properties{}})
+		ack = &packets.Puback{PacketID: p.PacketID, Properties: &packets.Properties{}}
 	case 2:
-		rc.send(&packets.Pubrec{PacketID: p.PacketID, Properties: &packets.Properties{}})
+		ack = &packets.Pubrec{PacketID: p.PacketID, Properties: &packets.Properties{}}
+	default:
+		return
+	}
+
+	rc.heldMu.Lock()
+	if rc.noAck.Load() {
+		rc.heldAcks = append(rc.heldAcks, ack)
+		rc.heldMu.Unlock()
+
+		return
+	}
+	rc.heldMu.Unlock()
+
+	rc.send(ack)
+}
+
+// releaseAcks sends the acks held back so far and answers from now on.
+func (rc *rawConn) releaseAcks() {
+	rc.heldMu.Lock()
+	acks := rc.heldAcks
+	rc.heldAcks = nil
+	rc.noAck.Store(false)
+	rc.heldMu.Unlock()
+
+	for _, a := range acks {
+		rc.send(a)
 	}
 }
 
@@ -379,8 +430,8 @@ func (rc *rawConn) subscribe(t *testing.T, filter string, qos byte) {
 
 // Review Focus 1: the same client ID connecting to two nodes at once, 50
 // times. Each round exactly one connection keeps the session and the other
-// is disconnected with 0x8E (or, when it lost the key's race twice, refused
-// with 0x88). QoS 2 messages published to the session all along are handed
+// is disconnected with 0x8E (ruling R27: a CONNECT is not refused because the
+// owner's own writes moved the key's revision). QoS 2 messages published to the session all along are handed
 // to the client exactly once, across every connection and takeover: the
 // client keeps its QoS 2 state across connections, as MQTT's exactly-once
 // asks of it, and the broker never sends a message it already sent under a
@@ -435,8 +486,6 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 
 	const rounds = 50
 
-	var taken, refused int
-
 	for round := range rounds {
 		var (
 			conns [2]*rawConn
@@ -478,16 +527,10 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		_, winnerDisc := conns[winner].disconnectedWith()
 		require.False(t, winnerDisc, "round %d: both connections were disconnected", round)
 
-		if acks[loser].ReasonCode != 0 {
-			require.Equal(t, byte(0x88), acks[loser].ReasonCode, "round %d", round)
+		require.Zero(t, acks[loser].ReasonCode, "round %d: the loser was refused", round)
 
-			refused++
-		} else {
-			code, _ := conns[loser].disconnectedWith()
-			require.Equal(t, byte(0x8E), code, "round %d", round)
-
-			taken++
-		}
+		code, _ := conns[loser].disconnectedWith()
+		require.Equal(t, byte(0x8E), code, "round %d", round)
 
 		rec, err := sessionKey(t, c.nodes[0], tid, "twin")
 		require.NoError(t, err)
@@ -509,7 +552,13 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 	// One more connection collects what the rounds left over.
 	last := dialRaw(t, c.addr(0), "twin", sess, false)
 	require.Equal(t, byte(0), last.ack(t).ReasonCode)
-	eventually(t, "the end marker", func() bool { return sess.count("end") > 0 })
+	// What the rounds left over is replayed first, which takes a while on a
+	// busy machine.
+	deadline := time.Now().Add(logWait)
+	for sess.count("end") == 0 {
+		require.True(t, time.Now().Before(deadline), "no end marker")
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -518,8 +567,8 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		require.Equal(t, 1, sess.delivered[p], "message %s delivered %d times", p, sess.delivered[p])
 	}
 
-	t.Logf("%d rounds: %d taken over (0x8E), %d refused (0x88); %d messages, %d QoS 2 resends recognised",
-		rounds, taken, refused, len(all), sess.dups)
+	t.Logf("%d rounds; %d messages, %d QoS 2 resends recognised, %d acquire retries on n1, %d on n2",
+		rounds, len(all), sess.dups, c.nodes[0].cluster.casRetries.Load(), c.nodes[1].cluster.casRetries.Load())
 }
 
 // Review Focus 4: a persistent subscriber that stops acknowledging while 500
@@ -809,4 +858,356 @@ func TestClientIDTooLongRefused(t *testing.T) {
 	require.Error(t, err)
 	require.NotNil(t, ca)
 	require.Equal(t, byte(0x85), ca.ReasonCode)
+}
+
+// windowCell is a cell whose clients get an inflight window of max messages.
+func windowCell(t *testing.T, nodes int, maxInflight uint16) (*testCell, string) {
+	t.Helper()
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	cfg := testConfig()
+	cfg.MaxInflight = maxInflight
+
+	c := startClusterWith(t, nodes, cfg, map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, nil)
+
+	return c, t1.ID.String()
+}
+
+// waitLive waits until the session is live again with no pin and its cursor
+// has reached at least seq.
+func waitLive(t *testing.T, b *Broker, nsID string, seq uint64) {
+	t.Helper()
+
+	eventually(t, "the session live, unpinned, past "+strconv.FormatUint(seq, 10), func() bool {
+		s := b.cluster.sessionByID(nsID)
+		if s == nil {
+			return false
+		}
+
+		lp := s.tt.livePos.Load()
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.mode == modeLive && !s.pinned && s.cursorLocked(lp) >= seq
+	})
+}
+
+// A replay that fills the client's inflight map to the brim and then goes
+// live: the next live message does not fit, mochi drops it without a hook,
+// and the session must notice (noteFull from the replay), pin, and replay it
+// once the window drains. Without that the cursor would move past it.
+func TestReplayFilledWindowThenLiveNotSkipped(t *testing.T) {
+	const window = 20
+
+	c, tid := windowCell(t, 1, window)
+	a := c.nodes[0]
+	nsID := namespacedID(tid, "brim")
+
+	sess := newRawSession()
+	rc := dialRaw(t, c.addr(0), "brim", sess, false)
+	require.Equal(t, byte(0), rc.ack(t).ReasonCode)
+	rc.subscribe(t, "brim/#", 1)
+	rc.leave(t)
+	waitOffline(t, a, tid, "brim")
+
+	pub, _, err := connect5(t, c.addr(0), "brim-pub", "u1", true)
+	require.NoError(t, err)
+
+	for i := range window {
+		require.Equal(t, byte(0), publishQ(t, pub, "brim/x", strconv.Itoa(i), 1))
+	}
+
+	// Back, acks held: the replay fills the window exactly, then goes live.
+	rc2 := dialRaw(t, c.addr(0), "brim", sess, true)
+	require.True(t, rc2.ack(t).SessionPresent)
+	eventually(t, "the replay to fill the window and go live", func() bool {
+		s := a.cluster.sessionByID(nsID)
+		if s == nil {
+			return false
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return rc2.pubs.Load() == window && s.mode == modeLive
+	})
+
+	repins := a.cluster.repins.Load()
+
+	require.Equal(t, byte(0), publishQ(t, pub, "brim/x", "over", 1))
+	eventually(t, "the session to go back to replaying", func() bool { return a.cluster.repins.Load() > repins })
+
+	rc2.releaseAcks()
+	eventually(t, "the message that did not fit", func() bool { return sess.count("over") == 1 })
+	waitLive(t, a, nsID, a.cluster.track(tid).livePos.Load())
+}
+
+// A live subscriber whose window fills drops what does not fit; the pin that
+// holds its cursor clears once the window drains: the session replays what
+// it missed from the pin, goes live again, and its cursor moves on.
+func TestPinClearsAfterWindowDrains(t *testing.T) {
+	const window = 20
+
+	c, tid := windowCell(t, 2, window)
+	a := c.nodes[0]
+	nsID := namespacedID(tid, "pin")
+
+	sess := newRawSession()
+	rc := dialRaw(t, c.addr(0), "pin", sess, true)
+	require.Equal(t, byte(0), rc.ack(t).ReasonCode)
+	rc.subscribe(t, "pin/#", 1)
+
+	pub, _, err := connect5(t, c.addr(1), "pin-pub", "u1", true)
+	require.NoError(t, err)
+
+	const total = 60
+
+	for i := range total {
+		require.Equal(t, byte(0), publishQ(t, pub, "pin/x", strconv.Itoa(i), 1))
+	}
+
+	eventually(t, "a repin", func() bool { return a.cluster.repins.Load() > 0 })
+	require.Less(t, rc.pubs.Load(), int64(total), "nothing was dropped")
+
+	rc.releaseAcks()
+
+	eventually(t, "every message", func() bool {
+		for i := range total {
+			if sess.count(strconv.Itoa(i)) == 0 {
+				return false
+			}
+		}
+
+		return true
+	})
+
+	waitLive(t, a, nsID, a.cluster.track(tid).livePos.Load())
+
+	// And the record follows.
+	eventually(t, "the record's cursor", func() bool {
+		rec, err := sessionKey(t, a, tid, "pin")
+
+		return err == nil && rec.Cursor >= a.cluster.track(tid).livePos.Load()
+	})
+
+	// Live again: a new message arrives through the index.
+	require.Equal(t, byte(0), publishQ(t, pub, "pin/x", "after", 1))
+	eventually(t, "the live message", func() bool { return sess.count("after") == 1 })
+}
+
+// A takeover by another node that lands while this node's CONNECT holds the
+// key but has not registered the session yet (it is loading it) is not lost:
+// the check waits for the CONNECT, and the connection is disconnected 0x8E.
+func TestTakeoverDuringLoadNotLost(t *testing.T) {
+	gate := make(chan struct{})
+	reached := make(chan struct{})
+
+	var armed atomic.Bool
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 2, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			if b.cluster.Config.NodeID == "n1" {
+				b.cluster.afterAcquire = func() {
+					if armed.CompareAndSwap(true, false) {
+						close(reached)
+						<-gate
+					}
+				}
+			}
+		})
+	a, b := c.nodes[0], c.nodes[1]
+	tid := t1.ID.String()
+
+	armed.Store(true)
+
+	type result struct {
+		c   *client5
+		err error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		cl, _, err := connect5(t, c.addr(0), "mid", "u1", false)
+		done <- result{cl, err}
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(logWait):
+		t.Fatal("the CONNECT never got its key")
+	}
+
+	// Another node takes the key while n1 is between acquire and register.
+	events := a.cluster.ownedEvents.Load()
+
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	_, _, _, err := b.cluster.Sessions.Acquire(ctx, tid, "mid", "n2")
+
+	cancel()
+	require.NoError(t, err)
+	eventually(t, "n1's watch to report it", func() bool { return a.cluster.ownedEvents.Load() > events })
+
+	close(gate)
+
+	r := <-done
+	require.NoError(t, r.err)
+
+	select {
+	case d := <-r.c.disconnects:
+		require.Equal(t, byte(0x8E), d.ReasonCode)
+	case <-time.After(logWait):
+		t.Fatal("the connection kept a session another node owns")
+	}
+}
+
+// A client that stops reading its socket while its session replays holds up
+// its own replay only: another session of the same tenant, replaying on the
+// same node from a later position (so it joins the same replay consumer),
+// finishes promptly.
+func TestStalledReplayDoesNotHoldOthers(t *testing.T) {
+	c := startCluster(t, 1)
+	a := c.nodes[0]
+	tid := c.t1.ID.String()
+
+	slowSess, fastSess := newRawSession(), newRawSession()
+
+	slow := dialRaw(t, c.addr(0), "stall", slowSess, false)
+	require.Equal(t, byte(0), slow.ack(t).ReasonCode)
+	slow.subscribe(t, "big/#", 1)
+	slow.leave(t)
+	waitOffline(t, a, tid, "stall")
+
+	pub, _, err := connect5(t, c.addr(0), "big-pub", "u1", true)
+	require.NoError(t, err)
+
+	big := strings.Repeat("x", 48*1024)
+
+	for i := range 400 {
+		require.Equal(t, byte(0), publishQ(t, pub, "big/x", strconv.Itoa(i)+big, 1))
+	}
+
+	fast := dialRaw(t, c.addr(0), "quick", fastSess, false)
+	require.Equal(t, byte(0), fast.ack(t).ReasonCode)
+	fast.subscribe(t, "big/#", 1)
+	fast.leave(t)
+	waitOffline(t, a, tid, "quick")
+
+	for i := range 50 {
+		require.Equal(t, byte(0), publishQ(t, pub, "big/y", strconv.Itoa(i), 1))
+	}
+
+	// The stalled client's replay starts first and fills its socket.
+	stalled := dialRawStalled(t, c.addr(0), "stall", slowSess)
+	require.True(t, stalled.ack(t).SessionPresent)
+
+	replayed := a.cluster.replayed.Load()
+	eventually(t, "the stalled replay to stop moving", func() bool {
+		now := a.cluster.replayed.Load()
+		moved := now != replayed
+		replayed = now
+
+		if moved {
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		return !moved && now > 0
+	})
+
+	fast2 := dialRaw(t, c.addr(0), "quick", fastSess, false)
+	require.True(t, fast2.ack(t).SessionPresent)
+
+	eventually(t, "the other session's replay", func() bool {
+		for i := range 50 {
+			if fastSess.count(strconv.Itoa(i)) == 0 {
+				return false
+			}
+		}
+
+		return true
+	})
+}
+
+// Ruling R28: a resume that fails after its key was acquired gives the key
+// back: offline, without the refused CONNECT's will, and with the session's
+// expiry as its TTL.
+func TestFailedResumeGivesKeyBack(t *testing.T) {
+	var fail atomic.Bool
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.cluster.loadHook = func() error {
+				if fail.Load() {
+					return errors.New("injected load failure")
+				}
+
+				return nil
+			}
+		})
+	a := c.nodes[0]
+	tid := t1.ID.String()
+
+	s, _ := connect5Expiry(t, c.addr(0), "back", "u1", 2)
+	subscribeQoS(t, s, "b/#", 1, false)
+	require.NoError(t, s.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitOffline(t, a, tid, "back")
+
+	fail.Store(true)
+
+	expiry := uint32(2)
+	_, ca, err := dial5(t, c.addr(0), &paho.Connect{
+		ClientID: "back", Username: "u1", UsernameFlag: true, Password: []byte("secret"), PasswordFlag: true,
+		KeepAlive: 30, Properties: &paho.ConnectProperties{SessionExpiryInterval: &expiry},
+		WillMessage: &paho.WillMessage{Topic: "b/will", Payload: []byte("bye")},
+	})
+	require.Error(t, err)
+	require.Equal(t, byte(0x88), ca.ReasonCode)
+
+	rec, err := sessionKey(t, a, tid, "back")
+	require.NoError(t, err)
+	require.Empty(t, rec.Owner)
+	require.Nil(t, rec.Will)
+	require.Equal(t, []cluster.SubRecord{{Filter: "b/#", QoS: 1}}, rec.Subscriptions)
+	require.Nil(t, a.cluster.sessionByID(namespacedID(tid, "back")))
+
+	eventually(t, "the key to expire", func() bool {
+		_, err := sessionKey(t, a, tid, "back")
+
+		return errors.Is(err, tether.ErrNotFound)
+	})
+}
+
+// An idle session taken by another node is noticed by the owned-keys watch
+// alone (no write of this node fails, since it makes none) and disconnected
+// with 0x8E. The watch runs for the broker's lifetime, not just its start.
+func TestIdleSessionTakenOverByWatch(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	for _, clean := range []bool{true, false} {
+		id := fmt.Sprintf("idle-%v", clean)
+
+		cl, _, err := connect5(t, c.addr(0), id, "u1", clean)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+		_, _, _, err = c.nodes[1].cluster.Sessions.Acquire(ctx, tid, id, "n2")
+
+		cancel()
+		require.NoError(t, err)
+
+		select {
+		case d := <-cl.disconnects:
+			require.Equal(t, byte(0x8E), d.ReasonCode, id)
+		case <-time.After(logWait):
+			t.Fatalf("%s: still served on n1 after n2 took it", id)
+		}
+	}
 }

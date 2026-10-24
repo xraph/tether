@@ -111,12 +111,24 @@ type session struct {
 	loaded    map[string]packets.Subscription // namespaced filter: held out of the index while replaying
 	skip      map[uint64]struct{}             // seqs the replay must not send: restored or already sent
 	out       map[uint16]uint64               // outbound QoS 1/2 deliveries in flight: packet ID to seq
+	queued    map[uint64]struct{}             // replayed QoS 1/2 waiting for the writer to take a packet ID
 	pinned    bool
 	pin       uint64 // with pinned: the cursor may not pass it
-	qos2Out   map[uint16]cluster.OutRecord
-	qos2Done  map[uint64]struct{}
-	recvMax   int
-	closedAt  time.Time
+	repinning bool   // a repin is on its way
+	// afterPin holds the deliveries completed after a pin, which the
+	// repin's replay must not send again.
+	afterPin map[uint64]struct{}
+	// skipThrough and redo come from a resumed record: up to skipThrough
+	// every message was dealt with except those in redo (its Pending).
+	skipThrough uint64
+	redo        map[uint64]struct{}
+	// replaySeen is the highest log sequence a replay of the session has
+	// been handed (sent, skipped or not matching).
+	replaySeen uint64
+	qos2Out    map[uint16]cluster.OutRecord
+	qos2Done   map[uint64]struct{}
+	recvMax    int
+	closedAt   time.Time
 
 	gen, savedGen uint64
 	savedCursor   uint64
@@ -318,9 +330,15 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		rec, prev *cluster.SessionRecord
 		rev       uint64
 		err       error
+		readEpoch uint64 // the epoch the latest attempt read
 	)
 
 	build := func(p *cluster.SessionRecord) *cluster.SessionRecord {
+		readEpoch = 0
+		if p != nil {
+			readEpoch = p.Epoch
+		}
+
 		r := &cluster.SessionRecord{
 			Clean:           cl.Properties.Clean,
 			ProtocolVersion: cl.Properties.ProtocolVersion,
@@ -329,11 +347,14 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 			ExpirySeconds:   st.sessionExpiry,
 			Will:            will,
 			Cursor:          livePos,
+			DoneThrough:     livePos,
 		}
 
 		if resume && p != nil && (p.ExpirySeconds > 0 || handover) {
 			r.Subscriptions = p.Subscriptions
 			r.Cursor = p.Cursor
+			r.DoneThrough = p.DoneThrough
+			r.Pending = p.Pending
 			r.QoS2In = p.QoS2In
 			r.QoS2Out = p.QoS2Out
 			r.QoS2Done = p.QoS2Done
@@ -346,16 +367,20 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		old.wmu.Lock()
 	}
 
-	for attempt := range 2 {
-		rec, prev, rev, err = n.Sessions.AcquireWith(ctx, st.tenantID, st.rawID, n.Config.NodeID, build)
-		if err == nil || !errors.Is(err, cluster.ErrLostCAS) {
-			break
-		}
+	// Read the log messages a resume will resend before taking the key, so a
+	// slow log delays or refuses this CONNECT and does not leave the key
+	// taken (and its previous connection displaced) for nothing.
+	var fetched map[uint64]cluster.LogMessage
 
-		if attempt == 0 {
-			n.casRetries.Add(1)
+	if resume && !handover {
+		if pre, _, gerr := n.Sessions.Get(ctx, st.tenantID, st.rawID); gerr == nil && pre.ExpirySeconds > 0 {
+			if fetched, err = b.fetchLogs(st.tenantID, resendSeqs(pre)); err != nil {
+				return nil, err
+			}
 		}
 	}
+
+	rec, prev, rev, err = b.acquireKey(ctx, st, build, &readEpoch)
 
 	if err != nil {
 		if handover {
@@ -400,11 +425,23 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	}
 	s.epoch.Store(rec.Epoch)
 
+	// The record just written is what the flusher would write: nothing to
+	// write until something changes.
+	s.savedCursor = rec.Cursor
+
+	if hook := n.afterAcquire; hook != nil {
+		hook()
+	}
+
 	resumed := resume && prev != nil && prev.ExpirySeconds > 0
 	s.tracked = persistent || resumed
 
 	if resumed {
-		if err := b.loadSession(ctx, s, cl, st, prev); err != nil {
+		if err := b.loadSession(s, cl, st, prev, fetched); err != nil {
+			// Ruling R28: the key goes back as it was, offline, so nothing
+			// is left owned by this node or carrying this CONNECT's will.
+			b.giveBack(s, rec, prev, rev)
+
 			return nil, err
 		}
 	}
@@ -420,6 +457,100 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	}
 
 	return s, nil
+}
+
+// Acquire retry pacing (ruling R27).
+const (
+	acquireRetryWindow = 2 * time.Second
+	acquireRetryBase   = 5 * time.Millisecond
+	acquireRetryMax    = 100 * time.Millisecond
+)
+
+// acquireKey takes st's session key with AcquireWith (ruling R27). A lost
+// compare-and-set is read again: when the record still has the epoch the
+// attempt read, the revision moved by the owner's own write (a flush, a QoS 2
+// step), not by another CONNECT, so it is tried again with a short backoff
+// for up to acquireRetryWindow. When the epoch moved, another CONNECT took
+// the key in between: the first time that is a simultaneous connect, which
+// this one, the later, takes over (the other gets 0x8E); a second time the
+// key keeps moving and the CONNECT is refused (0x88), as it is when the
+// window runs out. readEpoch is set by build on every attempt.
+func (b *Broker) acquireKey(ctx context.Context, st *clientState, build func(*cluster.SessionRecord) *cluster.SessionRecord,
+	readEpoch *uint64,
+) (rec, prev *cluster.SessionRecord, rev uint64, err error) {
+	n := b.cluster
+	deadline := time.Now().Add(acquireRetryWindow)
+	delay := acquireRetryBase
+	raced := false
+
+	for {
+		rec, prev, rev, err = n.Sessions.AcquireWith(ctx, st.tenantID, st.rawID, n.Config.NodeID, build)
+		if err == nil || !errors.Is(err, cluster.ErrLostCAS) {
+			return rec, prev, rev, err
+		}
+
+		n.casRetries.Add(1)
+
+		cur, _, gerr := n.Sessions.Get(ctx, st.tenantID, st.rawID)
+
+		var epoch uint64
+
+		switch {
+		case gerr == nil:
+			epoch = cur.Epoch
+		case errors.Is(gerr, tether.ErrNotFound):
+		default:
+			return nil, nil, 0, gerr
+		}
+
+		if epoch != *readEpoch {
+			if raced {
+				return nil, nil, 0, err
+			}
+
+			raced = true
+
+			continue
+		}
+
+		if time.Now().After(deadline) {
+			return nil, nil, 0, err
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, nil, 0, err
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, acquireRetryMax)
+	}
+}
+
+// giveBack returns the key of a resume that failed after it was acquired:
+// the session as it was, offline (no owner, no will) with its expiry as the
+// key's TTL (ruling R28).
+func (b *Broker) giveBack(s *session, rec, prev *cluster.SessionRecord, rev uint64) {
+	n := b.cluster
+
+	back := *rec
+	back.Owner = ""
+	back.Will = nil
+	back.ExpirySeconds = prev.ExpirySeconds
+	back.DisconnectedAt = time.Now().UTC()
+
+	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+	defer cancel()
+
+	if _, err := n.Sessions.Expire(ctx, s.tenantID, s.rawID, rev, &back, time.Duration(max(prev.ExpirySeconds, 1))*time.Second); err != nil {
+		n.log.Warn("tether: session key not given back after a failed resume", slog.String("client", s.nsID), slog.Any("error", err))
+	}
+
+	n.qos2Mu.Lock()
+	delete(n.qos2In, s.nsID)
+	n.qos2Mu.Unlock()
+
+	n.releaseAll(s.nsID, s.tenantID)
 }
 
 // handOver gives s, a session this node serves on another connection, to
@@ -481,15 +612,30 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 // topic index until the replay is done), the QoS 2 deliveries in flight as an
 // offline client's inflight messages, and the QoS 2 pending entries of the
 // client's own publishes.
-func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, st *clientState, prev *cluster.SessionRecord) error {
+func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev *cluster.SessionRecord,
+	fetched map[uint64]cluster.LogMessage,
+) error {
 	n := b.cluster
+
+	if hook := n.loadHook; hook != nil {
+		if err := hook(); err != nil {
+			return err
+		}
+	}
 
 	s.mode = modeReplay
 	s.pos = prev.Cursor
+	s.replaySeen = prev.Cursor
 	s.liveFloor = prev.Cursor
-	s.flipFloor = prev.Cursor
+	s.skipThrough = max(prev.DoneThrough, prev.Cursor)
+	s.flipFloor = s.skipThrough
 	s.loaded = make(map[string]packets.Subscription, len(prev.Subscriptions))
 	s.skip = make(map[uint64]struct{})
+	s.redo = make(map[uint64]struct{}, len(prev.Pending))
+
+	for _, seq := range prev.Pending {
+		s.redo[seq] = struct{}{}
+	}
 
 	for _, sr := range prev.Subscriptions {
 		ns := topic.Namespace(s.tenantID, sr.Filter)
@@ -520,6 +666,29 @@ func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, s
 
 	slices.SortFunc(ids, func(a, c uint16) int { return cmp.Compare(prev.QoS2Out[a].Seq, prev.QoS2Out[c].Seq) })
 
+	// The messages of deliveries to send again: read before the acquire,
+	// and in one pass over the log for any the record gained since.
+	var missing []uint64
+
+	for _, seq := range resendSeqs(prev) {
+		if _, ok := fetched[seq]; !ok {
+			missing = append(missing, seq)
+		}
+	}
+
+	msgs, err := b.fetchLogs(s.tenantID, missing)
+	if err != nil {
+		return err
+	}
+
+	for seq, m := range fetched {
+		if msgs == nil {
+			msgs = make(map[uint64]cluster.LogMessage, len(fetched))
+		}
+
+		msgs[seq] = m
+	}
+
 	now := time.Now().Unix()
 
 	for i, id := range ids {
@@ -534,11 +703,7 @@ func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, s
 		case outPubrel:
 			pk = packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id}
 		default:
-			m, ok, err := b.fetchLog(ctx, s.tenantID, or.Seq)
-			if err != nil {
-				return err
-			}
-
+			m, ok := msgs[or.Seq]
 			if !ok {
 				// Gone from the log: nothing left to send.
 				continue
@@ -567,6 +732,12 @@ func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, s
 
 		inflight = append(inflight, pk)
 		s.restored++
+	}
+
+	// What is restored or already completed is accounted for by the
+	// deliveries and qos2Done; redo keeps only what must be sent again.
+	for seq := range s.skip {
+		delete(s.redo, seq)
 	}
 
 	b.materialize(n.mochi, cl, s.nsID, prev, inflight)
@@ -600,24 +771,76 @@ func (b *Broker) loadSession(ctx context.Context, s *session, cl *mqtt.Client, s
 	return nil
 }
 
-// fetchLog reads the log message seq of tenantID, false when the log no
-// longer has it.
-func (b *Broker) fetchLog(ctx context.Context, tenantID string, seq uint64) (cluster.LogMessage, bool, error) {
-	var (
-		got   cluster.LogMessage
-		found bool
-	)
+// fetchAttempts bounds the reads of fetchLogs.
+const fetchAttempts = 3
 
-	err := b.cluster.Log.Replay(ctx, tenantID, seq, seq, func(m cluster.LogMessage) error {
-		got, found = m, true
+// resendSeqs lists the log sequences of a record's QoS 2 deliveries that are
+// resent as PUBLISH on resume (state outPublish, above the cursor).
+func resendSeqs(rec *cluster.SessionRecord) []uint64 {
+	var out []uint64
 
-		return nil
-	})
-	if err != nil {
-		return cluster.LogMessage{}, false, fmt.Errorf("tether/broker: read log message %d: %w", seq, err)
+	for _, or := range rec.QoS2Out {
+		if or.Seq > rec.Cursor && or.State != outPubrel {
+			out = append(out, or.Seq)
+		}
 	}
 
-	return got, found, nil
+	return out
+}
+
+// fetchLogs reads the log messages seqs of tenantID in one replay, with its
+// own deadline; one the log no longer has is missing from the result.
+func (b *Broker) fetchLogs(tenantID string, seqs []uint64) (map[uint64]cluster.LogMessage, error) {
+	if len(seqs) == 0 {
+		return nil, nil //nolint:nilnil // nothing asked, nothing read
+	}
+
+	want := make(map[uint64]struct{}, len(seqs))
+	for _, seq := range seqs {
+		want[seq] = struct{}{}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancel()
+
+	got := make(map[uint64]cluster.LogMessage, len(seqs))
+
+	// These messages were delivered, so the log has them unless they aged
+	// out; a read that misses one may have lagged and is tried again.
+	for attempt := range fetchAttempts {
+		var missing []uint64
+
+		for seq := range want {
+			if _, ok := got[seq]; !ok {
+				missing = append(missing, seq)
+			}
+		}
+
+		if len(missing) == 0 {
+			break
+		}
+
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, fmt.Errorf("tether/broker: read the log messages of the deliveries in flight: %w", ctx.Err())
+			case <-time.After(replayPoll * 5):
+			}
+		}
+
+		err := b.cluster.Log.Replay(ctx, tenantID, slices.Min(missing), slices.Max(missing), func(m cluster.LogMessage) error {
+			if _, ok := want[m.Seq]; ok {
+				got[m.Seq] = m
+			}
+
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("tether/broker: read the log messages of the deliveries in flight: %w", err)
+		}
+	}
+
+	return got, nil
 }
 
 // materialize builds the offline mochi client of a session resumed from the
@@ -699,6 +922,11 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 	}
 
 	s.markConnacked()
+
+	if s.tracked {
+		// What mochi cloned or resent may have filled the inflight map.
+		n.noteFull(s, cl)
+	}
 
 	if b.state.owner(cl.ID) != st {
 		n.log.Info("tether: connection lost its client ID to a concurrent connect", slog.String("client", cl.ID))
@@ -788,6 +1016,8 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 	delete(s.tt.waiting, s)
 	s.tt.mu.Unlock()
 
+	// A repin may have started a replay after the stop above; out of the
+	// tenant's sessions it ends at once.
 	b.retire(s)
 
 	n.sessMu.Lock()
@@ -915,8 +1145,40 @@ func (n *clusterNode) snapshot(s *session, cl *mqtt.Client, final bool) (rec *cl
 	rec.Epoch = s.epoch.Load()
 	rec.Subscriptions = subs
 
+	done := s.baseLocked(lp)
+
 	if s.tracked {
 		rec.Cursor = s.cursorLocked(lp)
+
+		// A resume still replaying keeps what its record said was dealt
+		// with beyond its position, and what was pending there.
+		if s.mode != modeLive && !s.pinned && s.skipThrough > done {
+			done = s.skipThrough
+		}
+
+		rec.DoneThrough = done
+		rec.Pending = nil
+
+		seen := make(map[uint64]struct{}, len(s.out)+len(s.queued))
+		for _, seq := range s.out {
+			seen[seq] = struct{}{}
+		}
+
+		for seq := range s.queued {
+			seen[seq] = struct{}{}
+		}
+
+		for seq := range s.redo {
+			if _, completed := s.qos2Done[seq]; !completed && seq > s.pos && seq <= done {
+				seen[seq] = struct{}{}
+			}
+		}
+
+		for seq := range seen {
+			rec.Pending = append(rec.Pending, seq)
+		}
+
+		slices.Sort(rec.Pending)
 	}
 
 	if len(s.qos2Out) > 0 {
@@ -931,7 +1193,7 @@ func (n *clusterNode) snapshot(s *session, cl *mqtt.Client, final bool) (rec *cl
 	rec.QoS2Done = nil
 
 	for seq := range s.qos2Done {
-		if seq <= rec.Cursor {
+		if seq <= done {
 			delete(s.qos2Done, seq)
 
 			continue
@@ -1107,51 +1369,76 @@ func (n *clusterNode) onOwnedLost(tenantID, clientID string, _ *cluster.SessionR
 		return
 	}
 
-	nsID := namespacedID(tenantID, clientID)
-	if n.sessionByID(nsID) == nil {
-		return
-	}
+	n.ownedEvents.Add(1)
 
-	go n.verifyOwner(nsID, tenantID, clientID)
+	// No check of the node's sessions here: a CONNECT of this node may hold
+	// the key without being registered yet (loadSession), and the watch has
+	// already forgotten the key. verifyOwner waits for it under the lock.
+	go n.verifyOwner(namespacedID(tenantID, clientID), tenantID, clientID)
 }
+
+// verifyOwnerRetry paces the reads of a takeover check that NATS did not
+// answer, up to verifyOwnerRetryMax between them.
+const (
+	verifyOwnerRetry    = 100 * time.Millisecond
+	verifyOwnerRetryMax = 5 * time.Second
+)
 
 // verifyOwner reads the key of a session the watch says this node lost and
 // marks it lost unless the record still names this node at the epoch the
-// session holds.
+// session holds. It runs under the session's lock, so a CONNECT of this node
+// in progress finishes first. A read that fails is tried again with backoff
+// until there is an answer, the session is gone, or the broker stops.
 func (n *clusterNode) verifyOwner(nsID, tenantID, clientID string) {
-	unlock := n.locks.lock(nsID)
+	quit := n.quit
+	delay := verifyOwnerRetry
 
-	s := n.sessionByID(nsID)
-	if s == nil {
+	for {
+		unlock := n.locks.lock(nsID)
+
+		s := n.sessionByID(nsID)
+		if s == nil {
+			unlock()
+
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
+		rec, _, err := n.Sessions.Get(ctx, tenantID, clientID)
+
+		cancel()
+
+		var deleted bool
+
+		switch {
+		case err == nil && rec.Owner == n.Config.NodeID && rec.Epoch == s.epoch.Load():
+			unlock()
+
+			return
+		case err == nil:
+		case errors.Is(err, tether.ErrNotFound):
+			deleted = true
+		default:
+			unlock()
+			n.log.Warn("tether: could not check a session the watch reported lost, retrying", slog.String("client", nsID),
+				slog.Duration("in", delay), slog.Any("error", err))
+
+			select {
+			case <-quit:
+				return
+			case <-time.After(delay):
+			}
+
+			delay = min(2*delay, verifyOwnerRetryMax)
+
+			continue
+		}
+
 		unlock()
+		n.lose(s, deleted)
 
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
-	rec, _, err := n.Sessions.Get(ctx, tenantID, clientID)
-
-	cancel()
-
-	var deleted bool
-
-	switch {
-	case err == nil && rec.Owner == n.Config.NodeID && rec.Epoch == s.epoch.Load():
-		unlock()
-
-		return
-	case err == nil:
-	case errors.Is(err, tether.ErrNotFound):
-		deleted = true
-	default:
-		unlock()
-		n.log.Warn("tether: could not check a session the watch reported lost", slog.String("client", nsID), slog.Any("error", err))
-
-		return
-	}
-
-	unlock()
-	n.lose(s, deleted)
 }
 
 // startSessions starts the owned-keys watch and the flusher. Called once,
@@ -1159,15 +1446,29 @@ func (n *clusterNode) verifyOwner(nsID, tenantID, clientID string) {
 func (b *Broker) startSessions() error {
 	n := b.cluster
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
-	defer cancel()
+	// The watch lives until Stop, so its context is not the start's: only
+	// its first pass is bounded, by connectTimeout.
+	ctx, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(connectTimeout, cancel)
+
+	n.quit = make(chan struct{})
 
 	stop, err := n.Sessions.WatchOwned(ctx, n.Config.NodeID, n.onOwnedLost)
+	if !timer.Stop() && err == nil {
+		stop()
+		err = context.DeadlineExceeded
+	}
+
 	if err != nil {
+		cancel()
+
 		return fmt.Errorf("tether/broker: watch owned sessions: %w", err)
 	}
 
-	n.watchStop = stop
+	n.watchStop = func() {
+		stop()
+		cancel()
+	}
 	n.flushStop, n.flushDone = make(chan struct{}), make(chan struct{})
 
 	go b.runFlusher(n.flushStop, n.flushDone)
@@ -1189,6 +1490,7 @@ func (b *Broker) stopSessions() {
 	if n.watchStop != nil {
 		n.watchStop()
 		n.watchStop = nil
+		close(n.quit)
 	}
 }
 
@@ -1372,6 +1674,11 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 			b.evictLocal(srv, local)
 		}
 	}
+
+	// A session of this node that just ended may still be writing its last
+	// record; its end holds the session's lock until that is in.
+	unlock := n.locks.lock(nsID)
+	defer unlock()
 
 	rec, rev, err := n.Sessions.Get(ctx, tenantID, clientID)
 	if errors.Is(err, tether.ErrNotFound) {

@@ -412,7 +412,8 @@ func TestAcksInArrivalOrder(t *testing.T) {
 // topics on two nodes only ever receive their own QoS 1 messages. A log
 // entry's tenant comes from its subject, and a reader only reads its own
 // tenant's subjects, so even a message appended for t2 straight into the log
-// reaches t2 alone; one under $SYS is dropped.
+// reaches t2 alone; one under $SYS is dropped. (Subscriber and publisher have
+// different client IDs: one ID on two nodes is one session, taken over.)
 func TestLogDeliveryTenantIsolation(t *testing.T) {
 	c := startCluster(t, 2)
 	b := c.nodes[1]
@@ -421,11 +422,11 @@ func TestLogDeliveryTenantIsolation(t *testing.T) {
 	pubs := map[string]*client5{}
 
 	for _, user := range []string{"u1", "u2"} {
-		s, _, err := connect5(t, c.addr(1), "dev", user, true)
+		s, _, err := connect5(t, c.addr(1), "dev-sub", user, true)
 		require.NoError(t, err)
 		subscribeQoS(t, s, "#", 1, false)
 
-		p, _, err := connect5(t, c.addr(0), "dev", user, true)
+		p, _, err := connect5(t, c.addr(0), "dev-pub", user, true)
 		require.NoError(t, err)
 
 		subs[user], pubs[user] = s, p

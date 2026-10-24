@@ -53,7 +53,9 @@ func TestQoS0AcrossNodes(t *testing.T) {
 }
 
 // Review Focus 3 for QoS 0: two tenants with the same raw client IDs and the
-// same topics on two nodes never see each other's messages.
+// same topics on two nodes never see each other's messages. (Within a tenant
+// the subscriber and the publisher have different IDs: one ID on two nodes
+// is one session, which the second CONNECT takes over.)
 func TestQoS0TenantIsolationAcrossNodes(t *testing.T) {
 	c := startCluster(t, 2)
 
@@ -61,11 +63,11 @@ func TestQoS0TenantIsolationAcrossNodes(t *testing.T) {
 	pubs := map[string]*client5{}
 
 	for _, user := range []string{"u1", "u2"} {
-		s, _, err := connect5(t, c.addr(1), "dev", user, true)
+		s, _, err := connect5(t, c.addr(1), "dev-sub", user, true)
 		require.NoError(t, err)
 		require.Equal(t, []byte{1, 1}, subscribe5(t, s, "#", "x/y"))
 
-		p, _, err := connect5(t, c.addr(0), "dev", user, true)
+		p, _, err := connect5(t, c.addr(0), "dev-pub", user, true)
 		require.NoError(t, err)
 
 		awaitInterest(t, p, s)
@@ -400,7 +402,8 @@ func TestRoutesReleased(t *testing.T) {
 		// Offline, the session is evicted to the cell and its route goes.
 		require.NoError(t, p.Disconnect(&paho.Disconnect{ReasonCode: 0}))
 		waitRouted("p")
-		require.Equal(t, base, nc.NumSubscriptions())
+		// The Router call runs right after the reference goes.
+		eventually(t, "the route's NATS subscription to go", func() bool { return nc.NumSubscriptions() == base })
 
 		require.NoError(t, b.DeleteSession(tid, "p"))
 		require.Empty(t, routed("p"))

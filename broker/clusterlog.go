@@ -793,8 +793,16 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 		it.retained = &ret
 	}
 
-	if qos == 2 && !st.pipe.reserve(it) {
-		return
+	if qos == 2 {
+		if !st.pipe.reserve(it) {
+			return
+		}
+
+		// The reservation shares the inflight map with the session's
+		// deliveries: a full map must pin the session (cursor.go).
+		if s := n.sessionOf(cl); s != nil && s.tracked {
+			n.noteFull(s, cl)
+		}
 	}
 
 	st.pipe.push(it)
