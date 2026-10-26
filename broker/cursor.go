@@ -566,8 +566,8 @@ func (n *clusterNode) holdOut(s *session, cl *mqtt.Client, subs []packets.Subscr
 }
 
 // startReplay starts s's replay for cl, after its CONNACK, stopping any
-// replay still running for the session first. It starts nothing when cl no
-// longer serves the session (a handover got there first: the new
+// replay still running for the session first. It does nothing at all when cl
+// no longer serves the session (a handover got there first: the new
 // connection starts its own at its CONNACK).
 func (b *Broker) startReplay(s *session, cl *mqtt.Client) {
 	n := b.cluster
@@ -575,11 +575,15 @@ func (b *Broker) startReplay(s *session, cl *mqtt.Client) {
 	s.replayMu.Lock()
 	defer s.replayMu.Unlock()
 
-	n.stopReplayLocked(s)
-
+	// A stale caller (a repin or a waiting flip that read the client before
+	// a handover) neither stops the current connection's replay nor touches
+	// the index under the ID it shares with it. handOver stopped the old
+	// connection's replay itself.
 	if n.client(s) != cl {
 		return
 	}
+
+	n.stopReplayLocked(s)
 
 	// What mochi's takeover put into the index (a replay handed over on
 	// this node) comes out again.
@@ -665,6 +669,9 @@ func (n *clusterNode) stopReplayLocked(s *session) {
 // replayBuffer bounds the replayed packets of one session waiting for its
 // writer.
 const replayBuffer = 64
+
+// replayCallWait bounds one Log.Replay call of a session's replay.
+const replayCallWait = 10 * time.Second
 
 // replayOut is one replay's writer: the replay hands it packets (replayOne)
 // and it sends them on its own goroutine, so a client that stops reading
@@ -810,9 +817,16 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 
 		target := max(lp, floor)
 
-		err := n.Log.Replay(ctx, s.tenantID, pos+1, target, func(m cluster.LogMessage) error {
+		// Each call is bounded: a replay consumer that stops delivering (seen
+		// under heavy load) must not leave the session out of the index for
+		// good. The waiter leaves, the consumer closes once no call uses it,
+		// and the next call starts a new one from where this got to.
+		callCtx, cancelCall := context.WithTimeout(ctx, replayCallWait)
+		err := n.Log.Replay(callCtx, s.tenantID, pos+1, target, func(m cluster.LogMessage) error {
 			return b.replayOne(s, cl, ro, m)
 		})
+
+		cancelCall()
 
 		s.mu.Lock()
 		short := err == nil && last > pos && s.replaySeen < last

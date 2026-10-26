@@ -601,6 +601,18 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 		s.tt.mu.Unlock()
 	}
 
+	// The live position before mochi clones the old connection's inflight
+	// map into this one: if the clone fills the map, the cursor is held
+	// there (established). Ruling R29: it is read before the client is
+	// switched. Until then pinFull checks the old connection, which mochi
+	// keeps delivering to until Clients.Add, so a message that its full map
+	// drops is pinned there; after the switch pinFull checks the new, empty
+	// connection, and a message dropped on the old one is above this
+	// position, so established's pin still holds it.
+	s.mu.Lock()
+	s.handoverPos = s.tt.livePos.Load()
+	s.mu.Unlock()
+
 	n.sessMu.Lock()
 	s.prevCl = prevCl
 	s.cl, s.st = cl, st
@@ -608,13 +620,6 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 	s.ackOnce = sync.Once{}
 	s.closedAt = time.Time{}
 	n.sessMu.Unlock()
-
-	// The live position before mochi clones the old connection's inflight
-	// map into this one: if the clone fills the map, the cursor is held
-	// there (established).
-	s.mu.Lock()
-	s.handoverPos = s.tt.livePos.Load()
-	s.mu.Unlock()
 
 	// A replay running for the old connection stops, its writer abandoned
 	// and what it had queued given back; OnSessionEstablished starts the

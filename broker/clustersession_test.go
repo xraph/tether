@@ -1368,3 +1368,72 @@ func TestReservationFillsWindowBeforeInject(t *testing.T) {
 
 	eventually(t, "the message that did not fit", func() bool { return sess.count("late") == 1 })
 }
+
+// A replay start for a connection that no longer serves the session (a repin
+// or a waiting flip that read the client before a same-node handover) does
+// nothing: it neither stops the current connection's replay nor touches the
+// index. Here the stale call is made directly, after the new connection's
+// replay has started, while that replay waits for its window.
+func TestStaleStartReplayLeavesCurrentReplay(t *testing.T) {
+	const window = 10
+
+	c, tid := windowCell(t, 1, window)
+	a := c.nodes[0]
+	nsID := namespacedID(tid, "stale")
+
+	sess := newRawSession()
+	first := dialRaw(t, c.addr(0), "stale", sess, false)
+	require.Equal(t, byte(0), first.ack(t).ReasonCode)
+	first.subscribe(t, "st/#", 1)
+	first.leave(t)
+	waitOffline(t, a, tid, "stale")
+
+	pub, _, err := connect5(t, c.addr(0), "stale-pub", "u1", true)
+	require.NoError(t, err)
+
+	const total = 30
+
+	for i := range total {
+		require.Equal(t, byte(0), publishQ(t, pub, "st/x", strconv.Itoa(i), 1))
+	}
+
+	// The old connection's replay fills its window and waits.
+	old := dialRaw(t, c.addr(0), "stale", newRawSession(), true)
+	require.True(t, old.ack(t).SessionPresent)
+	eventually(t, "the old window full", func() bool { return old.pubs.Load() == window })
+
+	oldCl, ok := a.server.Clients.Get(nsID)
+	require.True(t, ok)
+
+	// Handed over on the same node; the new connection's replay waits for
+	// its window too (acks held).
+	got := newRawSession()
+	again := dialRaw(t, c.addr(0), "stale", got, true)
+	require.True(t, again.ack(t).SessionPresent)
+	eventually(t, "the new connection's replay", func() bool {
+		s := a.cluster.sessionByID(nsID)
+		if s == nil {
+			return false
+		}
+
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		return s.replayCancel != nil && again.pubs.Load() >= window
+	})
+
+	s := a.cluster.sessionByID(nsID)
+	a.startReplay(s, oldCl) // stale
+
+	again.releaseAcks()
+
+	eventually(t, "every message on the new connection", func() bool {
+		for i := range total {
+			if got.count(strconv.Itoa(i)) == 0 {
+				return false
+			}
+		}
+
+		return true
+	})
+}
