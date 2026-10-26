@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/cluster
 
-Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. The QoS 0 router (route.go, dedup.go) sits on `*Conn` too, and so do the membership service (members.go), and the retained store (retained.go). Later tasks add the control bus.
+Runs Tether broker nodes as one cell over NATS and JetStream. This package holds the configuration, the NATS connection (embedded or external), the stream and bucket provisioning, the session store and the sentinel errors. The QoS 1/2 log (log.go, reader.go, replay.go) sits on `*Conn` too. The QoS 0 router (route.go, dedup.go) sits on `*Conn` too, and so do the membership service (members.go), the retained store (retained.go) and the control bus (control.go).
 
 ## Config
 
@@ -120,6 +120,20 @@ Every method checks first: a topic over 1024 bytes (`subject.CheckTopic`), a top
 - Test hooks: `Retained.onWatch` gets every KV watcher a Watch opens, `Retained.beforeRestart` runs in the gap before a restart.
 
 retained_test.go (package cluster, `startCellConns` gives n connections on a three-server cell, `startRetained` one Retained each) covers the round trip with Props (ordered duplicate user properties, a payload format of 0, correlation data, CR/LF/NUL payload), replacement and an empty put, Delete seen by Watch with its revision, a 2 s expiry seen by Watch about 2 s later and gone from Load, tenant isolation (same topic in two tenants, a tenant whose token prefixes another's, `$SYS` in another tenant), `$SYS` under `==tenant` and absent from a `#` key listing, a watch restarted after its subscription was stopped (delete, update and new key in the gap, no event for the unchanged key), the resync of unseen keys, stop and ctx end, and invalid input.
+
+## Control bus
+
+`NewControl(c *Conn, cfg Config) *Control` over stream `Config.ControlStream()` (`TETHER_CTL_<CELL>`, subjects `ctl.>`, MaxAge 1 h; Provision first). An event is JSON on `ctl.<kind>`. Each node reads with one ordered consumer (filter `ctl.>`) that starts at the stream's last sequence + 1 when Start runs (an explicit sequence, not "new", for the same reason as the log Reader). Every node, the publisher included, applies each event published while its Control runs exactly once and in stream order: the ordered consumer recreates itself after a gap from the last sequence it delivered, and a sequence at or below the last one handled is dropped. Events published while a node was down are not replayed to it. The connection's NoEcho does not matter: deliveries come from the server.
+
+- Kinds (constants) and their exported payload structs, snake_case JSON: `KindKeyInvalidated` "key.invalidated" `KeyInvalidated{KeyID, Disconnect, RotatedAt, GraceEnds}` (`key_id`, `disconnect`, `rotated_at`, `grace_ends`; times `omitzero`; RotatedAt is there for the reactor's KeyRotated, which needs it for ExpirePrincipal), `KindRoleChanged` "role.changed" `RoleChanged{RoleID}`, `KindSubjectChanged` "subject.changed" `SubjectChanged{Kind, ID}`, `KindTenantUpdated` "tenant.updated" `TenantUpdated{TenantID}`, `KindSessionKick` "session.kick" `SessionKick{Tenant, ClientID}`, `KindSessionDelete` "session.delete" `SessionDelete{Tenant, ClientID}`.
+- A kind is dot-separated tokens of `[-_A-Za-z0-9]`, at most 128 bytes, so `ctl.<kind>` is a literal subject. Anything else wraps `tether.ErrInvalidInput`.
+- `Subscribe(kind, fn func([]byte)) error`: registers a handler; several per kind run in registration order. No NATS call; before or after Start, but an event that arrives before its kind has a handler is dropped, so register before Start. Kinds nobody subscribed to are ignored (Debug log); matching is exact (`session.kick.extra` is not `session.kick`). fn gets the event's JSON, shared by the kind's handlers (do not modify). Handlers run on the bus's one goroutine, one at a time: they must not block (hand work to your own goroutine) and must not call Stop. nil fn: ErrInvalidInput; after Stop: wraps ErrUnavailable.
+- `Publish(ctx, kind, v any) error`: `json.Marshal(v)`, publish, wait for the JetStream ack. Needs no Start. 10 s without a deadline; timeouts wrap ErrUnavailable (the event may still have been stored).
+- `Start(ctx) error`: creates the consumer (it exists on the server when Start returns) and starts the read goroutine. ctx bounds the start only (10 s default). A second Start is an error unless the first failed; after Stop it wraps ErrUnavailable.
+- `Stop()`: idempotent, also before Start. It sets a stop flag, then waits for a running handler, and no handler runs after it returns; the iterator stop and the consumer delete run in the background, so it is prompt while NATS is unreachable (the ordered consumer's recreate loop can take 20 s or more). `Control.heartbeat` is the pull heartbeat (tests shorten it).
+- Locking: `Control.mu` guards the handler map and the lifecycle flags and is never held across a NATS call; a handler snapshot is copied under it per event.
+
+control_test.go (package cluster) covers `TestControlEventOnce` (three nodes on three servers, each publishing 12 events of all six kinds concurrently: every node, publisher included, applies all 36 exactly once with their fields intact, and none published before Start), unknown and near-miss kinds ignored with two handlers in order, invalid kinds and the lifecycle (double Start, Stop twice, Subscribe and Start after Stop, Publish after Stop), Stop within 1 s on a one-server cell whose server is down, and Stop waiting for a running handler with nothing delivered after it.
 
 ## clustertest
 
