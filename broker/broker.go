@@ -177,6 +177,8 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 
 		n.b = b
 		b.cluster = n
+
+		b.watchMembers()
 	}
 
 	return b, nil
@@ -252,6 +254,12 @@ func (b *Broker) Start(ctx context.Context) error {
 
 	if b.cluster != nil {
 		b.startReaderSweep()
+
+		if b.cluster.Members != nil {
+			// Keys this node owns from before a restart under the same ID:
+			// its peers never saw it die, so it settles them itself.
+			b.cluster.goLive(func() { b.reclaim(b.cluster.Config.NodeID) })
+		}
 	}
 
 	interval := b.sysInterval
@@ -388,8 +396,11 @@ func (b *Broker) Stop(ctx context.Context) error {
 		err := shutdown(srv, ids)
 
 		// The sessions that ended in the shutdown have written their last
-		// records; the watch and the flusher go now.
+		// records; the delayed wills, the reclaims, the watch and the
+		// flusher go now. A delayed will left pending keeps this node as
+		// its key's owner, for the cell to publish once this node is dead.
 		if b.cluster != nil {
+			b.stopLive()
 			b.stopSessions()
 			b.cluster.close()
 		}

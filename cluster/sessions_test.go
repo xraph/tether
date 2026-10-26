@@ -764,6 +764,67 @@ func TestListAndGet(t *testing.T) {
 	}
 }
 
+// OwnedBy reads every tenant and keeps only the records of one owner, with
+// the tenant, client ID and revision a CAS needs.
+func TestOwnedBy(t *testing.T) {
+	cell := startCell(t, 2)
+	a, b := cell[0], cell[1]
+	ctx := tctx(t, 30*time.Second)
+
+	revs := map[string]uint64{}
+
+	for _, tc := range []struct{ tenant, client, node string }{
+		{"ttnt_one", "a", "n1"}, {"ttnt_one", "weird client/id", "n1"}, {"ttnt_two", "a", "n1"},
+		{"ttnt_one", "b", "n2"}, {"ttnt_two", "gone", "n1"},
+	} {
+		_, rev, _, err := a.Acquire(ctx, tc.tenant, tc.client, tc.node)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		revs[tc.tenant+"/"+tc.client] = rev
+	}
+
+	if err := a.Delete(ctx, "ttnt_two", "gone", revs["ttnt_two/gone"]); err != nil {
+		t.Fatal(err)
+	}
+
+	owned, err := b.OwnedBy(ctx, "n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]uint64{}
+	for _, e := range owned {
+		if e.Record.Owner != "n1" {
+			t.Fatalf("entry %+v", e)
+		}
+
+		got[e.Tenant+"/"+e.ClientID] = e.Revision
+	}
+
+	want := map[string]uint64{
+		"ttnt_one/a": revs["ttnt_one/a"], "ttnt_one/weird client/id": revs["ttnt_one/weird client/id"], "ttnt_two/a": revs["ttnt_two/a"],
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("OwnedBy(n1) = %v, want %v", got, want)
+	}
+
+	if owned, err = b.OwnedBy(ctx, "n9"); err != nil || len(owned) != 0 {
+		t.Fatalf("OwnedBy of a node with nothing = %v, %v", owned, err)
+	}
+
+	if _, err = b.OwnedBy(ctx, ""); !errors.Is(err, tether.ErrInvalidInput) {
+		t.Fatalf("OwnedBy(\"\") = %v, want ErrInvalidInput", err)
+	}
+
+	// Entries carries the tenant too.
+	entries, err := b.Entries(ctx, "ttnt_one")
+	if err != nil || len(entries) != 3 || entries[0].Tenant != "ttnt_one" {
+		t.Fatalf("Entries = %+v, %v", entries, err)
+	}
+}
+
 func TestInvalidInput(t *testing.T) {
 	cell := startCell(t, 1)
 	s := cell[0]

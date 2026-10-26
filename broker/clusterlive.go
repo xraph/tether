@@ -1,0 +1,835 @@
+package broker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/packets"
+
+	"github.com/xraph/tether"
+	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/subject"
+	"github.com/xraph/tether/topic"
+)
+
+// Liveness in cluster mode (spec "Ownership, takeover and liveness" and
+// "Partitions"; rulings R18, R30, R31).
+//
+// Members tells the broker three things. OnFence: no heartbeat of this node
+// has been acknowledged for half the lease, so the node can no longer count on
+// holding its sessions. It drops every client with 0x88 and refuses new
+// CONNECTs until OnUnfence, and writes nothing for the sessions that end
+// meanwhile: their keys stay as they were, owned by this node and carrying
+// their wills, for whoever reclaims them. OnPeerDead: a peer has been silent
+// for the lease plus 2 s. The node that leads for it (IsLeaderFor) reclaims
+// every key the dead node owns. OnUnfence: the node reclaims the keys it still
+// owns but no longer serves, those it dropped while fenced.
+//
+// Reclaiming a key is one compare-and-set from the record the scan read, and
+// only the node whose write wins publishes the record's will (R18), so two
+// nodes that both think they lead, or a ghost node ID declared dead at
+// startup, publish nothing twice. A record with no will left to wait for is
+// written back offline (Owner "", no will, the rest of its expiry as TTL; a
+// clean session's key is deleted). A will whose MQTT 5 delay has not run out,
+// counted from DisconnectedAt or from now for a session that was connected, is
+// taken over instead: the reclaiming node writes itself as the owner, keeps
+// the will and publishes it when the delay ends, unless the session came back
+// first. So a record's Owner always names the node that answers for its will.
+//
+// Wills of local connections (R30): a will mochi fires for a client of this
+// node goes to the cell as the tenant's message. QoS 0 goes through the
+// Router and mochi delivers it here as usual; QoS 1 and 2 are appended to the
+// log and mochi's local delivery is withheld, so every node, this one
+// included, delivers it once from its reader. A will with a delay is never
+// left to mochi, whose delayed wills skip every hook: the session's last
+// record keeps the will with this node as its owner, and this node publishes
+// it when the delay ends, unless the record moved (a reconnect anywhere).
+// The delay is the lower of the will delay and the session's expiry, as MQTT
+// 5 says: a session that ends at once publishes its will at once.
+
+const (
+	// fenceDropSlots bounds the disconnects a fence runs at once.
+	fenceDropSlots = 64
+	// reclaimSlots bounds the keys one reclaim writes at once.
+	reclaimSlots = 16
+	// willPublishWait bounds one will's publish, the log commit included.
+	willPublishWait = 5 * time.Second
+	// willRetry and willRetryMax pace the retries of a will's append and of
+	// a delayed will's check.
+	willRetry    = 200 * time.Millisecond
+	willRetryMax = 5 * time.Second
+)
+
+// errFenced is what a session write returns while the node is fenced.
+var errFenced = fmt.Errorf("tether/broker: session write: %w", cluster.ErrFenced)
+
+// pendingWill is a delayed will this node answers for: the will of the
+// session (tenantID, clientID) at epoch, due when its timer fires.
+type pendingWill struct {
+	tenantID, clientID string
+	epoch              uint64
+	timer              *time.Timer
+}
+
+// liveness is the broker's side of Members, on clusterNode.
+type liveness struct {
+	// fenced is set by OnFence and cleared by OnUnfence.
+	fenced atomic.Bool
+
+	// ctx lives until Stop; the goroutines liveness starts run on it and
+	// Stop waits for them (wg).
+	ctx    context.Context //nolint:containedctx // the lifetime of the liveness goroutines
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// willsMu guards wills, the delayed wills this node answers for by
+	// namespaced client ID, and stopped, set by Stop: nothing starts after.
+	willsMu sync.Mutex
+	wills   map[string]*pendingWill
+	stopped bool
+
+	// Counters for tests: wills published to the cell, delayed wills
+	// cancelled, keys reclaimed (written back or taken over), clients
+	// dropped by a fence.
+	willsSent, willsCancelled, reclaimed, fenceDrops atomic.Uint64
+}
+
+func newLiveness() liveness {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return liveness{ctx: ctx, cancel: cancel, wills: make(map[string]*pendingWill)}
+}
+
+// watchMembers registers the broker's callbacks on the cell's Members, when
+// there is one. Called once, from New: Members wants them before its Start.
+func (b *Broker) watchMembers() {
+	m := b.cluster.Members
+	if m == nil {
+		return
+	}
+
+	m.OnFence(b.onFence)
+	m.OnUnfence(b.onUnfence)
+	m.OnPeerDead(b.onPeerDead)
+}
+
+// server returns the mochi server injections go to, nil before Start and
+// once Stop began.
+func (n *clusterNode) server() *mqtt.Server {
+	n.gate.RLock()
+	defer n.gate.RUnlock()
+
+	return n.srv
+}
+
+// goLive runs fn on a goroutine Stop waits for, unless Stop has begun.
+func (n *clusterNode) goLive(fn func()) {
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	if !n.stopped {
+		n.wg.Go(fn)
+	}
+}
+
+// stopLive cancels the pending delayed wills and the reclaims, and waits for
+// the goroutines liveness started. The keys of the cancelled wills keep this
+// node as their owner, so the cell publishes them once this node is declared
+// dead. Called from Stop, after the clients are gone.
+func (b *Broker) stopLive() {
+	n := b.cluster
+
+	n.willsMu.Lock()
+	n.stopped = true
+
+	for id, pw := range n.wills {
+		pw.timer.Stop()
+		delete(n.wills, id)
+	}
+
+	n.willsMu.Unlock()
+
+	n.cancel()
+	n.wg.Wait()
+}
+
+// onFence is Members.OnFence: drop every client and refuse new ones. It runs
+// on the Members dispatcher, so the disconnects run on their own goroutine.
+func (b *Broker) onFence() {
+	n := b.cluster
+	if !n.fenced.CompareAndSwap(false, true) {
+		return
+	}
+
+	srv := n.server()
+	if srv == nil {
+		return
+	}
+
+	n.log.Warn("tether: fenced from the cell, dropping every client and refusing new ones")
+	n.goLive(func() { n.dropClients(srv) })
+}
+
+// onUnfence is Members.OnUnfence: accept CONNECTs again and reclaim the keys
+// this node still owns but dropped while it was fenced.
+func (b *Broker) onUnfence() {
+	n := b.cluster
+	n.fenced.Store(false)
+
+	if n.server() == nil {
+		return
+	}
+
+	n.log.Info("tether: unfenced, accepting connections again")
+	n.goLive(func() { b.reclaim(n.Config.NodeID) })
+}
+
+// onPeerDead is Members.OnPeerDead: the node that leads for the dead peer
+// reclaims its keys.
+func (b *Broker) onPeerDead(node string) {
+	n := b.cluster
+	if n.server() == nil || !n.Members.IsLeaderFor(node) {
+		return
+	}
+
+	n.log.Warn("tether: reclaiming the sessions of a dead node", slog.String("dead", node))
+	n.goLive(func() { b.reclaim(node) })
+}
+
+// dropClients disconnects every network client of srv with 0x88, in
+// parallel up to fenceDropSlots; a 3.1.1 client, which has no DISCONNECT to
+// receive, is closed. No registry lock is held here: each connection's end
+// runs the hooks on its own goroutine.
+func (n *clusterNode) dropClients(srv *mqtt.Server) {
+	slots := make(chan struct{}, fenceDropSlots)
+
+	var wg sync.WaitGroup
+
+	for _, cl := range srv.Clients.GetAll() {
+		if cl.Net.Inline || cl.Closed() {
+			continue
+		}
+
+		slots <- struct{}{}
+
+		wg.Go(func() {
+			defer func() { <-slots }()
+
+			n.dropClient(srv, cl)
+		})
+	}
+
+	wg.Wait()
+}
+
+// dropClient ends one connection of a fenced node: 0x88 for 5.0, closed for
+// 3.1.1.
+func (n *clusterNode) dropClient(srv *mqtt.Server, cl *mqtt.Client) {
+	n.fenceDrops.Add(1)
+
+	if cl.Properties.ProtocolVersion < 5 {
+		cl.Stop(packets.ErrServerUnavailable)
+
+		return
+	}
+
+	disconnect(srv, n.log, cl, packets.ErrServerUnavailable)
+}
+
+// ClusterHealth reports whether this node can act for its cell: nil when it
+// can, or when the broker runs without a cluster. It returns an error
+// wrapping cluster.ErrFenced while the node is fenced, and one wrapping
+// cluster.ErrUnavailable when its NATS connection is down or JetStream does
+// not answer within ctx.
+func (b *Broker) ClusterHealth(ctx context.Context) error {
+	n := b.cluster
+	if n == nil {
+		return nil
+	}
+
+	if n.fenced.Load() || n.Members != nil && n.Members.Fenced() {
+		return fmt.Errorf("tether/broker: cluster health: %w", cluster.ErrFenced)
+	}
+
+	if err := n.Conn.Healthy(ctx); err != nil {
+		return fmt.Errorf("tether/broker: cluster health: %w", err)
+	}
+
+	return nil
+}
+
+// clusterWill is OnWill in cluster mode for a network client whose will
+// passed the grants (rel is its tenant-relative topic): it sends the will to
+// the cell, or leaves it to the session's last record, and returns what mochi
+// publishes locally (ruling R30).
+func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will mqtt.Will) mqtt.Will {
+	n := b.cluster
+	withheld := mqtt.Will{Flag: will.Flag, TopicName: withheldTopic}
+
+	s := st.sess
+
+	n.sessMu.Lock()
+	mine := s != nil && s.cl == cl && !s.lost && !s.ended
+	deleting := s != nil && s.deleting
+	n.sessMu.Unlock()
+
+	if n.fenced.Load() {
+		// The key keeps the will (finish writes nothing): the node that
+		// reclaims it publishes it.
+		if mine {
+			s.owe()
+		}
+
+		return withheld
+	}
+
+	var delay uint32
+	if cl.Properties.ProtocolVersion == 5 {
+		delay = min(will.WillDelayInterval, sessionExpiry(cl, st.expiryCap))
+	}
+
+	if delay > 0 && s != nil {
+		s.mu.Lock()
+		tracked := s.tracked
+		s.mu.Unlock()
+
+		if deleting || !tracked {
+			// The session ends now, and its will goes with it.
+			delay = 0
+		}
+	}
+
+	if delay > 0 {
+		if !mine {
+			// A new connection holds the session: a delayed will is
+			// cancelled by it.
+			n.willsCancelled.Add(1)
+
+			return withheld
+		}
+
+		// finish writes the record with the will and this node as its
+		// owner, then waits out the delay (scheduleWill).
+		s.mu.Lock()
+		s.willDelay = time.Duration(delay) * time.Second
+		s.willAt = time.Now()
+		s.mu.Unlock()
+
+		return withheld
+	}
+
+	w := &cluster.WillRecord{Topic: rel, Payload: will.Payload, QoS: will.Qos, Retain: will.Retain}
+	if len(will.User) > 0 {
+		w.Props.User = make([]cluster.UserProperty, len(will.User))
+		for i, u := range will.User {
+			w.Props.User[i] = cluster.UserProperty{Key: u.Key, Value: u.Val}
+		}
+	}
+
+	if err := b.publishWill(context.Background(), st.tenantID, st.rawID, w, false); err != nil {
+		n.log.Warn("tether: will not published to the cell", slog.String("client", cl.ID), slog.Any("error", err))
+
+		if will.Qos > 0 && mine {
+			// The record keeps it, and finish has it settled like a
+			// reclaimed key. (A QoS 0 will mochi delivers here anyway.)
+			s.owe()
+		}
+	}
+
+	if will.Qos == 0 {
+		// mochi delivers it on this node, and keeps it if it is retained.
+		return will
+	}
+
+	// The log delivers it here too.
+	return withheld
+}
+
+// publishWill publishes w as tenantID's message from client rawID: QoS 0
+// through the Router, QoS 1 and 2 through the log, retrying the append under
+// one message ID for up to willPublishWait within ctx. local makes this node
+// deliver a QoS 0 will itself (the Router never delivers to its own node) and
+// keep a retained will here, which is what mochi does for a will it fires. A
+// QoS 1 or 2 will is always retained here, since mochi's own publish of it is
+// withheld. Retained wills stay on the node that publishes them until
+// retained messages live in the cell (Task 11).
+func (b *Broker) publishWill(ctx context.Context, tenantID, rawID string, w *cluster.WillRecord, local bool) error {
+	n := b.cluster
+	nsID := namespacedID(tenantID, rawID)
+	srv := n.server()
+
+	if w.QoS == 0 {
+		err := n.Router.Publish(tenantID, w.Topic, w.Payload, w.Props)
+		if err != nil {
+			n.routeErrors.Add(1)
+		} else {
+			n.published.Add(1)
+		}
+
+		if local {
+			if ierr := b.inject(tenantID, w.Topic, w.Payload, 0, w.Props, nsID, 0); ierr != nil && !errors.Is(ierr, errNotInjecting) {
+				err = errors.Join(err, ierr)
+			}
+
+			b.retainWill(srv, tenantID, w)
+		}
+
+		if err == nil {
+			n.willsSent.Add(1)
+		}
+
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, willPublishWait)
+	defer cancel()
+
+	msg := cluster.LogMessage{
+		Tenant: tenantID, Topic: w.Topic, Payload: w.Payload, QoS: w.QoS, Retain: w.Retain, Props: w.Props,
+		Origin: n.Config.NodeID, ClientID: rawID,
+	}
+	msgID := newMsgID()
+	delay := willRetry
+
+	for {
+		_, _, err := n.Log.Append(ctx, msg, msgID)
+		if err == nil {
+			break
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("tether/broker: append will: %w", err)
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, willRetryMax)
+	}
+
+	n.appends.Add(1)
+
+	// mochi's local publish of it is withheld, so this node keeps it.
+	b.retainWill(srv, tenantID, w)
+	n.willsSent.Add(1)
+
+	return nil
+}
+
+// retainWill keeps a retained will as this node's retained message, as
+// mochi does for a will it publishes (retainLocal).
+func (b *Broker) retainWill(srv *mqtt.Server, tenantID string, w *cluster.WillRecord) {
+	if !w.Retain || srv == nil {
+		return
+	}
+
+	retainLocal(srv, &packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: w.QoS, Retain: true},
+		TopicName:   topic.Namespace(tenantID, w.Topic),
+		Payload:     w.Payload,
+		Properties:  packetProps(w.Props),
+		Created:     time.Now().Unix(),
+	})
+}
+
+// validWill reports whether a will read from a record is one this node may
+// publish for tenantID: the record comes off NATS, so it is checked like a
+// routed message.
+func validWill(tenantID string, w *cluster.WillRecord) bool {
+	return validTenant(tenantID) && w.QoS <= 2 && topic.Valid(w.Topic, false, subject.MaxTopicBytes) == nil && !hasSysPrefix(w.Topic)
+}
+
+// willWait is how long after now a record's will is due: its delay, capped
+// at the session's expiry, counted from discAt.
+func willWait(w *cluster.WillRecord, expirySeconds uint32, discAt, now time.Time) time.Duration {
+	delay := time.Duration(min(w.DelaySeconds, expirySeconds)) * time.Second
+
+	return discAt.Add(delay).Sub(now)
+}
+
+// expiryLeft is how much of a record's session expiry is left at now,
+// counted from discAt, rounded up to the whole second a key TTL needs; zero
+// when none is left.
+func expiryLeft(rec *cluster.SessionRecord, discAt, now time.Time) time.Duration {
+	left := discAt.Add(time.Duration(rec.ExpirySeconds) * time.Second).Sub(now)
+	if left <= 0 {
+		return 0
+	}
+
+	return left.Truncate(time.Second) + time.Second
+}
+
+// reclaim takes over the keys node owns: written back offline with their
+// wills published, or held by this node while a delayed will waits. For
+// node == this node it reclaims only keys no session of this node serves.
+// A pass that met errors runs again (each key is a CAS, so a second pass
+// does nothing twice), with backoff, until one succeeds or the broker stops;
+// while the node is fenced it waits.
+func (b *Broker) reclaim(node string) {
+	n := b.cluster
+	delay := willRetry
+
+	for {
+		if !n.fenced.Load() && b.reclaimPass(node) {
+			return
+		}
+
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, willRetryMax)
+	}
+}
+
+// reclaimID is reclaim for one key of this node: the session that just
+// ended here owing its will (finish). It runs once the session's lock is
+// free, and retries like reclaim.
+func (b *Broker) reclaimID(tenantID, clientID string) {
+	n := b.cluster
+	delay := willRetry
+	self := n.Config.NodeID
+
+	for {
+		if !n.fenced.Load() {
+			err := b.reclaimKey(self, cluster.SessionEntry{Tenant: tenantID, ClientID: clientID})
+			if err == nil {
+				return
+			}
+
+			if n.ctx.Err() == nil {
+				n.log.Warn("tether: settling a session that owes its will failed, retrying",
+					slog.String("client", namespacedID(tenantID, clientID)), slog.Any("error", err))
+			}
+		}
+
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, willRetryMax)
+	}
+}
+
+// reclaimPass is one pass of reclaim. It reports whether every key was
+// dealt with.
+func (b *Broker) reclaimPass(node string) bool {
+	n := b.cluster
+
+	ctx, cancel := context.WithTimeout(n.ctx, connectTimeout)
+	entries, err := n.Sessions.OwnedBy(ctx, node)
+
+	cancel()
+
+	if err != nil {
+		if n.ctx.Err() == nil {
+			n.log.Warn("tether: listing the sessions of a node failed", slog.String("node", node), slog.Any("error", err))
+		}
+
+		return n.ctx.Err() != nil
+	}
+
+	slots := make(chan struct{}, reclaimSlots)
+
+	var (
+		wg     sync.WaitGroup
+		failed atomic.Bool
+	)
+
+	for _, e := range entries {
+		slots <- struct{}{}
+
+		wg.Go(func() {
+			defer func() { <-slots }()
+
+			if err := b.reclaimKey(node, e); err != nil {
+				failed.Store(true)
+
+				if n.ctx.Err() == nil {
+					n.log.Warn("tether: reclaiming a session failed", slog.String("node", node),
+						slog.String("client", namespacedID(e.Tenant, e.ClientID)), slog.Any("error", err))
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+
+	return !failed.Load() || n.ctx.Err() != nil
+}
+
+// reclaimKey reclaims one key of node. A lost CAS means the key moved (a
+// reconnect, or another node reclaimed it first): nothing to do. For this
+// node's own keys the record is read again under the session's lock, and
+// e's record and revision are not used.
+func (b *Broker) reclaimKey(node string, e cluster.SessionEntry) error {
+	n := b.cluster
+	self := node == n.Config.NodeID
+	rec, rev := e.Record, e.Revision
+	nsID := namespacedID(e.Tenant, e.ClientID)
+
+	ctx, cancel := context.WithTimeout(n.ctx, sessionWriteWait)
+	defer cancel()
+
+	if self {
+		// A CONNECT of this node holds the session's lock from its acquire
+		// until the session is registered, so under it a key this node
+		// serves is told from one it dropped.
+		unlock := n.locks.lock(nsID)
+		defer unlock()
+
+		var err error
+
+		rec, rev, err = n.Sessions.Get(ctx, e.Tenant, e.ClientID)
+		if errors.Is(err, tether.ErrNotFound) {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if rec.Owner != node || n.serves(nsID, rec.Epoch) {
+			return nil
+		}
+	}
+
+	now := time.Now().UTC()
+
+	discAt := rec.DisconnectedAt
+	if discAt.IsZero() {
+		discAt = now
+	}
+
+	will := rec.Will
+	if will != nil && !validWill(e.Tenant, will) {
+		n.log.Warn("tether: dropping a will that is not a tenant topic", slog.String("client", nsID), slog.String("topic", will.Topic))
+
+		will = nil
+	}
+
+	if will != nil {
+		if wait := willWait(will, rec.ExpirySeconds, discAt, now); wait > 0 {
+			// Not due yet: this node answers for it now.
+			next := *rec
+			next.Owner = n.Config.NodeID
+			next.DisconnectedAt = discAt
+
+			_, err := n.Sessions.Expire(ctx, e.Tenant, e.ClientID, rev, &next, expiryLeft(rec, discAt, now))
+			if errors.Is(err, cluster.ErrLostCAS) {
+				return nil
+			}
+
+			if err != nil {
+				return err
+			}
+
+			n.reclaimed.Add(1)
+			b.scheduleWill(e.Tenant, e.ClientID, rec.Epoch, wait)
+
+			return nil
+		}
+	}
+
+	won, err := n.settle(ctx, e.Tenant, e.ClientID, rec, rev, discAt)
+	if err != nil || !won {
+		return err
+	}
+
+	n.reclaimed.Add(1)
+
+	if will != nil {
+		if err := b.publishWill(n.ctx, e.Tenant, e.ClientID, will, true); err != nil {
+			n.log.Warn("tether: will of a reclaimed session not published", slog.String("client", nsID), slog.Any("error", err))
+		}
+	}
+
+	return nil
+}
+
+// serves reports whether a session of this node serves nsID at epoch, or
+// waits out its delayed will.
+func (n *clusterNode) serves(nsID string, epoch uint64) bool {
+	if s := n.sessionByID(nsID); s != nil && s.epoch.Load() == epoch {
+		n.sessMu.Lock()
+		ended := s.ended
+		n.sessMu.Unlock()
+
+		if !ended {
+			return true
+		}
+	}
+
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	pw := n.wills[nsID]
+
+	return pw != nil && pw.epoch == epoch
+}
+
+// settle writes rec back as an offline session with no will, as a CAS on
+// rev: Owner "", disconnected at discAt, with the rest of its expiry as the
+// key's TTL, or deleted when none is left (a clean session). It reports
+// whether the write won.
+func (n *clusterNode) settle(ctx context.Context, tenantID, clientID string, rec *cluster.SessionRecord, rev uint64, discAt time.Time) (bool, error) {
+	var err error
+
+	if left := expiryLeft(rec, discAt, time.Now()); left <= 0 {
+		err = n.Sessions.Delete(ctx, tenantID, clientID, rev)
+	} else {
+		next := *rec
+		next.Owner = ""
+		next.Will = nil
+		next.DisconnectedAt = discAt
+		_, err = n.Sessions.Expire(ctx, tenantID, clientID, rev, &next, left)
+	}
+
+	if errors.Is(err, cluster.ErrLostCAS) {
+		return false, nil
+	}
+
+	return err == nil, err
+}
+
+// scheduleWill makes this node publish the will of (tenantID, clientID) at
+// epoch after wait, unless its key moves first.
+func (b *Broker) scheduleWill(tenantID, clientID string, epoch uint64, wait time.Duration) {
+	n := b.cluster
+	nsID := namespacedID(tenantID, clientID)
+
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	if n.stopped {
+		return
+	}
+
+	if old := n.wills[nsID]; old != nil {
+		old.timer.Stop()
+	}
+
+	pw := &pendingWill{tenantID: tenantID, clientID: clientID, epoch: epoch}
+	pw.timer = time.AfterFunc(max(wait, 0), func() {
+		n.goLive(func() { b.fireWill(pw) })
+	})
+	n.wills[nsID] = pw
+}
+
+// fireWill publishes a delayed will that is due, if its key still names this
+// node as the owner at the epoch the will was left at and still carries the
+// will: a CONNECT anywhere moves both, which cancels the will. The key is
+// written back offline first, and only a won write publishes. A read or
+// write that fails is tried again until it is answered or the broker stops.
+func (b *Broker) fireWill(pw *pendingWill) {
+	n := b.cluster
+	nsID := namespacedID(pw.tenantID, pw.clientID)
+
+	defer func() {
+		n.willsMu.Lock()
+		if n.wills[nsID] == pw {
+			delete(n.wills, nsID)
+		}
+		n.willsMu.Unlock()
+	}()
+
+	delay := willRetry
+
+	for {
+		published, retry := b.tryFire(pw)
+		if !retry {
+			if !published {
+				n.willsCancelled.Add(1)
+			}
+
+			return
+		}
+
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, willRetryMax)
+	}
+}
+
+// tryFire is one attempt of fireWill. retry says it met an error.
+func (b *Broker) tryFire(pw *pendingWill) (published, retry bool) {
+	n := b.cluster
+
+	if n.fenced.Load() {
+		return false, true
+	}
+
+	ctx, cancel := context.WithTimeout(n.ctx, sessionWriteWait)
+	defer cancel()
+
+	rec, rev, err := n.Sessions.Get(ctx, pw.tenantID, pw.clientID)
+
+	switch {
+	case errors.Is(err, tether.ErrNotFound):
+		return false, false
+	case err != nil:
+		return false, n.ctx.Err() == nil
+	case rec.Owner != n.Config.NodeID || rec.Epoch != pw.epoch || rec.Will == nil:
+		return false, false
+	}
+
+	discAt := rec.DisconnectedAt
+	if discAt.IsZero() {
+		discAt = time.Now().UTC()
+	}
+
+	won, err := n.settle(ctx, pw.tenantID, pw.clientID, rec, rev, discAt)
+	if err != nil {
+		return false, n.ctx.Err() == nil
+	}
+
+	if !won {
+		// The key moved between the read and the write: read it again.
+		return false, true
+	}
+
+	if !validWill(pw.tenantID, rec.Will) {
+		return false, false
+	}
+
+	if err := b.publishWill(n.ctx, pw.tenantID, pw.clientID, rec.Will, true); err != nil {
+		n.log.Warn("tether: delayed will not published", slog.String("client", namespacedID(pw.tenantID, pw.clientID)), slog.Any("error", err))
+	}
+
+	return true, false
+}
+
+// owe marks s as ending with its will unpublished: its key keeps the will
+// for a reclaim (finish).
+func (s *session) owe() {
+	s.mu.Lock()
+	s.willOwed = true
+	s.mu.Unlock()
+}
+
+// pendingWills returns the namespaced client IDs of the delayed wills this
+// node answers for, for tests.
+func (n *clusterNode) pendingWills() []string {
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	out := make([]string, 0, len(n.wills))
+	for id := range n.wills {
+		out = append(out, id)
+	}
+
+	return out
+}

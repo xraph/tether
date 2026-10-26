@@ -49,7 +49,11 @@ type Cluster struct {
 	// delivers to (*Broker).DeliverRouted, and you close it.
 	Router *cluster.Router
 
-	// Members tracks the cell's live nodes. Not used yet.
+	// Members tracks the cell's live nodes. When it is set, New registers
+	// the broker's fence, unfence and dead-peer callbacks on it
+	// (clusterlive.go); starting and stopping it is the caller's job, Start
+	// after the broker's and Stop after it. Nil: the node neither fences
+	// itself nor takes over for dead nodes.
 	Members *cluster.Members
 }
 
@@ -152,6 +156,10 @@ type clusterNode struct {
 	// b is the broker, for the work a session starts on its own (repin).
 	b *Broker
 
+	// liveness is the fence, the dead-node reclaims and the delayed wills
+	// (clusterlive.go).
+	liveness
+
 	// Test seams, set before Start: afterAcquire runs in a CONNECT right
 	// after its key is acquired, before the session is registered;
 	// loadHook runs first in loadSession and fails it with its error.
@@ -200,6 +208,7 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 		appendAttempt:  defaultAppendAttempt,
 		appendRetry:    defaultAppendRetry,
 		appendRetryMax: defaultAppendRetryMax,
+		liveness:       newLiveness(),
 	}
 
 	if n.Log == nil {

@@ -620,9 +620,10 @@ func (s *Sessions) Get(ctx context.Context, tenant, clientID string) (*SessionRe
 	return cur.rec, cur.rev, nil
 }
 
-// SessionEntry is one session Entries found: the client ID its key names, its
-// record and the key's revision.
+// SessionEntry is one session Entries or OwnedBy found: the tenant and client
+// ID its key names, its record and the key's revision.
 type SessionEntry struct {
+	Tenant   string
 	ClientID string
 	Record   *SessionRecord
 	Revision uint64
@@ -654,14 +655,33 @@ func (s *Sessions) Entries(ctx context.Context, tenant string) ([]SessionEntry, 
 
 	prefix, _, _ := strings.Cut(probe, ".")
 
+	return s.scan(ctx, prefix+".>", "list sessions", nil)
+}
+
+// OwnedBy returns every live session of the cell, in any tenant, whose record
+// names nodeID as its owner, in no particular order. It reads the whole bucket
+// through a watcher, so it costs a pass over every key of the cell. The
+// revisions are those the pass read: a write that uses one loses its CAS if
+// the key moved since.
+func (s *Sessions) OwnedBy(ctx context.Context, nodeID string) ([]SessionEntry, error) {
+	if nodeID == "" {
+		return nil, fmt.Errorf("cluster: owned sessions: empty node ID: %w", tether.ErrInvalidInput)
+	}
+
+	return s.scan(ctx, ">", "list owned sessions", func(rec *SessionRecord) bool { return rec.Owner == nodeID })
+}
+
+// scan reads the keys under filter through a watcher and returns those whose
+// record keep accepts (all of them when keep is nil).
+func (s *Sessions) scan(ctx context.Context, filter, op string, keep func(*SessionRecord) bool) ([]SessionEntry, error) {
 	h, err := s.handles(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	w, err := h.kv.Watch(ctx, prefix+".>", jetstream.IgnoreDeletes())
+	w, err := h.kv.Watch(ctx, filter, jetstream.IgnoreDeletes())
 	if err != nil {
-		return nil, s.wrapErr("list sessions", err)
+		return nil, s.wrapErr(op, err)
 	}
 	defer s.stopWatcher(w)
 
@@ -670,17 +690,17 @@ func (s *Sessions) Entries(ctx context.Context, tenant string) ([]SessionEntry, 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, s.wrapErr("list sessions", ctx.Err())
+			return nil, s.wrapErr(op, ctx.Err())
 		case e, ok := <-w.Updates():
 			if !ok {
-				return nil, fmt.Errorf("cluster: list sessions: watcher closed: %w", ErrUnavailable)
+				return nil, fmt.Errorf("cluster: %s: watcher closed: %w", op, ErrUnavailable)
 			}
 
 			if e == nil {
 				return out, nil
 			}
 
-			_, clientID, kerr := splitSessionKey(e.Key())
+			tenant, clientID, kerr := splitSessionKey(e.Key())
 			if kerr != nil {
 				s.c.logger.Warn("skipping undecodable session key", "key", e.Key(), "error", kerr)
 
@@ -694,7 +714,11 @@ func (s *Sessions) Entries(ctx context.Context, tenant string) ([]SessionEntry, 
 				continue
 			}
 
-			out = append(out, SessionEntry{ClientID: clientID, Record: rec, Revision: e.Revision()})
+			if keep != nil && !keep(rec) {
+				continue
+			}
+
+			out = append(out, SessionEntry{Tenant: tenant, ClientID: clientID, Record: rec, Revision: e.Revision()})
 		}
 	}
 }

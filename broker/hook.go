@@ -15,6 +15,7 @@ import (
 
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/subject"
 	"github.com/xraph/tether/tenant"
 	"github.com/xraph/tether/topic"
@@ -96,6 +97,11 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		// Ruling R13: the cell keys sessions by client ID, which it caps.
 		if err := checkClientID(cl.ID); err != nil {
 			return h.refuse(cl, log, packets.ErrClientIdentifierNotValid, "client ID the cell cannot carry", err)
+		}
+
+		// A fenced node serves nobody until it can reach the cell again.
+		if h.b.cluster.fenced.Load() {
+			return h.refuse(cl, log, packets.ErrServerUnavailable, "node is fenced from the cell", cluster.ErrFenced)
 		}
 	}
 
@@ -1149,10 +1155,18 @@ func (b *Broker) canRead(tenantID string, set *acl.Set, name string) bool {
 // will on withheldTopic with nothing in it, which no tenant's filter
 // matches and no ACL check lets through: mochi ignores an error from this
 // hook and cannot be told to drop the will.
+//
+// In cluster mode a will that passes goes to the cell (Broker.clusterWill,
+// ruling R30), and mochi gets back either the will, for its local delivery
+// of a QoS 0 one, or the withheld will.
 func (h *hook) OnWill(cl *mqtt.Client, will mqtt.Will) (mqtt.Will, error) {
 	st := h.b.state.get(cl)
 	if st != nil {
 		if rel, ok := topic.Strip(st.tenantID, will.TopicName); ok && canPublish(st.acl(), rel) {
+			if h.b.cluster != nil && !cl.Net.Inline {
+				return h.b.clusterWill(cl, st, rel, will), nil
+			}
+
 			return will, nil
 		}
 	}

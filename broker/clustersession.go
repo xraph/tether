@@ -151,6 +151,16 @@ type session struct {
 	// handoverPos is the tenant's live position when a connection of this
 	// node took the session over (handOver), for established.
 	handoverPos uint64
+
+	// willDelay, set by OnWill (clusterWill) for a will with a delay, keeps
+	// the will and this node as the owner in the session's last record, and
+	// finish schedules the will willDelay after willAt (clusterlive.go).
+	willDelay time.Duration
+	willAt    time.Time
+	// willOwed, set by clusterWill, says the will was not published (the
+	// node was fenced, or the append failed): the key keeps it, and finish
+	// writes nothing but leaves the key to a reclaim.
+	willOwed bool
 }
 
 // touch marks the session's record as changed.
@@ -960,6 +970,13 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 		}
 	}
 
+	if n.fenced.Load() {
+		// Fenced while this CONNECT was on its way: it goes like the rest.
+		n.dropClient(n.mochi, cl)
+
+		return
+	}
+
 	if b.state.owner(cl.ID) != st {
 		n.log.Info("tether: connection lost its client ID to a concurrent connect", slog.String("client", cl.ID))
 		disconnect(n.mochi, b.log, cl, packets.ErrSessionTakenOver)
@@ -1072,8 +1089,27 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 		defer n.dropQoS2(s.nsID)
 	}
 
+	s.mu.Lock()
+	owed := s.willOwed
+	s.mu.Unlock()
+
+	// The fence is read after the session is marked ended, under its lock:
+	// a reclaim of this node's keys at the unfence either runs after this
+	// and finds the session ended, or the unfence came first and owed is
+	// settled here.
 	switch {
 	case lost, deleting:
+		return
+	case n.fenced.Load():
+		// Ruling R31: the write would fail. The key stays as it was, owned
+		// by this node with its will, for whoever reclaims it; the next
+		// owner replays from the last cursor written.
+		return
+	case owed:
+		// The key keeps the will, which this node still owes: it settles
+		// the key like a reclaim, once this session's lock is free.
+		n.goLive(func() { b.reclaimID(s.tenantID, s.rawID) })
+
 		return
 	case expire || !s.tracked:
 		go b.deleteKey(s)
@@ -1088,9 +1124,21 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
 		defer cancel()
 
-		if err := n.persist(ctx, s, ttl); err != nil && !errors.Is(err, errSessionLost) {
+		err := n.persist(ctx, s, ttl)
+		if err != nil && !errors.Is(err, errSessionLost) && !errors.Is(err, errFenced) {
 			n.log.Warn("tether: final session write failed; the next owner replays from the last cursor written",
 				slog.String("client", s.nsID), slog.Any("error", err))
+		}
+
+		s.mu.Lock()
+		delay, at := s.willDelay, s.willAt
+		s.mu.Unlock()
+
+		if delay > 0 && !errors.Is(err, errSessionLost) && !errors.Is(err, errFenced) {
+			// The record keeps the will (snapshot): it goes out when the
+			// delay ends unless the session comes back first. A write that
+			// failed left the CONNECT's record, which has it too.
+			b.scheduleWill(s.tenantID, s.rawID, s.epoch.Load(), time.Until(at.Add(delay)))
 		}
 	}
 }
@@ -1107,6 +1155,11 @@ func (b *Broker) deleteKey(s *session) {
 	defer s.wmu.Unlock()
 
 	s.done = true
+
+	if n.fenced.Load() {
+		// Ruling R31: the key stays for whoever reclaims it.
+		return
+	}
 
 	err := n.Sessions.Delete(ctx, s.tenantID, s.rawID, s.rev)
 	if err != nil && !errors.Is(err, cluster.ErrLostCAS) {
@@ -1245,8 +1298,17 @@ func (n *clusterNode) snapshot(s *session, cl *mqtt.Client, final bool) (rec *cl
 	}
 
 	if final {
-		rec.Owner = ""
-		rec.Will = nil
+		s.mu.Lock()
+		pending := s.willDelay > 0
+		s.mu.Unlock()
+
+		// A delayed will stays in the record, with this node as the owner
+		// that answers for it, until it is published or cancelled.
+		if !pending {
+			rec.Owner = ""
+			rec.Will = nil
+		}
+
 		rec.DisconnectedAt = time.Now().UTC()
 		rec.ExpirySeconds = sessionExpiry(cl, s.expiryCap)
 	}
@@ -1309,6 +1371,11 @@ func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration
 
 	if n.isLost(s) {
 		return errSessionLost
+	}
+
+	if n.fenced.Load() {
+		// Ruling R31: no write can succeed, and none should be tried.
+		return errFenced
 	}
 
 	if s.done {
@@ -1590,7 +1657,7 @@ func (b *Broker) flush() {
 			ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
 			defer cancel()
 
-			if err := n.persist(ctx, s, 0); err != nil && !errors.Is(err, errSessionLost) {
+			if err := n.persist(ctx, s, 0); err != nil && !errors.Is(err, errSessionLost) && !errors.Is(err, errFenced) {
 				n.log.Warn("tether: session write failed", slog.String("client", s.nsID), slog.Any("error", err))
 			}
 		})
