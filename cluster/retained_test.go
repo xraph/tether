@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/xraph/tether"
@@ -458,7 +459,10 @@ func TestRetainedWatchRestarts(t *testing.T) {
 	first := kws[0]
 	mu.Unlock()
 
-	if err := first.Stop(); err != nil {
+	// Stop unsubscribes first and then deletes the consumer, which may be
+	// gone already (an ordered consumer that reset itself); the subscription
+	// is closed either way.
+	if err := first.Stop(); err != nil && !errors.Is(err, nats.ErrConsumerNotFound) && !errors.Is(err, jetstream.ErrConsumerNotFound) {
 		t.Fatal(err)
 	}
 
@@ -510,6 +514,116 @@ func TestRetainedWatchRestarts(t *testing.T) {
 
 	if ev := w.next(t, 5*time.Second); ev.topic != "keep" || string(ev.msg.Payload) != "k2" {
 		t.Fatalf("event after restart = %+v", ev)
+	}
+}
+
+// A first pass that misses writes the leader had already acknowledged, as a
+// watcher on a lagging replica does, still returns them: Load and Watch read
+// on until the watcher reaches the leader's mark. The afterOpen hook writes
+// after the watcher took its snapshot and before the mark is read, so without
+// the mark both would return the stale snapshot every time. The newest entry
+// under the mark is a delete marker, so this also fails if markers are left
+// out of the pass.
+func TestRetainedFirstPassReachesLeaderMark(t *testing.T) {
+	cell := startRetained(t, 2)
+	a, b := cell[0], cell[1]
+	ctx := tctx(t, 60*time.Second)
+
+	mustPut(t, a, testTenant, "old/kept", "k")
+	mustPut(t, a, testTenant, "old/gone", "g")
+
+	round := 0
+
+	b.afterOpen = func() {
+		round++
+		mustPut(t, a, testTenant, "late/put", fmt.Sprintf("v%d", round))
+
+		if err := a.Delete(ctx, testTenant, "old/gone"); err != nil {
+			t.Error(err)
+		}
+	}
+
+	got := topicsOf(mustLoad(t, b, testTenant))
+	if want := []string{"late/put=v1", "old/kept=k"}; !slices.Equal(got, want) {
+		t.Fatalf("Load = %v, want %v", got, want)
+	}
+
+	mustPut(t, a, testTenant, "old/gone", "g")
+
+	w := newRetWatcher()
+	mustWatch(t, b, testTenant, w)
+
+	state := map[string]string{}
+	for _, ev := range w.snapshot() {
+		if ev.deleted {
+			delete(state, ev.topic)
+		} else {
+			state[ev.topic] = string(ev.msg.Payload)
+		}
+	}
+
+	if want := map[string]string{"late/put": "v2", "old/kept": "k"}; !reflect.DeepEqual(state, want) {
+		t.Fatalf("state when Watch returned = %v, want %v", state, want)
+	}
+}
+
+// Writes acknowledged on one node are in a Load on another right away, round
+// after round. This is the leader mark at work, not a timing allowance.
+func TestRetainedLoadSeesAcknowledgedWrite(t *testing.T) {
+	cell := startRetained(t, 3)
+
+	for i := range 40 {
+		w, r := cell[i%3], cell[(i+1)%3]
+		v := fmt.Sprint(i)
+
+		mustPut(t, w, testTenant, "flip", v)
+
+		if got := topicsOf(mustLoad(t, r, testTenant)); !slices.Equal(got, []string{"flip=" + v}) {
+			t.Fatalf("round %d: Load on node %d = %v, want flip=%s", i, (i+1)%3+1, got, v)
+		}
+	}
+}
+
+// The watch's start has a bound of its own: with NATS gone, a Watch whose ctx
+// never ends still gives up, with ErrUnavailable, after about 10 s.
+func TestRetainedWatchStartBound(t *testing.T) {
+	cl := clustertest.StartCluster(t, 1)
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.NodeID = "n1"
+	cfg.Cell = "c1"
+	cfg.Mode = ModeExternal
+	cfg.URLs = cl.URLs()
+	cfg.Replicas = 1
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	if err = Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewRetained(c, cfg)
+	mustPut(t, r, testTenant, "a", "x") // opens the bucket handle while NATS is up
+
+	cl.Stop(0)
+
+	start := time.Now()
+
+	_, err = r.Watch(t.Context(), testTenant, func(string, *LogMessage, bool) {})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Watch = %v, want ErrUnavailable from the start bound", err)
+	}
+
+	if d := time.Since(start); d > opTimeout+5*time.Second {
+		t.Fatalf("Watch gave up after %v, want at most about %v", d, opTimeout)
+	} else {
+		t.Logf("Watch gave up after %v", d.Round(10*time.Millisecond))
 	}
 }
 
@@ -587,6 +701,7 @@ func TestRetainedInvalidInput(t *testing.T) {
 		"put empty topic":     r.Put(ctx, testTenant, "", msg, 0),
 		"put long topic":      r.Put(ctx, testTenant, long, msg, 0),
 		"put QoS 3":           r.Put(ctx, testTenant, "a", LogMessage{Payload: []byte("x"), QoS: 3}, 0),
+		"empty put QoS 3":     r.Put(ctx, testTenant, "a", LogMessage{QoS: 3}, 0),
 		"delete empty tenant": r.Delete(ctx, "", "a"),
 		"delete long topic":   r.Delete(ctx, testTenant, long),
 		"empty put bad topic": r.Put(ctx, testTenant, "a/#", LogMessage{}, 0),

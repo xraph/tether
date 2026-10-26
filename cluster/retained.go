@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -34,11 +35,17 @@ type Retained struct {
 	// between a watch ending by itself and its replacement starting.
 	onWatch       func(jetstream.KeyWatcher)
 	beforeRestart func()
+	// afterOpen, when set, runs in Load and in every watch start after the
+	// KV watcher exists and before the leader's mark is read: a write it makes
+	// is missing from the watcher's first pass but covered by the mark, which
+	// is what a watcher on a lagging replica looks like.
+	afterOpen func()
 }
 
 type retainedHandles struct {
 	kv     jetstream.KeyValue
 	prefix string // "$KV.<bucket>.", the subject of a key's messages
+	getMsg string // the stream's MSG.GET API subject, answered by the leader
 }
 
 // retainedValue is the JSON value of a retained key. Tenant and topic are not
@@ -68,7 +75,11 @@ func (r *Retained) handles(ctx context.Context) (*retainedHandles, error) {
 		return nil, r.wrapErr("open retained bucket", err)
 	}
 
-	r.h.CompareAndSwap(nil, &retainedHandles{kv: kv, prefix: "$KV." + r.bucket + "."})
+	r.h.CompareAndSwap(nil, &retainedHandles{
+		kv:     kv,
+		prefix: "$KV." + r.bucket + ".",
+		getMsg: "$JS.API.STREAM.MSG.GET.KV_" + r.bucket,
+	})
 
 	return r.h.Load(), nil
 }
@@ -136,12 +147,12 @@ func (r *Retained) Put(ctx context.Context, tenant, topic string, msg LogMessage
 		return err
 	}
 
-	if len(msg.Payload) == 0 {
-		return r.Delete(ctx, tenant, topic)
-	}
-
 	if msg.QoS > 2 {
 		return fmt.Errorf("cluster: put retained: QoS %d: %w", msg.QoS, tether.ErrInvalidInput)
+	}
+
+	if len(msg.Payload) == 0 {
+		return r.Delete(ctx, tenant, topic)
 	}
 
 	at := msg.PublishedAt
@@ -233,11 +244,13 @@ func decodeRetained(key string, rev uint64, data []byte) (LogMessage, error) {
 // revision in the bucket, which grows with every write of the cell, so of two
 // readings of one topic the higher Seq is the newer.
 //
-// It reads the tenant's keys through a watcher, so it costs a pass over them.
-// The watcher's consumer may sit on a replica a few milliseconds behind the
-// stream leader, so a write acknowledged just before Load may be missing; a
-// cache kept by Watch gets it moments later. An entry that does not decode is
-// logged at Warn and skipped. A context without a deadline gets 10 s.
+// Every write acknowledged before Load was called is in the result. Load reads
+// the tenant's keys through a watcher, whose consumer the server may place on
+// a replica a few milliseconds behind the stream leader, so it first asks the
+// leader for the newest revision under the tenant's keys and reads on until
+// the watcher has delivered it (see catchUp). It costs a pass over the
+// tenant's keys. An entry that does not decode is logged at Warn and skipped.
+// A context without a deadline gets 10 s.
 func (r *Retained) Load(ctx context.Context, tenant string) ([]LogMessage, error) {
 	filters := retainedTenantFilters(tenant)
 	if filters == nil {
@@ -252,39 +265,181 @@ func (r *Retained) Load(ctx context.Context, tenant string) ([]LogMessage, error
 		return nil, err
 	}
 
-	w, err := h.kv.WatchFiltered(ctx, filters, jetstream.IgnoreDeletes())
+	// Markers stay in: the newest entry under the mark can be one.
+	w, err := h.kv.WatchFiltered(ctx, slices.Clone(filters))
 	if err != nil {
 		return nil, r.wrapErr("load retained", err)
 	}
 	defer r.stopWatcher(w)
 
-	var out []LogMessage
+	if r.afterOpen != nil {
+		r.afterOpen()
+	}
 
-	for {
+	p, err := r.newCatchUp(ctx, h, filters)
+	if err != nil {
+		return nil, err
+	}
+
+	live := make(map[string]LogMessage)
+
+	for !p.caughtUp() {
 		select {
 		case <-ctx.Done():
 			return nil, r.wrapErr("load retained", ctx.Err())
+		case <-p.tick():
+			p.recheck(ctx)
 		case e, ok := <-w.Updates():
 			if !ok {
 				return nil, fmt.Errorf("cluster: load retained: watcher closed: %w", ErrUnavailable)
 			}
 
 			if e == nil {
-				slices.SortFunc(out, func(a, b LogMessage) int { return strings.Compare(a.Topic, b.Topic) })
+				p.firstPassEnded()
 
-				return out, nil
+				continue
+			}
+
+			p.saw(e.Revision())
+
+			if e.Operation() != jetstream.KeyValuePut {
+				delete(live, e.Key())
+
+				continue
 			}
 
 			m, derr := decodeRetained(e.Key(), e.Revision(), e.Value())
 			if derr != nil {
+				delete(live, e.Key())
 				r.c.logger.Warn("skipping undecodable retained entry", "key", e.Key(), "error", derr)
 
 				continue
 			}
 
-			out = append(out, m)
+			live[e.Key()] = m
 		}
 	}
+
+	out := make([]LogMessage, 0, len(live))
+	for _, m := range live {
+		out = append(out, m)
+	}
+
+	slices.SortFunc(out, func(a, b LogMessage) int { return strings.Compare(a.Topic, b.Topic) })
+
+	return out, nil
+}
+
+// catchUpRecheck is how often a pass that has not caught up yet asks the
+// leader for its mark again.
+const catchUpRecheck = 250 * time.Millisecond
+
+// catchUp tells when a KV watcher's pass over a tenant has caught up with the
+// stream leader. The watcher's consumer is R1, and the server places it on any
+// replica of the bucket, possibly a follower that has not applied the newest
+// writes yet; it delivers them later, as updates after its first pass. So a
+// pass reads, after its watcher exists, the leader's newest revision under the
+// tenant's key filters (the mark: every write acknowledged before then is at
+// or below it), and counts as done once the watcher has ended its first pass
+// and delivered a revision at or above the mark.
+//
+// The entry at the mark can disappear before the watcher delivers it: a purge
+// marker that runs out its TTL leaves nothing behind. So while it waits the
+// pass asks the leader again every catchUpRecheck and lowers the mark to the
+// answer; it never raises it, so steady writes cannot hold the pass back.
+//
+// A catchUp belongs to one goroutine.
+type catchUp struct {
+	r       *Retained
+	h       *retainedHandles
+	filters []string
+	mark    uint64
+	seen    uint64
+	ended   bool // the watcher sent the end of its first pass
+	done    bool
+}
+
+func (r *Retained) newCatchUp(ctx context.Context, h *retainedHandles, filters []string) (*catchUp, error) {
+	mark, err := r.leaderMark(ctx, h, filters)
+	if err != nil {
+		return nil, err
+	}
+
+	return &catchUp{r: r, h: h, filters: filters, mark: mark}, nil
+}
+
+func (p *catchUp) saw(rev uint64)  { p.seen = max(p.seen, rev) }
+func (p *catchUp) firstPassEnded() { p.ended = true }
+
+// caughtUp reports whether the pass is done. Once true it stays true.
+func (p *catchUp) caughtUp() bool {
+	if !p.done && p.ended && p.seen >= p.mark {
+		p.done = true
+	}
+
+	return p.done
+}
+
+// tick returns a channel that fires when the mark is due a recheck, nil once
+// the pass is done.
+func (p *catchUp) tick() <-chan time.Time {
+	if p.done {
+		return nil
+	}
+
+	return time.After(catchUpRecheck)
+}
+
+// recheck asks the leader for the mark again and keeps the lower one. A
+// failed read keeps the mark as it is.
+func (p *catchUp) recheck(ctx context.Context) {
+	rctx, cancel := context.WithTimeout(ctx, opTimeout)
+	defer cancel()
+
+	mark, err := p.r.leaderMark(rctx, p.h, p.filters)
+	if err != nil {
+		p.r.c.logger.Debug("retained: rereading the leader's mark failed", "error", err)
+
+		return
+	}
+
+	p.mark = min(p.mark, mark)
+}
+
+// leaderMark returns the newest revision under any of filters, 0 when none
+// has a message, from the stream leader: the JetStream non-direct message get
+// with last_by_subj, which takes a wildcard subject.
+func (r *Retained) leaderMark(ctx context.Context, h *retainedHandles, filters []string) (uint64, error) {
+	var mark uint64
+
+	for _, f := range filters {
+		body, err := json.Marshal(msgGetRequest{LastBySubject: h.prefix + f})
+		if err != nil {
+			return 0, fmt.Errorf("cluster: retained leader mark: %w", err)
+		}
+
+		reply, err := r.c.nc.RequestWithContext(ctx, h.getMsg, body)
+		if err != nil {
+			return 0, r.wrapErr("retained leader mark", err)
+		}
+
+		var resp msgGetResponse
+		if err := json.Unmarshal(reply.Data, &resp); err != nil {
+			return 0, fmt.Errorf("cluster: retained leader mark: bad reply: %w", err)
+		}
+
+		switch {
+		case resp.Error != nil && resp.Error.ErrorCode == jetstream.JSErrCodeMessageNotFound:
+		case resp.Error != nil:
+			return 0, r.wrapErr("retained leader mark", resp.Error)
+		case resp.Message == nil:
+			return 0, errors.New("cluster: retained leader mark: empty reply")
+		default:
+			mark = max(mark, resp.Message.Sequence)
+		}
+	}
+
+	return mark, nil
 }
 
 // stopWatcher stops w without blocking the caller, and drains it so the
@@ -310,14 +465,15 @@ func (r *Retained) stopWatcher(w jetstream.KeyWatcher) {
 //
 // It starts with the messages that exist now: fn gets each as a put, and Watch
 // returns once it has, so a cache filled by fn is loaded when Watch returns.
-// After that fn gets every change: a put (msg is the new message, deleted is
-// false) or a removal by Delete, by an empty Put or by expiry (JetStream
-// reports an expiry as a purge with the reason MaxAge; msg then carries only
-// Tenant, Topic and Seq, and deleted is true). msg.Seq is the key's revision,
-// 0 for a removal found by a restarted watch (below). A removal is reported
-// only for a topic fn holds, and a put only when its revision is newer than the
-// last one fn saw for the topic, so fn sees each change of a topic once and in
-// order.
+// Every write acknowledged before Watch was called is in that first pass, as
+// with Load (the pass waits for the leader's mark, see catchUp). After that fn
+// gets every change: a put (msg is the new message, deleted is false) or a
+// removal by Delete, by an empty Put or by expiry (JetStream reports an expiry
+// as a purge with the reason MaxAge; msg then carries only Tenant, Topic and
+// Seq, and deleted is true). msg.Seq is the key's revision, 0 for a removal
+// found by a restarted watch (below). A removal is reported only for a topic
+// fn holds, and a put only when its revision is newer than the last one fn saw
+// for the topic, so fn sees each change of a topic once and in order.
 //
 // fn runs on the watch's one goroutine, one call at a time, and before Watch
 // returns too, so do not call Watch while holding a lock fn takes. Keep fn
@@ -325,14 +481,16 @@ func (r *Retained) stopWatcher(w jetstream.KeyWatcher) {
 //
 // A watch that ends by itself (its subscription closed under it) is logged at
 // Error and started again, with backoff while NATS refuses. The new watch's
-// first pass catches fn up: it reports the puts fn missed and, as removed, the
-// topics fn holds that are gone.
+// first pass, caught up with the leader the same way, catches fn up: it
+// reports the puts fn missed and, as removed, the topics fn holds that are
+// gone.
 //
-// The watch runs until ctx ends or stop is called. Starting it waits for NATS
-// at most until ctx's deadline, or 10 s without one, and the first pass at
-// most until ctx ends. stop is idempotent and returns promptly even while NATS
-// is unreachable: it waits only for an fn that is running, and fn is never
-// called after it returns. Do not call stop from fn.
+// ctx is the watch's lifetime: it runs until ctx ends or stop is called. The
+// start (the watcher, the leader's mark and the first pass) has a bound of its
+// own, 10 s, or ctx's deadline when that comes first; when it runs out Watch
+// fails with an error wrapping ErrUnavailable. stop is idempotent and returns
+// promptly even while NATS is unreachable: it waits only for an fn that is
+// running, and fn is never called after it returns. Do not call stop from fn.
 func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic string, msg *LogMessage, deleted bool)) (stop func(), err error) {
 	filters := retainedTenantFilters(tenant)
 	if filters == nil || fn == nil {
@@ -340,6 +498,9 @@ func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic strin
 	}
 
 	wctx, cancel := context.WithCancel(ctx)
+
+	startCtx, cancelStart := context.WithTimeout(wctx, opTimeout)
+	defer cancelStart()
 
 	w := &retainedWatch{
 		r: r, tenant: tenant, filters: filters, fn: fn,
@@ -354,28 +515,29 @@ func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic strin
 		w.fnMu.Unlock() //nolint:gocritic,staticcheck // empty on purpose: waits out a running fn
 	}
 
-	kw, err := w.open(wctx)
+	kw, end, pass, err := w.open(wctx, startCtx)
 	if err != nil {
 		cancel()
 
 		return nil, err
 	}
 
-	// run returns only once wctx has ended, so waiting for ready or ctx is
-	// enough: a watch that ends during its first pass starts again.
-	go w.run(wctx, kw)
+	// run returns only once wctx has ended, so waiting for ready or the start
+	// bound is enough: a watch that ends during its first pass starts again.
+	go w.run(wctx, kw, end, pass)
 
 	select {
 	case <-w.ready:
 		return stop, nil
-	case <-ctx.Done():
+	case <-startCtx.Done():
 		stop()
 
-		return nil, r.wrapErr("watch retained", ctx.Err())
+		return nil, r.wrapErr("watch retained: first pass", startCtx.Err())
 	}
 }
 
-// retainedWatch is one Watch. Only its run goroutine touches known and resync.
+// retainedWatch is one Watch. Only its run goroutine touches known, resync and
+// the pass.
 type retainedWatch struct {
 	r       *Retained
 	tenant  string
@@ -394,33 +556,63 @@ type retainedWatch struct {
 	stopped atomic.Bool
 }
 
-// open starts a KV watcher on the tenant's keys, waiting for NATS at most until
-// ctx's deadline or 10 s.
-func (w *retainedWatch) open(ctx context.Context) (jetstream.KeyWatcher, error) {
-	octx, cancel := opContext(ctx)
-	defer cancel()
-
-	h, err := w.r.handles(octx)
+// open starts a KV watcher on the tenant's keys and reads the leader's mark
+// for its first pass.
+//
+// nats.go ends a KV watcher's subscription when the context it was created
+// with ends, and uses that same context, deadline or not, for the request that
+// creates its consumer. So the watcher gets a context of its own under life,
+// cancelled by the returned func, and bound limits only the start: when bound
+// ends during the create call the watcher's context is cancelled with it.
+func (w *retainedWatch) open(life, bound context.Context) (jetstream.KeyWatcher, context.CancelFunc, *catchUp, error) {
+	h, err := w.r.handles(bound)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 
+	lctx, lcancel := context.WithCancel(life)
+	unbind := context.AfterFunc(bound, lcancel)
+
 	// WatchFiltered writes the bucket prefix into the slice it is given.
-	kw, err := h.kv.WatchFiltered(octx, slices.Clone(w.filters))
+	kw, err := h.kv.WatchFiltered(lctx, slices.Clone(w.filters))
+
+	if !unbind() { // bound ended during the call, and lctx with it
+		if err == nil {
+			w.r.stopWatcher(kw)
+		}
+
+		return nil, nil, nil, w.r.wrapErr("watch retained", bound.Err())
+	}
+
 	if err != nil {
-		return nil, w.r.wrapErr("watch retained", err)
+		lcancel()
+
+		return nil, nil, nil, w.r.wrapErr("watch retained", err)
 	}
 
 	if hook := w.r.onWatch; hook != nil {
 		hook(kw)
 	}
 
-	return kw, nil
+	if hook := w.r.afterOpen; hook != nil {
+		hook()
+	}
+
+	pass, err := w.r.newCatchUp(bound, h, w.filters)
+	if err != nil {
+		lcancel()
+		w.r.stopWatcher(kw)
+
+		return nil, nil, nil, err
+	}
+
+	return kw, lcancel, pass, nil
 }
 
-func (w *retainedWatch) run(ctx context.Context, kw jetstream.KeyWatcher) {
+func (w *retainedWatch) run(ctx context.Context, kw jetstream.KeyWatcher, end context.CancelFunc, pass *catchUp) {
 	for {
-		w.read(ctx, kw)
+		w.read(ctx, kw, pass)
+		end()
 		w.r.stopWatcher(kw)
 
 		if ctx.Err() != nil {
@@ -434,30 +626,38 @@ func (w *retainedWatch) run(ctx context.Context, kw jetstream.KeyWatcher) {
 		}
 
 		var ok bool
-		if kw, ok = w.restart(ctx); !ok {
+		if kw, end, pass, ok = w.restart(ctx); !ok {
 			return
 		}
 	}
 }
 
-// read consumes kw until it closes or ctx ends.
-func (w *retainedWatch) read(ctx context.Context, kw jetstream.KeyWatcher) {
+// read consumes kw until it closes or ctx ends. When pass catches up it ends
+// the first pass (endFirstPass) and marks the watch ready.
+func (w *retainedWatch) read(ctx context.Context, kw jetstream.KeyWatcher, pass *catchUp) {
 	for {
+		if !pass.done && pass.caughtUp() {
+			w.endFirstPass()
+			w.readyOnce.Do(func() { close(w.ready) })
+		}
+
 		select {
 		case <-ctx.Done():
 			return
+		case <-pass.tick():
+			pass.recheck(ctx)
 		case e, ok := <-kw.Updates():
 			if !ok {
 				return
 			}
 
 			if e == nil {
-				w.endFirstPass()
-				w.readyOnce.Do(func() { close(w.ready) })
+				pass.firstPassEnded()
 
 				continue
 			}
 
+			pass.saw(e.Revision())
 			w.consume(e)
 		}
 	}
@@ -465,22 +665,26 @@ func (w *retainedWatch) read(ctx context.Context, kw jetstream.KeyWatcher) {
 
 // restart opens a new watch with backoff until it works or ctx ends. Its first
 // pass is a resync.
-func (w *retainedWatch) restart(ctx context.Context) (jetstream.KeyWatcher, bool) {
+func (w *retainedWatch) restart(ctx context.Context) (jetstream.KeyWatcher, context.CancelFunc, *catchUp, bool) {
 	delay := consumerRetry
 
 	for {
-		kw, err := w.open(ctx)
+		bound, cancel := context.WithTimeout(ctx, opTimeout)
+		kw, end, pass, err := w.open(ctx, bound)
+
+		cancel()
+
 		if err == nil {
 			w.resync = make(map[string]struct{})
 
-			return kw, true
+			return kw, end, pass, true
 		}
 
 		w.r.c.logger.Error("watch: restarting the retained watch failed", "tenant", w.tenant, "error", err)
 
 		select {
 		case <-ctx.Done():
-			return nil, false
+			return nil, nil, nil, false
 		case <-time.After(delay):
 		}
 
