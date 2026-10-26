@@ -191,6 +191,7 @@ type willSpec struct {
 	qos       byte
 	expiry    uint32 // session expiry; 0 is a clean session
 	delay     uint32 // will delay
+	user      []packets.User
 }
 
 // rawConnectWill connects a 5.0 client of u1 over a raw TCP connection with
@@ -204,7 +205,7 @@ func rawConnectWill(t *testing.T, addr string, spec willSpec) net.Conn {
 		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: spec.id, CleanStart: spec.expiry == 0, KeepAlive: 30,
 		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
 		Properties:     &packets.Properties{SessionExpiryInterval: &expiry},
-		WillProperties: &packets.Properties{WillDelayInterval: &delay},
+		WillProperties: &packets.Properties{WillDelayInterval: &delay, User: spec.user},
 		WillFlag:       true, WillTopic: spec.topic, WillQOS: spec.qos, WillMessage: []byte("gone " + spec.id),
 	})
 }
@@ -827,6 +828,182 @@ func TestCleanDisconnectDuringOutageNoWill(t *testing.T) {
 	require.Zero(t, a.cluster.willsSent.Load())
 	require.Zero(t, c.nodes[1].cluster.willsSent.Load())
 	require.Equal(t, []string{"n1", "n2"}, c.members[1].Live(), "n2 never saw n1 dead")
+}
+
+// heldFault returns a willFault that fails every send while hold is set and
+// counts the attempts.
+func heldFault(hold *atomic.Bool, attempts *atomic.Int64) func() error {
+	return func() error {
+		attempts.Add(1)
+
+		if hold.Load() {
+			return errors.New("injected will fault")
+		}
+
+		return nil
+	}
+}
+
+// Fix round 2: a will whose publish keeps failing after its key was
+// settled does not hold the session's lock, so its client can connect to the
+// node meanwhile.
+func TestHeldPublishDoesNotBlockConnect(t *testing.T) {
+	var (
+		hold     atomic.Bool
+		attempts atomic.Int64
+	)
+
+	hold.Store(true)
+
+	c := startLiveCellWith(t, 2, 1, func(b *Broker) {
+		if b.cluster.Config.NodeID == "n1" {
+			b.cluster.willFault = heldFault(&hold, &attempts)
+		}
+	})
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 3600})
+
+	c.cut()
+	requireClosed(t, x)
+	c.proxy.SetMode(chaos.Both, chaos.Pass)
+
+	// After the unfence n1 settles x's key and keeps failing to send its
+	// will.
+	eventuallyLive(t, "x's key settled with its publish failing", func() bool {
+		rec, rerr := c.record(t, 1, "x")
+
+		return rerr == nil && rec.Owner == "" && rec.Will == nil && attempts.Load() > 1
+	})
+
+	start := time.Now()
+	x2, ca, err := connect5(t, c.addr(0), "x", "u1", false)
+	require.NoError(t, err)
+	require.True(t, ca.SessionPresent)
+	require.Less(t, time.Since(start), 3*time.Second)
+
+	hold.Store(false)
+
+	require.Equal(t, "will/x", recvLive(t, sb).Topic)
+	noMoreMsgs(t, sb)
+	requireConnected(t, x2)
+	require.Equal(t, []string{"n1", "n2"}, c.members[1].Live(), "n2 never saw n1 dead")
+}
+
+// Fix round 2: a reclaimed will stuck in its publish does not stall the
+// sweep: a node that dies later still has its keys settled.
+func TestStuckPublishDoesNotStallSweep(t *testing.T) {
+	var (
+		hold     atomic.Bool
+		attempts atomic.Int64
+	)
+
+	hold.Store(true)
+
+	c := startLiveCellWith(t, 3, 3, func(b *Broker) {
+		if b.cluster.Config.NodeID == "n2" {
+			b.cluster.willFault = heldFault(&hold, &attempts)
+		}
+	})
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x1 := rawConnectWill(t, c.addr(0), willSpec{id: "x1", topic: "will/x1", qos: 1, expiry: 3600})
+	y3 := rawConnectWill(t, c.addr(2), willSpec{id: "y3", topic: "will/y3", qos: 1, expiry: 3600})
+
+	c.proxies[0].SetMode(chaos.Both, chaos.Blackhole)
+	requireClosed(t, x1)
+
+	eventuallyLive(t, "x1's key settled with its publish stuck", func() bool {
+		rec, rerr := c.record(t, 1, "x1")
+
+		return rerr == nil && rec.Owner == "" && attempts.Load() > 0
+	})
+
+	c.proxies[2].SetMode(chaos.Both, chaos.Blackhole)
+	requireClosed(t, y3)
+
+	eventuallyLive(t, "y3's key settled while x1's publish is stuck", func() bool {
+		rec, rerr := c.record(t, 1, "y3")
+
+		return rerr == nil && rec.Owner == "" && rec.Will == nil
+	})
+	require.True(t, hold.Load())
+
+	hold.Store(false)
+
+	got := map[string]bool{}
+	for len(got) < 2 {
+		got[recvLive(t, sb).Topic] = true
+	}
+
+	require.Equal(t, map[string]bool{"will/x1": true, "will/y3": true}, got)
+	noMoreMsgs(t, sb)
+}
+
+// Fix round 2: a will NATS can never carry (its user properties take it
+// over max_payload) is dropped at once and logged, on the local path and on
+// the reclaim path, instead of being retried until Stop.
+func TestOversizedWillDropped(t *testing.T) {
+	var (
+		hold     atomic.Bool
+		attempts atomic.Int64
+	)
+
+	c := startLiveCellWith(t, 2, 1, func(b *Broker) {
+		if b.cluster.Config.NodeID == "n2" {
+			b.cluster.willFault = heldFault(&hold, &attempts)
+		}
+	})
+	b := c.nodes[1]
+
+	// About 800 KB of user properties: under the 1 MiB MQTT packet limit,
+	// over NATS's 1 MiB max_payload once base64 encoded into a header.
+	big := make([]packets.User, 16)
+	for i := range big {
+		big[i] = packets.User{Key: fmt.Sprintf("k%d", i), Value: strings.Repeat("v", 50_000)}
+	}
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	// Local path: n2 drops it and clears the record.
+	y := rawConnectWill(t, c.addr(1), willSpec{id: "y", topic: "will/y", qos: 1, expiry: 3600, user: big})
+	require.NoError(t, y.Close())
+
+	eventually(t, "y's will dropped", func() bool { return b.cluster.willsDropped.Load() == 1 })
+	eventually(t, "y's record cleared", func() bool {
+		rec, rerr := c.record(t, 1, "y")
+
+		return rerr == nil && rec.Owner == "" && rec.Will == nil
+	})
+
+	// Reclaim path: one attempt, then given up.
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 3600, user: big})
+
+	c.cut()
+	requireClosed(t, x)
+
+	eventuallyLive(t, "x's will dropped", func() bool { return b.cluster.willsDropped.Load() == 2 })
+
+	sent := attempts.Load()
+	require.Equal(t, int64(2), sent, "one attempt per will")
+
+	time.Sleep(2 * time.Second)
+	require.Equal(t, sent, attempts.Load(), "no retry of a will that can never go out")
+	noMoreMsgs(t, sb)
+	require.Zero(t, b.cluster.willsSent.Load())
+
+	rec, err := c.record(t, 1, "x")
+	require.NoError(t, err)
+	require.Empty(t, rec.Owner)
+	require.Nil(t, rec.Will)
 }
 
 // Without a cluster the broker is always healthy as far as the cell goes.

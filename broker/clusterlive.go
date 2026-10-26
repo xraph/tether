@@ -11,6 +11,8 @@ import (
 
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/cluster"
@@ -119,8 +121,9 @@ type liveness struct {
 
 	// Counters for tests: wills published to the cell, delayed wills
 	// cancelled, keys reclaimed (written back or taken over), clients
-	// dropped by a fence, sweeps that read the bucket.
-	willsSent, willsCancelled, reclaimed, fenceDrops, sweeps atomic.Uint64
+	// dropped by a fence, sweeps that read the bucket, wills given up on
+	// because they can never be sent.
+	willsSent, willsCancelled, reclaimed, fenceDrops, sweeps, willsDropped atomic.Uint64
 }
 
 func newLiveness() liveness {
@@ -487,7 +490,7 @@ func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will 
 	if err := b.publishWill(ctx, st.tenantID, st.rawID, w, false, msgID); err != nil {
 		n.log.Warn("tether: will not published to the cell", slog.String("client", cl.ID), slog.Any("error", err))
 
-		if will.Qos > 0 && mine {
+		if will.Qos > 0 && mine && !errors.Is(err, errWillDropped) {
 			// The record keeps it, and finish has it settled like a
 			// reclaimed key, under the same message ID in case an append
 			// committed after all. (A QoS 0 will mochi delivers here
@@ -511,7 +514,9 @@ func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will 
 // a will whose key this node already settled (reclaim, a delayed will) uses
 // the broker's lifetime, so it retries until Stop. Every attempt appends
 // under msgID ("" mints one), so the log deduplicates a retry, and a later
-// publish of the same will after an append that errored but committed.
+// publish of the same will after an append that errored but committed. A
+// will that can never be sent (permanentWillErr) is dropped at once, logged
+// at Error, with an error wrapping errWillDropped.
 //
 // local makes this node deliver a QoS 0 will itself (the Router never
 // delivers to its own node) and keep a retained will here, which is what
@@ -544,6 +549,16 @@ func (b *Broker) publishWill(ctx context.Context, tenantID, rawID string, w *clu
 			break
 		}
 
+		if permanentWillErr(err) {
+			// Retrying cannot help (too large for NATS, refused as invalid):
+			// the will is dropped.
+			n.willsDropped.Add(1)
+			n.log.Error("tether: will can never be published, dropped", slog.String("client", namespacedID(tenantID, rawID)),
+				slog.String("topic", w.Topic), slog.Any("error", err))
+
+			return fmt.Errorf("tether/broker: publish will: %w: %w", errWillDropped, err)
+		}
+
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("tether/broker: publish will: %w", err)
@@ -562,6 +577,27 @@ func (b *Broker) publishWill(ctx context.Context, tenantID, rawID string, w *clu
 	n.willsSent.Add(1)
 
 	return nil
+}
+
+// errWillDropped is what publishWill returns for a will it gave up on at
+// once, because no retry could get it out.
+var errWillDropped = errors.New("tether/broker: will dropped")
+
+// jsErrMessageTooLarge is nats-server's JSStreamMessageExceedsMaximumErr
+// (10054). nats.go has no exported constant for it.
+const jsErrMessageTooLarge jetstream.ErrorCode = 10054
+
+// permanentWillErr reports whether a failed will send can never succeed:
+// a message over NATS's max_payload or the stream's message size limit, or
+// one the cluster refuses as invalid.
+func permanentWillErr(err error) bool {
+	if errors.Is(err, tether.ErrInvalidInput) || errors.Is(err, nats.ErrMaxPayload) || errors.Is(err, nats.ErrBadSubject) {
+		return true
+	}
+
+	var api *jetstream.APIError
+
+	return errors.As(err, &api) && api.ErrorCode == jsErrMessageTooLarge
 }
 
 // sendWill is one attempt of publishWill.
@@ -842,12 +878,25 @@ func (b *Broker) reclaimKey(node string, e cluster.SessionEntry, msgID string) e
 	}
 
 	if will != nil {
-		if err := b.publishWill(n.ctx, e.Tenant, e.ClientID, will, true, msgID); err != nil {
-			n.log.Warn("tether: will of a reclaimed session lost at Stop", slog.String("client", nsID), slog.Any("error", err))
-		}
+		// On its own goroutine: the publish may retry until Stop, and must
+		// hold neither the session's lock (a CONNECT of the client waits on
+		// it) nor the reclaim's slot (the sweep waits on those).
+		n.goLive(func() { b.publishHeld(e.Tenant, e.ClientID, will, msgID) })
 	}
 
 	return nil
+}
+
+// publishHeld publishes a will whose key this node has already settled, so
+// it holds the only copy: publishWill on the broker's lifetime, retried
+// until Stop unless it can never succeed.
+func (b *Broker) publishHeld(tenantID, clientID string, w *cluster.WillRecord, msgID string) {
+	n := b.cluster
+
+	err := b.publishWill(n.ctx, tenantID, clientID, w, true, msgID)
+	if err != nil && !errors.Is(err, errWillDropped) {
+		n.log.Warn("tether: will lost at Stop before it went out", slog.String("client", namespacedID(tenantID, clientID)), slog.Any("error", err))
+	}
 }
 
 // serves reports whether a session of this node serves nsID at epoch, or
@@ -999,11 +1048,9 @@ func (b *Broker) tryFire(pw *pendingWill) (published, retry bool) {
 		return false, false
 	}
 
-	// This node holds the will's only copy now: publishWill retries until
-	// Stop.
-	if err := b.publishWill(n.ctx, pw.tenantID, pw.clientID, rec.Will, true, ""); err != nil {
-		n.log.Warn("tether: delayed will lost at Stop", slog.String("client", namespacedID(pw.tenantID, pw.clientID)), slog.Any("error", err))
-	}
+	// This node holds the will's only copy now. No lock is held here, so
+	// the publish runs inline, retried until Stop.
+	b.publishHeld(pw.tenantID, pw.clientID, rec.Will, "")
 
 	return true, false
 }
