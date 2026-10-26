@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -265,6 +266,76 @@ func (b *Broker) repin(s *session) {
 	b.startReplay(s, cl)
 }
 
+// orderResend makes mochi resend cl's inflight messages in log order at the
+// CONNACK of a session it took over or restored: mochi sorts them by the
+// low 16 bits of Created, whole seconds, so deliveries made within one
+// second would come back in any order. Tagged ones get Created in their
+// sequence's order, just in the past; untagged ones (inbound PUBREC
+// reservations) go first.
+func orderResend(cl *mqtt.Client) {
+	all := cl.State.Inflight.GetAll(false)
+	if len(all) < 2 {
+		return
+	}
+
+	type tagged struct {
+		pk  packets.Packet
+		seq uint64
+	}
+
+	var (
+		seqd  []tagged
+		other []packets.Packet
+	)
+
+	for _, pk := range all {
+		if seq, ok := seqOf(pk); ok {
+			seqd = append(seqd, tagged{pk, seq})
+		} else {
+			other = append(other, pk)
+		}
+	}
+
+	if len(seqd) < 2 {
+		return
+	}
+
+	slices.SortFunc(seqd, func(a, b tagged) int { return cmp.Compare(a.seq, b.seq) })
+
+	base := time.Now().Unix() - int64(len(all))
+
+	for _, pk := range other {
+		pk.Created = base - 1
+		cl.State.Inflight.Set(pk)
+	}
+
+	for i, t := range seqd {
+		t.pk.Created = base + int64(i)
+		cl.State.Inflight.Set(t.pk)
+	}
+}
+
+// pinIfFull is noteFull for something that filled cl's inflight map outside
+// the tenant's lock (an inbound QoS 2 reservation, a takeover's clone): a
+// message injected between the last pinFull and now may already have been
+// dropped, so a live session is pinned at lp, the live position read before
+// the map grew, and sent back to replaying.
+func (n *clusterNode) pinIfFull(s *session, cl *mqtt.Client, lp uint64) {
+	if cl.State.Inflight.Len() < n.maxInflight {
+		return
+	}
+
+	s.mu.Lock()
+	repin := s.mode == modeLive && s.pinLocked(lp)
+	s.mu.Unlock()
+
+	n.noteFull(s, cl)
+
+	if repin {
+		go n.b.repin(s)
+	}
+}
+
 // noteFull marks s as one whose inflight map is full, so the next message
 // injected pins it (pinFull): mochi drops a delivery that does not fit
 // without telling any hook.
@@ -321,6 +392,10 @@ func (b *Broker) deliverLog(tenantID string, m cluster.LogMessage) error {
 	}
 
 	n.pinFull(tt, m.Seq)
+
+	if hook := n.beforeInject; hook != nil {
+		hook(m.Seq)
+	}
 
 	origin := ""
 	if m.ClientID != "" {
@@ -438,6 +513,12 @@ func (n *clusterNode) flip(tt *tenantTrack, s *session) {
 	s.mu.Lock()
 	s.mode = modeLive
 	s.liveFloor = s.pos
+
+	if s.pinned && s.pin <= s.pos {
+		// Set while replaying, which covered it.
+		s.pinned = false
+	}
+
 	loaded := s.loaded
 	s.loaded = nil
 	s.skip, s.skipThrough, s.redo = nil, 0, nil
@@ -484,9 +565,21 @@ func (n *clusterNode) holdOut(s *session, cl *mqtt.Client, subs []packets.Subscr
 	}
 }
 
-// startReplay starts s's replay for cl, after its CONNACK.
+// startReplay starts s's replay for cl, after its CONNACK, stopping any
+// replay still running for the session first. It starts nothing when cl no
+// longer serves the session (a handover got there first: the new
+// connection starts its own at its CONNACK).
 func (b *Broker) startReplay(s *session, cl *mqtt.Client) {
 	n := b.cluster
+
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
+	n.stopReplayLocked(s)
+
+	if n.client(s) != cl {
+		return
+	}
 
 	// What mochi's takeover put into the index (a replay handed over on
 	// this node) comes out again.
@@ -503,30 +596,70 @@ func (b *Broker) startReplay(s *session, cl *mqtt.Client) {
 	done := make(chan struct{})
 
 	s.mu.Lock()
-	oldCancel := s.replayCancel
 	s.replayCancel, s.replayDone = cancel, done
 	s.mu.Unlock()
-
-	if oldCancel != nil {
-		oldCancel() // a replay that ended waiting
-	}
 
 	go b.runReplay(ctx, s, cl, done)
 }
 
 // stopReplay ends s's replay, if one runs, and waits for it.
 func (n *clusterNode) stopReplay(s *session) {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
+	n.stopReplayLocked(s)
+}
+
+// stopReplayLocked is stopReplay under s.replayMu. The replay's writer is
+// abandoned: it sends nothing more, even when its blocked write comes back
+// (a handover's new connection gets what the old one had in flight from
+// mochi's clone instead). What it had queued and not sent is given back to
+// the replay: the position goes back below the first of it, and the
+// deliveries in flight above that are marked not to send again, so the next
+// replay, for whichever connection, sends it in order.
+func (n *clusterNode) stopReplayLocked(s *session) {
 	s.mu.Lock()
 	cancel, done := s.replayCancel, s.replayDone
 	s.replayCancel, s.replayDone = nil, nil
 	s.mu.Unlock()
 
-	if cancel == nil {
+	if cancel != nil {
+		cancel()
+		<-done
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.writer != nil {
+		s.writer.abandoned = true
+		s.writer = nil
+	}
+
+	if len(s.queued) == 0 {
 		return
 	}
 
-	cancel()
-	<-done
+	first := uint64(0)
+	for seq := range s.queued {
+		if first == 0 || seq < first {
+			first = seq
+		}
+	}
+
+	s.pos = min(s.pos, first-1)
+	s.replaySeen = min(s.replaySeen, s.pos)
+	s.queued = nil
+
+	if s.skip == nil {
+		s.skip = make(map[uint64]struct{})
+	}
+
+	for _, seq := range s.out {
+		if seq > s.pos {
+			s.skip[seq] = struct{}{}
+		}
+	}
 }
 
 // replayBuffer bounds the replayed packets of one session waiting for its
@@ -546,6 +679,9 @@ type replayOut struct {
 	q       chan packets.Packet
 	pending atomic.Int64 // queued or being written
 	failed  atomic.Bool  // a write failed: the connection is gone
+	// abandoned (under s.mu) is set when the replay stops: nothing more is
+	// registered or written.
+	abandoned bool
 }
 
 func newReplayOut(n *clusterNode, s *session, cl *mqtt.Client) *replayOut {
@@ -580,17 +716,34 @@ func (ro *replayOut) send(pk packets.Packet) bool {
 
 		pk.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
 
+		// Registered under s.mu with the abandon check, so a stopped
+		// replay never leaves a delivery behind it.
+		s.mu.Lock()
+
+		if ro.abandoned {
+			s.mu.Unlock()
+
+			return false
+		}
+
 		if cl.State.Inflight.Set(pk) {
 			atomic.AddInt64(&ro.n.mochi.Info.Inflight, 1)
 		}
 
-		s.mu.Lock()
 		s.out[pk.PacketID] = seq
 		delete(s.queued, seq)
 		s.mu.Unlock()
 
 		cl.State.Inflight.DecreaseSendQuota()
 		ro.n.noteFull(s, cl)
+	} else {
+		s.mu.Lock()
+		abandoned := ro.abandoned
+		s.mu.Unlock()
+
+		if abandoned {
+			return false
+		}
 	}
 
 	return cl.WritePacket(pk) == nil
@@ -609,6 +762,10 @@ func (b *Broker) runReplay(ctx context.Context, s *session, cl *mqtt.Client, don
 	delay := replayPoll
 
 	ro := newReplayOut(n, s, cl)
+
+	s.mu.Lock()
+	s.writer = ro
+	s.mu.Unlock()
 	defer close(ro.q)
 
 	go ro.run()
@@ -979,6 +1136,9 @@ func (n *clusterNode) onPublishDropped(cl *mqtt.Client, pk packets.Packet) {
 	if s.out[pk.PacketID] == seq {
 		delete(s.out, pk.PacketID)
 	}
+
+	// Not sent after all: a replay must not pass over it.
+	delete(s.skip, seq)
 
 	s.mu.Unlock()
 

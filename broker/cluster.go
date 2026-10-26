@@ -157,6 +157,9 @@ type clusterNode struct {
 	// loadHook runs first in loadSession and fails it with its error.
 	afterAcquire func()
 	loadHook     func() error
+	// beforeInject runs in deliverLog between pinFull and the injection,
+	// under the tenant's lock.
+	beforeInject func(seq uint64)
 }
 
 // routeRef is one session's reference on a (tenant, filter) route. It is

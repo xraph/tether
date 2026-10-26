@@ -144,6 +144,13 @@ type session struct {
 
 	replayCancel context.CancelFunc
 	replayDone   chan struct{}
+	// writer is the running replay's writer (under mu); replayMu serialises
+	// starting and stopping replays.
+	writer   *replayOut
+	replayMu sync.Mutex
+	// handoverPos is the tenant's live position when a connection of this
+	// node took the session over (handOver), for established.
+	handoverPos uint64
 }
 
 // touch marks the session's record as changed.
@@ -594,10 +601,6 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 		s.tt.mu.Unlock()
 	}
 
-	// A replay running for the old connection stops; OnSessionEstablished
-	// starts it again for this one.
-	n.stopReplay(s)
-
 	n.sessMu.Lock()
 	s.prevCl = prevCl
 	s.cl, s.st = cl, st
@@ -605,6 +608,20 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 	s.ackOnce = sync.Once{}
 	s.closedAt = time.Time{}
 	n.sessMu.Unlock()
+
+	// The live position before mochi clones the old connection's inflight
+	// map into this one: if the clone fills the map, the cursor is held
+	// there (established).
+	s.mu.Lock()
+	s.handoverPos = s.tt.livePos.Load()
+	s.mu.Unlock()
+
+	// A replay running for the old connection stops, its writer abandoned
+	// and what it had queued given back; OnSessionEstablished starts the
+	// replay again for this one. The client is switched first, so a replay
+	// started for the old one meanwhile (a repin) is stopped here or never
+	// starts.
+	n.stopReplay(s)
 }
 
 // loadSession prepares a session resumed from the cell for mochi: the
@@ -924,8 +941,18 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 	s.markConnacked()
 
 	if s.tracked {
-		// What mochi cloned or resent may have filled the inflight map.
-		n.noteFull(s, cl)
+		// What mochi cloned may have filled the inflight map before this
+		// ran, and a message injected meanwhile been dropped: the cursor
+		// stays at the live position from before the clone.
+		s.mu.Lock()
+		pos := s.handoverPos
+		s.mu.Unlock()
+
+		if pos > 0 {
+			n.pinIfFull(s, cl, pos)
+		} else {
+			n.noteFull(s, cl)
+		}
 	}
 
 	if b.state.owner(cl.ID) != st {

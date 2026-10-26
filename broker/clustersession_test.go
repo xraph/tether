@@ -174,6 +174,9 @@ type rawSession struct {
 	held      map[uint16]string
 	delivered map[string]int
 	dups      int
+	// onDeliver, when set before connecting, sees every payload handed to
+	// the application, in arrival order.
+	onDeliver func(payload string)
 }
 
 func newRawSession() *rawSession {
@@ -313,6 +316,10 @@ func (rc *rawConn) onPublish(p *packets.Publish) {
 	}
 
 	s.mu.Unlock()
+
+	if s.onDeliver != nil {
+		s.onDeliver(payload)
+	}
 
 	var ack io.WriterTo
 
@@ -1210,4 +1217,154 @@ func TestIdleSessionTakenOverByWatch(t *testing.T) {
 			t.Fatalf("%s: still served on n1 after n2 took it", id)
 		}
 	}
+}
+
+// A reconnect to the same node while the session's replay is stuck on a
+// connection that stopped reading: the stuck writer is abandoned, what it
+// had queued goes back to the replay, and the new connection gets every
+// message, in order (mochi resends what the old one had in flight, ordered
+// by sequence at the CONNACK, then the replay goes on from there).
+func TestHandoverDuringStalledReplay(t *testing.T) {
+	c := startCluster(t, 1)
+	a := c.nodes[0]
+	tid := c.t1.ID.String()
+
+	sess := newRawSession()
+
+	first := dialRaw(t, c.addr(0), "hand", sess, false)
+	require.Equal(t, byte(0), first.ack(t).ReasonCode)
+	first.subscribe(t, "hb/#", 1)
+	first.leave(t)
+	waitOffline(t, a, tid, "hand")
+
+	pub, _, err := connect5(t, c.addr(0), "hand-pub", "u1", true)
+	require.NoError(t, err)
+
+	const total = 300
+
+	big := strings.Repeat("x", 48*1024)
+
+	for i := range total {
+		require.Equal(t, byte(0), publishQ(t, pub, "hb/x", strconv.Itoa(i)+":"+big, 1))
+	}
+
+	stalled := dialRawStalled(t, c.addr(0), "hand", newRawSession())
+	require.True(t, stalled.ack(t).SessionPresent)
+
+	replayed := a.cluster.replayed.Load()
+	eventually(t, "the stalled replay to stop moving", func() bool {
+		now := a.cluster.replayed.Load()
+		moved := now != replayed
+		replayed = now
+
+		if moved {
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		return !moved && now > 0
+	})
+
+	// Same client ID, same node, the old connection still open.
+	got := newRawSession()
+	order := make(chan int, 4*total)
+	got.onDeliver = func(payload string) {
+		i, _, _ := strings.Cut(payload, ":")
+		n, err := strconv.Atoi(i)
+		if err == nil {
+			order <- n
+		}
+	}
+
+	again := dialRaw(t, c.addr(0), "hand", got, false)
+	require.True(t, again.ack(t).SessionPresent)
+
+	next := 0
+	deadline := time.After(logWait)
+
+	for next < total {
+		select {
+		case n := <-order:
+			require.LessOrEqual(t, n, next, "message %d came before %d", n, next)
+
+			if n == next {
+				next++
+			}
+		case <-deadline:
+			t.Fatalf("stuck at message %d of %d", next, total)
+		}
+	}
+}
+
+// An inbound QoS 2 reservation that fills the client's inflight map between
+// the reader's full check and the injection of the next message: mochi drops
+// that message without a hook. The reservation pins the cursor at the live
+// position read before it and sends the session back to replaying, so the
+// message arrives once the window drains.
+func TestReservationFillsWindowBeforeInject(t *testing.T) {
+	const window = 3
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	cfg := testConfig()
+	cfg.MaxInflight = window
+
+	var (
+		armed   atomic.Bool
+		reached = make(chan struct{})
+		release = make(chan struct{})
+		gate    = newAppendGate()
+	)
+
+	c := startClusterWith(t, 1, cfg, map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.cluster.holdAppend = gate.hold
+			b.cluster.beforeInject = func(uint64) {
+				if armed.CompareAndSwap(true, false) {
+					close(reached)
+					<-release
+				}
+			}
+		})
+	a := c.nodes[0]
+	nsID := namespacedID(t1.ID.String(), "rs")
+
+	sess := newRawSession()
+	rc := dialRaw(t, c.addr(0), "rs", sess, true)
+	require.Equal(t, byte(0), rc.ack(t).ReasonCode)
+	rc.subscribe(t, "w/#", 1)
+
+	pub, _, err := connect5(t, c.addr(0), "rs-pub", "u1", true)
+	require.NoError(t, err)
+
+	for i := range window - 1 {
+		require.Equal(t, byte(0), publishQ(t, pub, "w/x", strconv.Itoa(i), 1))
+	}
+
+	inflight := func() int {
+		cl, ok := a.server.Clients.Get(nsID)
+		if !ok {
+			return -1
+		}
+
+		return cl.State.Inflight.Len()
+	}
+
+	eventually(t, "the first deliveries", func() bool { return inflight() == window-1 })
+
+	// The next message stops in the reader after its full check.
+	armed.Store(true)
+	require.Equal(t, byte(0), publishQ(t, pub, "w/x", "late", 1))
+	<-reached
+
+	// The client's own QoS 2 publish reserves the last slot meanwhile.
+	gate.close()
+	rc.send(&packets.Publish{Topic: "other/x", QoS: 2, PacketID: 9, Payload: []byte("q2"), Properties: &packets.Properties{}})
+	eventually(t, "the reservation", func() bool { return inflight() == window })
+
+	close(release) // "late" does not fit and is dropped by mochi
+
+	rc.releaseAcks()
+	gate.open()
+
+	eventually(t, "the message that did not fit", func() bool { return sess.count("late") == 1 })
 }

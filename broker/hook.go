@@ -588,6 +588,10 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 				return pk
 			}
 
+			if h.b.cluster != nil {
+				orderResend(cl)
+			}
+
 			if n := h.b.cluster; n != nil && !n.mayResend(st) {
 				// Another node took the session while this CONNECT was
 				// loading it: what it restored must not be resent from here

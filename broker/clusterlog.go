@@ -794,14 +794,23 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 	}
 
 	if qos == 2 {
+		// The reservation shares the inflight map with the session's
+		// deliveries and is made outside the tenant's delivery lock: if it
+		// fills the map, a message injected right after may be dropped, so
+		// the cursor is held at the live position read before (cursor.go).
+		s := n.sessionOf(cl)
+
+		var lp uint64
+		if s != nil && s.tracked {
+			lp = s.tt.livePos.Load()
+		}
+
 		if !st.pipe.reserve(it) {
 			return
 		}
 
-		// The reservation shares the inflight map with the session's
-		// deliveries: a full map must pin the session (cursor.go).
-		if s := n.sessionOf(cl); s != nil && s.tracked {
-			n.noteFull(s, cl)
+		if s != nil && s.tracked {
+			n.pinIfFull(s, cl, lp)
 		}
 	}
 
