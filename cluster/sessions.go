@@ -659,16 +659,30 @@ func (s *Sessions) Entries(ctx context.Context, tenant string) ([]SessionEntry, 
 }
 
 // OwnedBy returns every live session of the cell, in any tenant, whose record
-// names nodeID as its owner, in no particular order. It reads the whole bucket
-// through a watcher, so it costs a pass over every key of the cell. The
-// revisions are those the pass read: a write that uses one loses its CAS if
-// the key moved since.
-func (s *Sessions) OwnedBy(ctx context.Context, nodeID string) ([]SessionEntry, error) {
-	if nodeID == "" {
-		return nil, fmt.Errorf("cluster: owned sessions: empty node ID: %w", tether.ErrInvalidInput)
+// names one of nodeIDs as its owner, in no particular order. It reads the
+// whole bucket through a watcher, so it costs one pass over every key of the
+// cell however many nodes it asks for. The revisions are those the pass read:
+// a write that uses one loses its CAS if the key moved since.
+func (s *Sessions) OwnedBy(ctx context.Context, nodeIDs ...string) ([]SessionEntry, error) {
+	if len(nodeIDs) == 0 {
+		return nil, fmt.Errorf("cluster: owned sessions: no node ID: %w", tether.ErrInvalidInput)
 	}
 
-	return s.scan(ctx, ">", "list owned sessions", func(rec *SessionRecord) bool { return rec.Owner == nodeID })
+	want := make(map[string]struct{}, len(nodeIDs))
+
+	for _, id := range nodeIDs {
+		if id == "" {
+			return nil, fmt.Errorf("cluster: owned sessions: empty node ID: %w", tether.ErrInvalidInput)
+		}
+
+		want[id] = struct{}{}
+	}
+
+	return s.scan(ctx, ">", "list owned sessions", func(rec *SessionRecord) bool {
+		_, ok := want[rec.Owner]
+
+		return ok
+	})
 }
 
 // scan reads the keys under filter through a watcher and returns those whose

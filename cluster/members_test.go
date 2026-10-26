@@ -252,6 +252,10 @@ func TestPeerDeadAfterLease(t *testing.T) {
 		t.Fatal("the only live node is not the leader for the dead one")
 	}
 
+	if d := a.m.Dead(); len(d) != 1 || d[0] != "n2" {
+		t.Fatalf("Dead() = %v, want [n2]", d)
+	}
+
 	// Once: nothing more arrives.
 	time.Sleep(500 * time.Millisecond)
 
@@ -272,6 +276,10 @@ func TestPeerDeadAfterLease(t *testing.T) {
 	t.Cleanup(b2.Stop)
 
 	eventually(t, 5*time.Second, "A to see B again", liveIs(a.m, "n1", "n2"))
+
+	if d := a.m.Dead(); len(d) != 0 {
+		t.Fatalf("Dead() after the peer came back = %v, want none", d)
+	}
 
 	if n := len(a.ev.deadEvents("n2")); n != 1 {
 		t.Fatalf("OnPeerDead fired %d times after the peer came back, want 1", n)

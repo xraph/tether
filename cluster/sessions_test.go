@@ -814,6 +814,15 @@ func TestOwnedBy(t *testing.T) {
 		t.Fatalf("OwnedBy of a node with nothing = %v, %v", owned, err)
 	}
 
+	// Several owners in one pass.
+	if owned, err = b.OwnedBy(ctx, "n1", "n2", "n9"); err != nil || len(owned) != 4 {
+		t.Fatalf("OwnedBy(n1, n2, n9) = %d entries, %v; want 4", len(owned), err)
+	}
+
+	if _, err = b.OwnedBy(ctx); !errors.Is(err, tether.ErrInvalidInput) {
+		t.Fatalf("OwnedBy() = %v, want ErrInvalidInput", err)
+	}
+
 	if _, err = b.OwnedBy(ctx, ""); !errors.Is(err, tether.ErrInvalidInput) {
 		t.Fatalf("OwnedBy(\"\") = %v, want ErrInvalidInput", err)
 	}

@@ -9,10 +9,12 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eclipse/paho.golang/packets"
+	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether"
@@ -33,12 +35,13 @@ const (
 	liveWait = 20 * time.Second
 )
 
-// liveCell is a cell whose nodes run Members, with node 0 reaching NATS
-// through proxy.
+// liveCell is a cell whose nodes run Members, with the first nodes reaching
+// NATS through proxies (proxy is node 0's).
 type liveCell struct {
 	*testCell
 
 	members []*cluster.Members
+	proxies []*chaos.Proxy
 	proxy   *chaos.Proxy
 }
 
@@ -47,6 +50,14 @@ type liveCell struct {
 // node 0 behind a fault proxy (NoDiscovery keeps it there). Users u1 and u2
 // may publish and subscribe anything, as in startCluster.
 func startLiveCell(t *testing.T, nodes int) *liveCell {
+	t.Helper()
+
+	return startLiveCellWith(t, nodes, 1, nil)
+}
+
+// startLiveCellWith is startLiveCell with nodes 0 to proxied-1 behind fault
+// proxies and before run on each broker before it starts.
+func startLiveCellWith(t *testing.T, nodes, proxied int, before func(*Broker)) *liveCell {
 	t.Helper()
 
 	t1, t2 := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
@@ -61,8 +72,8 @@ func startLiveCell(t *testing.T, nodes int) *liveCell {
 		ctx, cancel := context.WithTimeout(context.Background(), liveWait)
 		defer cancel()
 
-		if c.proxy != nil {
-			c.proxy.SetMode(chaos.Both, chaos.Pass)
+		for _, p := range c.proxies {
+			p.SetMode(chaos.Both, chaos.Pass)
 		}
 
 		for _, b := range c.nodes {
@@ -78,8 +89,8 @@ func startLiveCell(t *testing.T, nodes int) *liveCell {
 		}
 
 		// Last, so the nodes stop over a working link.
-		if c.proxy != nil {
-			c.proxy.Close()
+		for _, p := range c.proxies {
+			p.Close()
 		}
 	})
 
@@ -95,11 +106,12 @@ func startLiveCell(t *testing.T, nodes int) *liveCell {
 		ccfg.Heartbeat = liveHeartbeat
 		ccfg.Lease = liveLease
 
-		if i == 0 {
+		if i < proxied {
 			p, err := chaos.NewProxy(strings.TrimPrefix(ccfg.URLs[0], "nats://"))
 			require.NoError(t, err)
 
-			c.proxy = p
+			c.proxies = append(c.proxies, p)
+			c.proxy = c.proxies[0]
 			ccfg.URLs = []string{"nats://" + p.Addr()}
 		}
 
@@ -123,6 +135,10 @@ func startLiveCell(t *testing.T, nodes int) *liveCell {
 			Cluster: &Cluster{Conn: conn, Config: ccfg, Members: m},
 		})
 		require.NoError(t, err)
+
+		if before != nil {
+			before(b)
+		}
 
 		require.NoError(t, b.Start(t.Context()))
 		c.nodes = append(c.nodes, b)
@@ -650,6 +666,167 @@ func TestUnfenceReclaimsDroppedSessions(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, rec.Owner)
 	require.Nil(t, rec.Will)
+}
+
+// Fix round 1 (finding 1): n1 dies while n2, the lowest live node in n3's
+// view, is about to die itself. n3 is not n1's leader when n1 is declared
+// dead, and n2 is fenced by then, so nobody acts on n1's death; once n2 is
+// declared dead n3 leads for both and its sweep settles both nodes' keys.
+func TestCorrelatedDeathsSwept(t *testing.T) {
+	c := startLiveCellWith(t, 3, 2, nil)
+	n3 := c.nodes[2]
+
+	s3, _, err := connect5(t, c.addr(2), "s3", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, s3, "will/#", 1, false)
+
+	x1 := rawConnectWill(t, c.addr(0), willSpec{id: "x1", topic: "will/x1", qos: 1, expiry: 3600})
+	x2 := rawConnectWill(t, c.addr(1), willSpec{id: "x2", topic: "will/x2", qos: 1, expiry: 3600})
+
+	cut := c.cut()
+
+	requireClosed(t, x1)
+
+	// n2 goes 1.5 s later: fenced (at about 2 s) before n3 declares n1 dead
+	// (at about 3 s), declared dead itself at about 4.5 s. A fixed schedule
+	// is the point of the test.
+	time.Sleep(time.Until(cut.Add(1500 * time.Millisecond)))
+	c.proxies[1].SetMode(chaos.Both, chaos.Blackhole)
+	requireClosed(t, x2)
+
+	got := map[string]time.Duration{}
+
+	for len(got) < 2 {
+		m := recvLive(t, s3)
+		got[m.Topic] = time.Since(cut)
+	}
+
+	require.Contains(t, got, "will/x1")
+	require.Contains(t, got, "will/x2")
+	require.GreaterOrEqual(t, got["will/x1"], liveDead+1500*time.Millisecond-500*time.Millisecond,
+		"n1's will waits for n2's death, when n3 becomes its leader")
+	noMoreMsgs(t, s3)
+
+	require.Equal(t, uint64(2), n3.cluster.willsSent.Load())
+	require.ElementsMatch(t, []string{"n1", "n2"}, c.members[2].Dead())
+
+	for _, id := range []string{"x1", "x2"} {
+		rec, err := c.record(t, 2, id)
+		require.NoError(t, err)
+		require.Empty(t, rec.Owner)
+		require.Nil(t, rec.Will)
+	}
+
+	// Cleared: later ticks read nothing more.
+	sweeps := n3.cluster.sweeps.Load()
+
+	time.Sleep(2 * liveLease)
+	require.Equal(t, sweeps, n3.cluster.sweeps.Load(), "a cleared dead node is not swept again")
+}
+
+// Fix round 1 (finding 2): once the CAS that clears a will from its key is
+// won, the reclaiming node holds the only copy, so it keeps trying to
+// publish it, here for longer than the 5 s a local will gets.
+func TestReclaimedWillRetried(t *testing.T) {
+	var failUntil atomic.Int64
+
+	c := startLiveCellWith(t, 2, 1, func(b *Broker) {
+		if b.cluster.Config.NodeID == "n2" {
+			b.cluster.willFault = func() error {
+				if time.Now().UnixNano() < failUntil.Load() {
+					return errors.New("injected will fault")
+				}
+
+				return nil
+			}
+		}
+	})
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 3600})
+
+	cut := c.cut()
+	until := cut.Add(liveDead + 7*time.Second)
+	failUntil.Store(until.UnixNano())
+
+	requireClosed(t, x)
+
+	// The key is settled (its will cleared) while every publish fails.
+	eventuallyLive(t, "x's key settled", func() bool {
+		rec, rerr := c.record(t, 1, "x")
+
+		return rerr == nil && rec.Owner == "" && rec.Will == nil
+	})
+	require.True(t, time.Now().Before(until))
+
+	m := recvLive(t, sb)
+	require.Equal(t, "will/x", m.Topic)
+	require.False(t, time.Now().Before(until), "published only once the fault is gone")
+	noMoreMsgs(t, sb)
+	require.Equal(t, uint64(1), c.nodes[1].cluster.willsSent.Load())
+}
+
+// Fix round 1 (finding 3): a client that disconnects normally while its node
+// is cut from NATS leaves the CONNECT's will in its key (the final write is
+// skipped once fenced). After the unfence the node settles the key itself,
+// and publishes no will: the client never owed one.
+func TestCleanDisconnectDuringOutageNoWill(t *testing.T) {
+	c := startLiveCellWith(t, 2, 1, func(b *Broker) {
+		if b.cluster.Config.NodeID != "n1" {
+			return
+		}
+
+		b.disconnectHold = func(cl *mqtt.Client, removed bool) {
+			if !removed || !strings.HasSuffix(cl.ID, "/c") {
+				return
+			}
+
+			// The session ends once the node is fenced.
+			deadline := time.Now().Add(liveWait)
+			for !b.cluster.fenced.Load() && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	})
+	a := c.nodes[0]
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	conn := rawConnectWill(t, c.addr(0), willSpec{id: "c", topic: "will/c", qos: 1, expiry: 3600})
+
+	c.cut()
+	writePacket(t, conn, &packets.Disconnect{ReasonCode: 0, Properties: &packets.Properties{}})
+	requireClosed(t, conn)
+
+	nsID := namespacedID(c.t1.ID.String(), "c")
+
+	eventually(t, "c's end noted as owing no will", func() bool {
+		a.cluster.willsMu.Lock()
+		defer a.cluster.willsMu.Unlock()
+
+		_, ok := a.cluster.noWill[nsID]
+
+		return ok && a.cluster.fenced.Load()
+	})
+
+	c.proxy.SetMode(chaos.Both, chaos.Pass)
+
+	eventuallyLive(t, "c's key settled", func() bool {
+		rec, rerr := c.record(t, 1, "c")
+
+		return rerr == nil && rec.Owner == "" && rec.Will == nil
+	})
+
+	time.Sleep(time.Second)
+	noMoreMsgs(t, sb)
+	require.Zero(t, a.cluster.willsSent.Load())
+	require.Zero(t, c.nodes[1].cluster.willsSent.Load())
+	require.Equal(t, []string{"n1", "n2"}, c.members[1].Live(), "n2 never saw n1 dead")
 }
 
 // Without a cluster the broker is always healthy as far as the cell goes.

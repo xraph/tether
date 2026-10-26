@@ -294,6 +294,27 @@ func (m *Members) Live() []string {
 	return m.liveLocked("")
 }
 
+// Dead returns the peers this node has declared dead and not heard from
+// since, sorted. A dead peer stays in it until it heartbeats again, so a
+// caller that missed or lost the OnPeerDead work for one can find it here
+// later. It is what this node last decided, fenced or not.
+func (m *Members) Dead() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var out []string
+
+	for id, p := range m.peers {
+		if p.dead {
+			out = append(out, id)
+		}
+	}
+
+	sort.Strings(out)
+
+	return out
+}
+
 // Fenced reports whether this node is fenced.
 func (m *Members) Fenced() bool {
 	m.mu.Lock()

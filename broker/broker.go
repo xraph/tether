@@ -257,8 +257,10 @@ func (b *Broker) Start(ctx context.Context) error {
 
 		if b.cluster.Members != nil {
 			// Keys this node owns from before a restart under the same ID:
-			// its peers never saw it die, so it settles them itself.
+			// its peers never saw it die, so it settles them itself. Then
+			// the sweep of dead peers' keys (sweepDead).
 			b.cluster.goLive(func() { b.reclaim(b.cluster.Config.NodeID) })
+			b.cluster.goLive(b.sweepLoop)
 		}
 	}
 

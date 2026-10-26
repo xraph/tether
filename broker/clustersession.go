@@ -160,7 +160,8 @@ type session struct {
 	// willOwed, set by clusterWill, says the will was not published (the
 	// node was fenced, or the append failed): the key keeps it, and finish
 	// writes nothing but leaves the key to a reclaim.
-	willOwed bool
+	willOwed  bool
+	willMsgID string
 }
 
 // touch marks the session's record as changed.
@@ -407,6 +408,10 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		return nil, fmt.Errorf("tether/broker: acquire session: %w", err)
 	}
 
+	// A new epoch: whatever this node noted about the key's previous one is
+	// moot.
+	n.clearNoWill(nsID, 0)
+
 	if handover {
 		old.rev = rev
 		old.epoch.Store(rec.Epoch)
@@ -556,11 +561,18 @@ func (b *Broker) giveBack(s *session, rec, prev *cluster.SessionRecord, rev uint
 	back.ExpirySeconds = prev.ExpirySeconds
 	back.DisconnectedAt = time.Now().UTC()
 
+	ttl := time.Duration(max(prev.ExpirySeconds, 1)) * time.Second
+
 	ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
 	defer cancel()
 
-	if _, err := n.Sessions.Expire(ctx, s.tenantID, s.rawID, rev, &back, time.Duration(max(prev.ExpirySeconds, 1))*time.Second); err != nil {
-		n.log.Warn("tether: session key not given back after a failed resume", slog.String("client", s.nsID), slog.Any("error", err))
+	if _, err := n.Sessions.Expire(ctx, s.tenantID, s.rawID, rev, &back, ttl); err != nil && !errors.Is(err, cluster.ErrLostCAS) {
+		// Until it goes through, the key looks like a live connection of
+		// this node with the refused CONNECT's will: this node's own
+		// reclaim settles it without the will, and the write is retried.
+		n.log.Warn("tether: session key not given back after a failed resume, retrying", slog.String("client", s.nsID), slog.Any("error", err))
+		n.markNoWill(s.nsID, rec.Epoch)
+		n.goLive(func() { b.retryGiveBack(s.tenantID, s.rawID, rev, &back, ttl) })
 	}
 
 	n.qos2Mu.Lock()
@@ -568,6 +580,38 @@ func (b *Broker) giveBack(s *session, rec, prev *cluster.SessionRecord, rev uint
 	n.qos2Mu.Unlock()
 
 	n.releaseAll(s.nsID, s.tenantID)
+}
+
+// retryGiveBack retries giveBack's write until it goes through, the key
+// moves (a lost CAS: a new CONNECT, or this node's reclaim settled it), or
+// the broker stops; it waits while the node is fenced.
+func (b *Broker) retryGiveBack(tenantID, rawID string, rev uint64, back *cluster.SessionRecord, ttl time.Duration) {
+	n := b.cluster
+	nsID := namespacedID(tenantID, rawID)
+	delay := willRetry
+
+	for {
+		if !n.fenced.Load() {
+			ctx, cancel := context.WithTimeout(n.ctx, sessionWriteWait)
+			_, err := n.Sessions.Expire(ctx, tenantID, rawID, rev, back, ttl)
+
+			cancel()
+
+			if err == nil || errors.Is(err, cluster.ErrLostCAS) {
+				n.clearNoWill(nsID, back.Epoch)
+
+				return
+			}
+		}
+
+		select {
+		case <-n.ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, willRetryMax)
+	}
 }
 
 // handOver gives s, a session this node serves on another connection, to
@@ -1090,8 +1134,16 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 	}
 
 	s.mu.Lock()
-	owed := s.willOwed
+	owed, msgID, delayed := s.willOwed, s.willMsgID, s.willDelay > 0
 	s.mu.Unlock()
+
+	if !owed && !delayed && !lost && !deleting {
+		// No will is owed (a normal DISCONNECT, or one already published or
+		// withheld), but the key keeps the CONNECT's will until the write
+		// below clears it, which may fail or be skipped (fenced): this
+		// node's own reclaim must then settle it without the will.
+		n.markNoWill(s.nsID, s.epoch.Load())
+	}
 
 	// The fence is read after the session is marked ended, under its lock:
 	// a reclaim of this node's keys at the unfence either runs after this
@@ -1108,7 +1160,7 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 	case owed:
 		// The key keeps the will, which this node still owes: it settles
 		// the key like a reclaim, once this session's lock is free.
-		n.goLive(func() { b.reclaimID(s.tenantID, s.rawID) })
+		n.goLive(func() { b.reclaimID(s.tenantID, s.rawID, msgID) })
 
 		return
 	case expire || !s.tracked:
@@ -1125,6 +1177,10 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 		defer cancel()
 
 		err := n.persist(ctx, s, ttl)
+		if errors.Is(err, errSessionLost) {
+			n.clearNoWill(s.nsID, 0)
+		}
+
 		if err != nil && !errors.Is(err, errSessionLost) && !errors.Is(err, errFenced) {
 			n.log.Warn("tether: final session write failed; the next owner replays from the last cursor written",
 				slog.String("client", s.nsID), slog.Any("error", err))
@@ -1164,7 +1220,11 @@ func (b *Broker) deleteKey(s *session) {
 	err := n.Sessions.Delete(ctx, s.tenantID, s.rawID, s.rev)
 	if err != nil && !errors.Is(err, cluster.ErrLostCAS) {
 		n.log.Warn("tether: session key not deleted", slog.String("client", s.nsID), slog.Any("error", err))
+
+		return
 	}
+
+	n.clearNoWill(s.nsID, s.epoch.Load())
 }
 
 // evictLocal evicts a closed client's leftover session from mochi.
@@ -1410,6 +1470,11 @@ func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration
 	n.sessionWrites.Add(1)
 	s.rev = rev
 	s.done = ttl > 0
+
+	if s.done {
+		// The last record is in, with no will unless a delayed one is held.
+		n.clearNoWill(s.nsID, rec.Epoch)
+	}
 
 	s.mu.Lock()
 	s.savedGen = gen
