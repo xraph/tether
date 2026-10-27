@@ -272,6 +272,8 @@ The pump talks to node 1 and the display hears it on node 3. If you kill a node 
 
 The routes listen on loopback here, so nothing off the machine can reach them. If you bind `cluster_listen` (or the NATS client `embedded.listen`) to a real interface, Tether won't start until you either set `embedded.user` and `embedded.password`, the same pair on every node, or set `embedded.insecure: true`. Think hard before you pick the second one. Anyone who reaches an open route port can join the cell as a NATS server and read every tenant's traffic.
 
+The user and password only decide who gets in. Route and client traffic still crosses the wire in plain text, and embedded mode has no TLS option, so keep those ports on a network you trust.
+
 One catch with the binary: it keeps tenants, keys and roles in SQLite, and the nodes of a cell have to share them, so a cell of binaries lives on one host. To spread a cell across machines, mount the extension in your own app on PostgreSQL (see [Use it with Forge](#use-it-with-forge)) with the same `cluster:` block, or `extension.WithCluster(cluster.Config{...})` in code.
 
 ### NATS you run
@@ -290,7 +292,9 @@ You give every node the same block and its own ID. With `TETHER_NODE_ID` the fil
 
 `log_max_age` is how long JetStream keeps a QoS 1 or 2 message for a session that's offline, 7 days by default. Keep `broker.max_session_expiry` at or under it. A session that stays away longer still has its subscriptions when it comes back, but the messages older than the log's age are gone, and Tether logs a warning at start when the two don't line up.
 
-A node that can't renew its lease for half of it fences itself: it drops its clients and refuses new ones until NATS answers again, so it never acts on sessions the rest of the cell may already have taken over. The extension's health check fails while that lasts, or while JetStream is out of reach, and it shows up in `/_/health`. `forge_tether_cluster_fenced` reads 1 at the same time.
+NATS caps every message at its `max_payload`, 1 MiB unless you change it. Tether stores a retained message as base64 inside JSON, which grows it by about a third, so in a cell the broker lowers `max_packet_size` to what still fits and logs a warning when it does. The embedded server sets `max_payload` to 4 MiB, which leaves the 1 MiB default packet size alone. With NATS you run, raise `max_payload` on your servers if you want packets close to 1 MiB.
+
+A node that can't renew its lease for half of it fences itself: it drops its clients and refuses new ones until NATS answers again, so it never acts on sessions the rest of the cell may already have taken over. The extension's health check fails while that lasts, when the node's NATS connection is down, or once JetStream hasn't answered for half the lease, and it shows up in `/_/health`. Only the JetStream meta leader answers that check, so it goes quiet on every node during a leader election (4 to 9 seconds on nats-server 2.15). The half-lease grace keeps a readiness probe from pulling the whole cell out for one. `forge_tether_cluster_fenced` reads 1 at the same time.
 
 ## Configuration
 
