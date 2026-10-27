@@ -17,7 +17,8 @@
 # aimed at the measured window, so the storm's own cost stays out of the process
 # that times the messages. That process keeps its clients connected until the
 # measured window is over, so closing them does not land inside it. Set
-# STORM_GOMAXPROCS to limit how many cores the storm process may use.
+# STORM_GOMAXPROCS to limit how many cores the storm process may use, and MAX_LOAD
+# to hold each run back until the 1-minute load average is under that.
 set -euo pipefail
 
 out=$1 name=$2 runs=$3 cmd=$4
@@ -67,6 +68,15 @@ for n in $(seq 1 "$runs"); do
   [ -s "$dir/cell.json" ] || { echo "cell did not start: $(cat "$dir/cell.out")" >&2; exit 1; }
 
   sleep "$settle"
+  # MAX_LOAD holds a run back until the machine is quieter than that, for up to
+  # ten minutes. Without it the run starts at once and records whatever load it had.
+  if [ -n "${MAX_LOAD:-}" ]; then
+    for _ in $(seq 1 120); do
+      l=$(uptime | sed 's/.*load averages*: //' | awk -F'[ ,]+' '{print int($1)}')
+      [ "$l" -lt "$MAX_LOAD" ] && break
+      sleep 5
+    done
+  fi
   echo "run $n of $runs: $name (load: $(uptime | sed 's/.*load averages*: //'))" >&2
 
   if [ -n "${STORM_CLIENTS:-}" ]; then
