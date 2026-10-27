@@ -740,7 +740,7 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 		ids = append(ids, id)
 	}
 
-	slices.SortFunc(ids, func(a, c uint16) int { return cmp.Compare(prev.QoS2Out[a].Seq, prev.QoS2Out[c].Seq) })
+	slices.SortFunc(ids, func(a, c uint16) int { return cmp.Compare(outSeq(prev.QoS2Out[a]), outSeq(prev.QoS2Out[c])) })
 
 	// The messages of deliveries to send again: read before the acquire,
 	// and in one pass over the log for any the record gained since.
@@ -771,14 +771,15 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 		or := prev.QoS2Out[id]
 
 		if or.Seq == 0 {
-			// A shared delivery between its PUBREC and PUBCOMP (ruling R37):
-			// the PUBREL goes again, and the packet ID stays taken until
-			// the PUBCOMP. No log message and no cursor are involved.
-			if or.State != outPubrel {
-				continue
+			// A pinned shared QoS 2 delivery (ruling R39): its PUBREL, or
+			// its message again under the same packet ID (mochi resends it
+			// with DUP). No cursor, skip or flip floor: it is not the
+			// session's own log message.
+			pk, ok := sharedResend(s.tenantID, id, or, msgs, time.Now())
+			if !ok {
+				continue // gone from the log, or expired: dropped
 			}
 
-			pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id}
 			pk.Created = now - int64(len(ids)) + int64(i)
 
 			s.qos2Out[id] = or
@@ -874,17 +875,70 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 const fetchAttempts = 3
 
 // resendSeqs lists the log sequences of a record's QoS 2 deliveries that are
-// resent as PUBLISH on resume (state outPublish, above the cursor).
+// resent as PUBLISH on resume (state outPublish): the session's own above the
+// cursor, and its pinned shared ones wherever they are in the log.
 func resendSeqs(rec *cluster.SessionRecord) []uint64 {
 	var out []uint64
 
 	for _, or := range rec.QoS2Out {
-		if or.Seq > rec.Cursor && or.State != outPubrel {
+		switch {
+		case or.State == outPubrel:
+		case or.Seq == 0 && or.Shared > 0:
+			out = append(out, or.Shared)
+		case or.Seq > rec.Cursor:
 			out = append(out, or.Seq)
 		}
 	}
 
 	return out
+}
+
+// outSeq is the log sequence of an outbound QoS 2 record entry, its own or a
+// pinned shared delivery's, for ordering the resend.
+func outSeq(or cluster.OutRecord) uint64 {
+	if or.Seq == 0 {
+		return or.Shared
+	}
+
+	return or.Seq
+}
+
+// sharedResend builds the packet a resumed session sends again for a pinned
+// shared QoS 2 delivery (ruling R39): its PUBREL, or its message from the log
+// under the same packet ID, untagged (no cursor part). False when the message
+// is gone from the log or expired: nobody is owed it any more.
+func sharedResend(tenantID string, id uint16, or cluster.OutRecord, msgs map[uint64]cluster.LogMessage, now time.Time) (packets.Packet, bool) {
+	if or.State == outPubrel {
+		return packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id}, true
+	}
+
+	m, ok := msgs[or.Shared]
+	if !ok || or.Shared == 0 {
+		return packets.Packet{}, false
+	}
+
+	pk := packets.Packet{
+		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: 2},
+		PacketID:    id,
+		TopicName:   topic.Namespace(tenantID, m.Topic),
+		Payload:     m.Payload,
+		Properties:  packetProps(m.Props),
+	}
+
+	if m.ClientID != "" {
+		pk.Origin = namespacedID(m.Tenant, m.ClientID)
+	}
+
+	if m.Props.MessageExpiry > 0 && !m.PublishedAt.IsZero() {
+		exp := m.PublishedAt.Add(time.Duration(m.Props.MessageExpiry) * time.Second)
+		if !exp.After(now) {
+			return packets.Packet{}, false
+		}
+
+		pk.Expiry = exp.Unix()
+	}
+
+	return pk, true
 }
 
 // fetchLogs reads the log messages seqs of tenantID in one replay, with its

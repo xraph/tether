@@ -95,12 +95,16 @@ type WillRecord struct {
 }
 
 // OutRecord is the state of one outbound QoS 2 delivery: the log sequence of
-// the message and where the handshake stands. Seq 0 (no log message has it)
-// is a shared subscription's delivery past its PUBREC, kept so a resume sends
-// the PUBREL again (the broker's state 1).
+// the message and where the handshake stands.
+//
+// A shared subscription's QoS 2 delivery has Seq 0 (the session's cursor
+// plays no part in it) and its message's log sequence in Shared, so a resume
+// sends that message again under the same packet ID (or its PUBREL) and no
+// other member of the group ever gets it [MQTT-4.8.2-4], [MQTT-4.8.2-5].
 type OutRecord struct {
-	Seq   uint64 `json:"seq"`
-	State byte   `json:"state"`
+	Seq    uint64 `json:"seq"`
+	State  byte   `json:"state"`
+	Shared uint64 `json:"shared,omitempty"`
 }
 
 // Sessions stores MQTT sessions in the sessions bucket, one key per session,

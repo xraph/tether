@@ -922,6 +922,13 @@ func (b *Broker) windowFull(s *session, cl *mqtt.Client) bool {
 	inflight := cl.State.Inflight.Len()
 	queued := len(s.queued)
 
+	// Pinned QoS 2 shared deliveries (Seq 0) are unacknowledged too.
+	for _, or := range s.qos2Out {
+		if or.Seq == 0 {
+			shared++
+		}
+	}
+
 	return inflight+queued >= n.maxInflight || s.recvMax > 0 && len(s.out)+queued+shared >= s.recvMax
 }
 
@@ -1238,8 +1245,8 @@ func (n *clusterNode) onAck(cl *mqtt.Client, id uint16, comp bool) {
 	if or, ok := s.qos2Out[id]; ok {
 		delete(s.qos2Out, id)
 
-		// Seq 0 is a shared delivery's PUBREL (sharePubrec): no log message
-		// to mark done.
+		// Seq 0 is a pinned shared delivery (clustershared.go): not the
+		// session's own log message, nothing to mark done.
 		if or.Seq > 0 {
 			s.qos2Done[or.Seq] = struct{}{}
 		}

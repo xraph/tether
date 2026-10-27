@@ -736,3 +736,95 @@ func TestSharedPubrelResumed(t *testing.T) {
 		return err == nil && len(rec.QoS2Out) == 0
 	})
 }
+
+// Ruling R39 [MQTT-4.8.2-4]: a shared QoS 2 delivery whose connection breaks
+// before its PUBREC is the session's. Another member that joins meanwhile
+// never gets it, and the session resumed on another node gets it again with
+// DUP under the same packet ID, once.
+func TestSharedQoS2PinnedToSession(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	m, _ := rawPersist(t, c.addr(0), "p2", 0)
+	rawSubscribe(t, m, 2, "$share/g/p2/#")
+
+	pub, _, err := connect5(t, c.addr(1), "pub", "u1", true)
+	require.NoError(t, err)
+	require.Equal(t, byte(0), publishQ(t, pub, "p2/a", "pinned", 2))
+
+	cp := readLog(t, m)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	first := cp.Content.(*packets.Publish)
+	require.Equal(t, "pinned", string(first.Payload))
+
+	// Gone before the PUBREC.
+	require.NoError(t, m.Close())
+	waitOffline(t, c.nodes[0], tid, "p2")
+
+	other, _, err := connect5(t, c.addr(1), "other", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, other, "$share/g/p2/#", 2, false)
+
+	m, ack := rawPersist(t, c.addr(1), "p2", 0)
+	require.True(t, ack.SessionPresent)
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	again := cp.Content.(*packets.Publish)
+	require.Equal(t, "pinned", string(again.Payload))
+	require.Equal(t, first.PacketID, again.PacketID)
+	require.True(t, again.Duplicate)
+	require.Equal(t, byte(2), again.QoS)
+
+	writePacket(t, m, &packets.Pubrec{PacketID: again.PacketID, Properties: &packets.Properties{}})
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBREL, cp.Type)
+	writePacket(t, m, &packets.Pubcomp{PacketID: again.PacketID, Properties: &packets.Properties{}})
+
+	require.Nil(t, readFor(t, m, settle), "sent again after its flow completed")
+	noMoreMsgs(t, other)
+
+	eventually(t, "the record free of it", func() bool {
+		rec, err := sessionKey(t, c.nodes[1], tid, "p2")
+
+		return err == nil && len(rec.QoS2Out) == 0
+	})
+}
+
+// Ruling R39 [MQTT-4.8.2-5]: when the session of a shared QoS 2 delivery
+// ends before the delivery completes (here a clean start), the message goes
+// to no other member and not to the new session either.
+func TestSharedQoS2DroppedWithSession(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	m, _ := rawPersist(t, c.addr(0), "d2", 0)
+	rawSubscribe(t, m, 2, "$share/g/d2/#")
+
+	pub, _, err := connect5(t, c.addr(1), "pub", "u1", true)
+	require.NoError(t, err)
+	require.Equal(t, byte(0), publishQ(t, pub, "d2/a", "pinned", 2))
+
+	cp := readLog(t, m)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+	require.NoError(t, m.Close())
+	waitOffline(t, c.nodes[0], tid, "d2")
+
+	other, _, err := connect5(t, c.addr(1), "other", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, other, "$share/g/d2/#", 2, false)
+
+	fresh, ack, err := connect5(t, c.addr(0), "d2", "u1", true)
+	require.NoError(t, err)
+	require.False(t, ack.SessionPresent)
+
+	// Sentinel: a later message reaches the group (the other member), so
+	// the pinned one had its chance to go anywhere.
+	require.Equal(t, byte(0), publishQ(t, pub, "d2/b", "later", 2))
+	require.Equal(t, "later", recvLog(t, other).Payload)
+	noMoreMsgs(t, other)
+	noMoreMsgs(t, fresh)
+}

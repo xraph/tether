@@ -480,9 +480,9 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 
 			return pk, nil
 		case packets.Pubrec:
-			// The record says PUBREL before mochi sends it, for a shared
-			// delivery (sharePubrec) and the session's own (onPubrec).
-			if !n.sharePubrec(cl, pk) || !n.onPubrec(cl, pk) {
+			// The record says PUBREL before mochi sends it, for the
+			// session's own QoS 2 deliveries and its pinned shared ones.
+			if !n.onPubrec(cl, pk) {
 				return pk, packets.ErrRejectPacket
 			}
 
