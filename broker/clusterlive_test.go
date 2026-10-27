@@ -956,6 +956,11 @@ func TestOversizedWillDropped(t *testing.T) {
 	)
 
 	c := startLiveCellWith(t, 2, 1, func(b *Broker) {
+		// fitPacketSize lowers the packet size below what this will
+		// needs, so such a will is refused at CONNECT; it is raised back
+		// to reach the drop path behind it.
+		b.cfg.MaxPacketSize = 1 << 20
+
 		if b.cluster.Config.NodeID == "n2" {
 			b.cluster.willFault = heldFault(&hold, &attempts)
 		}
