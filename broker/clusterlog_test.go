@@ -1360,3 +1360,53 @@ func TestLostAcksResentWhenLogReturns(t *testing.T) {
 	require.Less(t, took, 3*time.Second, "lost acks were waited out one by one")
 	storedOnce(t, a, t1.ID.String(), n)
 }
+
+// A client that reuses a QoS 2 packet ID for a new message after PUBCOMP,
+// while the record still holds the old message ID (the PUBREL's clear has
+// not been written), and resends the new message with DUP on another node
+// gets it stored: the old message ID is reused only for the same message,
+// so JetStream does not discard the new one as a duplicate (B-C1).
+func TestQoS2ReusedPacketIDNotDedupedAsStale(t *testing.T) {
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 2, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			if b.cluster != nil {
+				b.cluster.flushInterval = time.Hour
+			}
+		})
+
+	sub, _, err := connect5(t, c.addr(1), "watcher", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sub, "q/#", 2, false)
+
+	sess := newRawSession()
+	p := dialRaw(t, c.addr(0), "qp", sess, false)
+	require.Equal(t, byte(0), p.ack(t).ReasonCode)
+
+	p.send(&packets.Publish{PacketID: 1, QoS: 2, Topic: "q/x", Payload: []byte("m1"), Properties: &packets.Properties{}})
+	require.True(t, p.alive())
+	require.Equal(t, "m1", recvLog(t, sub).Payload)
+	p.send(&packets.Pubrel{PacketID: 1, Properties: &packets.Properties{}})
+	require.True(t, p.alive())
+
+	// The node loses the cell (as a fence does): no write gets through, so
+	// the record keeps packet ID 1's entry for m1.
+	c.nodes[0].cluster.fenced.Store(true)
+	t.Cleanup(func() { c.nodes[0].cluster.fenced.Store(false) })
+
+	// The client reuses packet ID 1 for a new message, which cannot commit.
+	p.send(&packets.Publish{PacketID: 1, QoS: 2, Topic: "q/x", Payload: []byte("N"), Properties: &packets.Properties{}})
+	require.True(t, p.alive())
+	time.Sleep(300 * time.Millisecond)
+	_ = p.conn.Close()
+
+	// It resumes on the other node and resends N with DUP.
+	p2 := dialRaw(t, c.addr(1), "qp", sess, false)
+	require.Equal(t, byte(0), p2.ack(t).ReasonCode)
+	p2.send(&packets.Publish{PacketID: 1, QoS: 2, Duplicate: true, Topic: "q/x", Payload: []byte("N"), Properties: &packets.Properties{}})
+	require.True(t, p2.alive())
+
+	m := recvLog(t, sub)
+	require.Equal(t, "N", m.Payload, "N was acked with PUBREC but never stored")
+}

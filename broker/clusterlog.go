@@ -3,10 +3,14 @@ package broker
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1128,7 +1132,7 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 
 	msgID := newMsgID()
 	if qos == 2 {
-		msgID = n.qos2MsgID(cl.ID, pk.PacketID, pk.FixedHeader.Dup)
+		msgID = n.qos2MsgID(cl.ID, pk.PacketID, pk.FixedHeader.Dup, qos2Digest(rel, qos, pk.Payload))
 	}
 
 	it := &pubItem{
@@ -1202,21 +1206,31 @@ func (b *Broker) appendHost(ctx context.Context, tenantID, name string, payload 
 
 // qos2MsgID returns the message ID a QoS 2 publish of session nsID with
 // packet ID id is appended under. A DUP resend takes the one its pending
-// entry holds; anything else gets a fresh one and becomes the entry. The
-// entry lives until the PUBREL (clearQoS2) or the session's end (dropQoS2).
+// entry holds when the entry was made for the same message; anything else
+// gets a fresh one and becomes the entry. The entry lives until the PUBREL
+// (clearQoS2) or the session's end (dropQoS2).
 //
 // The entries are this node's memory of the session's record: each is
 // written into cluster.SessionRecord.QoS2In before the append (persistQoS2,
 // for a session that has a record to resume) and loaded with the session, so
 // a resend reaching another node finds it too.
-func (n *clusterNode) qos2MsgID(nsID string, id uint16, dup bool) string {
+//
+// A message ID ends in digest, the message's qos2Digest, so the entry says
+// which message it was made for. A PUBREL clears the entry in memory only
+// until the next record write, so a node that resumes the session can load
+// an entry of a message already completed; the client may have reused the
+// packet ID for a new message by then [MQTT-2.2.1-3]. Reusing the old ID for
+// the new message would make JetStream discard it as a duplicate after it
+// was acknowledged. A fresh ID is safe: the entry is persisted before the
+// append.
+func (n *clusterNode) qos2MsgID(nsID string, id uint16, dup bool, digest string) string {
 	n.qos2Mu.Lock()
 	defer n.qos2Mu.Unlock()
 
 	set := n.qos2In[nsID]
 
 	if dup {
-		if msgID, ok := set[id]; ok {
+		if msgID, ok := set[id]; ok && strings.HasSuffix(msgID, "."+digest) {
 			return msgID
 		}
 	}
@@ -1226,10 +1240,27 @@ func (n *clusterNode) qos2MsgID(nsID string, id uint16, dup bool) string {
 		n.qos2In[nsID] = set
 	}
 
-	msgID := newMsgID()
+	msgID := newMsgID() + "." + digest
 	set[id] = msgID
 
 	return msgID
+}
+
+// qos2Digest identifies a QoS 2 publish by its topic, QoS and payload, for
+// qos2MsgID: 16 hex digits of their SHA-256.
+func qos2Digest(topic string, qos byte, payload []byte) string {
+	h := sha256.New()
+
+	var n [9]byte
+
+	binary.BigEndian.PutUint64(n[:8], uint64(len(topic)))
+	n[8] = qos
+
+	h.Write(n[:])
+	h.Write([]byte(topic))
+	h.Write(payload)
+
+	return hex.EncodeToString(h.Sum(nil)[:8])
 }
 
 // clearQoS2 drops the pending entry of nsID's packet id, on its PUBREL.
