@@ -37,7 +37,8 @@ const (
 
 	// MetricLogAppendSeconds is a histogram of the time a QoS 1 or 2 append
 	// to the cell's log takes from send to commit, client publishes, host
-	// publishes and wills alike.
+	// publishes and wills alike. The time includes any wait before the send
+	// while the node's publisher has 4000 acks outstanding.
 	MetricLogAppendSeconds = "tether_log_append_seconds"
 
 	// MetricCASLost counts session record writes that lost their
@@ -52,7 +53,8 @@ const (
 
 // logAppendBuckets are the bounds of MetricLogAppendSeconds, in seconds: a
 // commit on a healthy cell takes a millisecond or a few, and the broker gives
-// one up after 5 s.
+// one attempt of a client publish up to 10 s (its append attempt bound, the
+// publisher's backpressure wait included) before it sends it again.
 var logAppendBuckets = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 // brokerMetrics reports the broker's counters to forge's metrics.
