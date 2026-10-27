@@ -190,27 +190,56 @@ func (b *Broker) ReloadPrincipal(ctx context.Context, principalID string) {
 // cache is cleared (service.Tenants.Update does both), so a connection that
 // is authorizing at the same time reads the new tenant when it authorizes
 // again.
+//
+// With a control bus (Cluster.Control) the change goes to every node of the
+// cell instead: UpdateTenant publishes a tenant.updated event carrying a copy
+// of t and returns once it is stored, and every node, this one included,
+// applies it when the event comes back (clustercontrol.go), with the
+// disconnects running in the background. If the publish fails this node
+// applies it at once and logs at Warn; other nodes then keep the old
+// snapshot until their clients reconnect.
 func (b *Broker) UpdateTenant(t *tenant.Tenant) {
 	if t == nil || t.ID.IsNil() {
 		return
 	}
 
 	snap := *t
+
+	if b.publishTenant(&snap) {
+		return
+	}
+
+	b.applyTenant(&snap, false)
+}
+
+// applyTenant is UpdateTenant on this node. With async the disconnects of a
+// disabled tenant run in their own goroutines and applyTenant does not wait
+// for them (the control bus's handlers must not block).
+func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 	tenantID := snap.ID.String()
 
 	b.changes.Add(1)
 
+	if b.cluster != nil {
+		b.cluster.tenantApplied.Add(1)
+	}
+
 	srv := b.running()
 
 	for _, st := range b.state.match(func(st *clientState) bool { return st.tenantID == tenantID }) {
-		st.tenant.Store(&snap)
+		st.tenant.Store(snap)
 
 		if snap.Enabled || srv == nil || st.cl.Closed() {
 			continue
 		}
 
 		b.log.Info("tether: tenant disabled, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", tenantID))
-		disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+
+		if async {
+			go disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+		} else {
+			disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+		}
 	}
 }
 
@@ -701,6 +730,16 @@ func filtersOf(tenantID string, cl *mqtt.Client) []string {
 // a second whatever the client does. A persistent session stays, offline;
 // use DeleteSession to remove it. It returns tether.ErrNotFound when no
 // connection with that client ID is open, an offline session included.
+//
+// With a control bus (Cluster.Control), a connection another node of the
+// cell serves is kicked by that node: Kick publishes a session.kick event
+// naming the node and the session's epoch, and returns nil once the cell's
+// session store shows the node let the connection go (the session offline,
+// ended, or taken over), which is when the client is gone. If that does
+// not happen within remoteAdminWait (5 s) it returns an error wrapping
+// tether.ErrConflict naming the node; the event stays in the control stream
+// and the node may still act on it. Without a control bus such a connection
+// is tether.ErrNotFound, as on a lone broker.
 func (b *Broker) Kick(tenantID, clientID string) error {
 	nsID, err := sessionID(tenantID, clientID)
 	if err != nil {
@@ -714,6 +753,10 @@ func (b *Broker) Kick(tenantID, clientID string) error {
 
 	cl, ok := srv.Clients.Get(nsID)
 	if !ok || cl.Closed() {
+		if b.cluster != nil && b.cluster.Control != nil {
+			return b.kickRemote(tenantID, clientID)
+		}
+
 		return notConnected(clientID)
 	}
 
@@ -752,8 +795,15 @@ const sessionEndWait = 2 * time.Second
 // serves is disconnected as above and its key deleted; an offline one is
 // deleted from the cell's session store whichever node it was on, at the
 // revision read, so a CONNECT that resumes it meanwhile wins (the delete
-// fails with tether.ErrConflict). A session another node serves is refused
-// with tether.ErrConflict naming that node.
+// fails with tether.ErrConflict). A session another node serves is deleted
+// by that node when the broker has a control bus (Cluster.Control): a
+// session.delete event names the node and the session's epoch, the node
+// deletes it as above, and DeleteSession returns once the record is gone
+// from the cell (nil), the client connected again (tether.ErrConflict), or
+// remoteAdminWait (5 s) passed (tether.ErrConflict naming the node). If the
+// node let the session go offline without deleting it, DeleteSession deletes
+// the offline record itself. Without a control bus such a session is
+// refused with tether.ErrConflict naming the node.
 func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	nsID, err := sessionID(tenantID, clientID)
 	if err != nil {
@@ -770,7 +820,7 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 			return fmt.Errorf("tether/broker: %w", err)
 		}
 
-		return b.deleteClusterSession(srv, tenantID, clientID, nsID)
+		return b.deleteClusterSession(srv, tenantID, clientID, nsID, 0, false)
 	}
 
 	cl, ok := srv.Clients.Get(nsID)

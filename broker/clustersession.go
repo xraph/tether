@@ -1899,9 +1899,16 @@ func (n *clusterNode) persistQoS2In(tenantID, rawID string, _ uint16, _ string) 
 // deleteClusterSession is DeleteSession in cluster mode (ruling R7). A
 // session this node serves is disconnected first and its end writes
 // nothing; then the key is deleted at the revision read, whoever wrote it
-// last, unless another node owns the session now: that is an error naming
-// the owner (the control bus that reaches it comes later).
-func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID string) error {
+// last, unless another node owns the session now. That node is asked to
+// delete it over the control bus (deleteRemote, Task 13) when the broker has
+// one and the call did not come from the bus itself (fromBus); otherwise it
+// is an error naming the owner.
+//
+// epoch, when not zero, is the epoch the session must still have (the one a
+// session.delete event names): a session of another epoch here, or a record
+// of another epoch, is a client that connected again, and the delete fails
+// with tether.ErrConflict.
+func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID string, epoch uint64, fromBus bool) error {
 	n := b.cluster
 	log := b.log.With(slog.String("client", nsID), slog.String("tenant", tenantID))
 
@@ -1921,7 +1928,12 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 	}
 	defer b.state.endDelete(nsID)
 
-	if s := n.sessionByID(nsID); s != nil {
+	s := n.sessionByID(nsID)
+	if s != nil && epoch != 0 && s.epoch.Load() != epoch {
+		return deleteConflict(clientID, "the client connected again")
+	}
+
+	if s != nil {
 		n.sessMu.Lock()
 		s.deleting = true
 		live := s.cl
@@ -1949,7 +1961,13 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 	// A session of this node that just ended may still be writing its last
 	// record; its end holds the session's lock until that is in.
 	unlock := n.locks.lock(nsID)
-	defer unlock()
+	locked := true
+
+	defer func() {
+		if locked {
+			unlock()
+		}
+	}()
 
 	rec, rev, err := n.Sessions.Get(ctx, tenantID, clientID)
 	if errors.Is(err, tether.ErrNotFound) {
@@ -1964,8 +1982,23 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 		return fmt.Errorf("tether/broker: delete session %q: %w", clientID, err)
 	}
 
+	if epoch != 0 && rec.Epoch != epoch {
+		return deleteConflict(clientID, "the client connected again")
+	}
+
 	if rec.Owner != "" && rec.Owner != n.Config.NodeID {
-		return fmt.Errorf("tether/broker: delete session %q: %w: owned by node %q", clientID, tether.ErrConflict, rec.Owner)
+		if fromBus || n.Control == nil {
+			return fmt.Errorf("tether/broker: delete session %q: %w: owned by node %q", clientID, tether.ErrConflict, rec.Owner)
+		}
+
+		// The owner deletes it. Neither the session's lock nor anything
+		// else is held across the publish and the wait; the tombstone
+		// stays, so this node refuses the client ID until it is done.
+		unlock()
+
+		locked = false
+
+		return b.deleteRemote(tenantID, clientID, rec.Owner, rec.Epoch)
 	}
 
 	if err := n.Sessions.Delete(ctx, tenantID, clientID, rev); err != nil {

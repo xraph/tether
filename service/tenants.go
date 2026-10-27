@@ -37,7 +37,8 @@ type UpdateTenantInput struct {
 //
 // ResolveTenant keeps a 30 s cache that Update and Delete evict. The cache is
 // per process: when several broker nodes share a store, a change made through
-// one node reaches the others within 30 s.
+// one node reaches the others within 30 s, or at once when every node calls
+// Evict for it (a cell's control bus, events.EvictTenantsOnUpdate).
 type Tenants struct {
 	store store.Store
 	now   func() time.Time
@@ -233,6 +234,14 @@ func (s *Tenants) ResolveTenant(ctx context.Context, appID, externalID string) (
 	cp := *t
 
 	return &cp, nil
+}
+
+// Evict drops the tenant from the resolve cache. Update and Delete do it
+// themselves. When several broker nodes share the store, each node calls it
+// for a change another node made (events.EvictTenantsOnUpdate on the cell's
+// control bus), so the change does not wait out the 30 s cache there.
+func (s *Tenants) Evict(tenantID id.TenantID) {
+	s.evict(tenantID)
 }
 
 // evict drops every cached entry for the tenant.

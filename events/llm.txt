@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/events
 
-Turns keysmith key changes and warden role changes into reactions on live MQTT connections. Imports keysmith (key, rotation), warden (role, assignment, id), mochi `packets` and `auth`; it does not import `broker` (a broker satisfies `BrokerControl`).
+Turns keysmith key changes and warden role changes into reactions on live MQTT connections. Imports keysmith (key, rotation), warden (role, assignment, id), mochi `packets`, `auth` and `cluster` (event kinds and payloads); it does not import `broker` (a broker satisfies `BrokerControl`).
 
 ## Handler
 
@@ -29,6 +29,18 @@ Called synchronously from inside the engine call that made the change (and from 
 - `RolesChanged(id)`: `ReloadRole`.
 - `SubjectChanged` with kind `"api_key"`, `"user"` or `"service_acct"` (warden's names): `ReloadPrincipal(id)`. Other kinds and empty IDs are ignored. Principal IDs are matched across kinds, which is fine while key, user and service account IDs are typeIDs with distinct prefixes.
 - Empty IDs are ignored.
+
+## Cluster reactor
+
+For a broker that is one node of a cell (ruling R41). `Bus` is `Publish(ctx, kind string, v any) error` and `Subscribe(kind string, fn func([]byte)) error`, satisfied by `*cluster.Control`.
+
+`NewClusterReactor(evict func(keyID string), b BrokerControl, bus Bus, log *slog.Logger) (Handler, error)`: subscribes `key.invalidated`, `role.changed` and `subject.changed` on bus (call it before the bus starts; nil bus wraps `tether.ErrInvalidInput`, a Subscribe error is returned). Its Handler methods drop what NewReactor ignores (empty IDs, subjects that never connect) and publish the rest as `cluster.KeyInvalidated{KeyID, Disconnect}`, `cluster.KeyInvalidated{KeyID, RotatedAt, GraceEnds}` (KeyRotated), `cluster.RoleChanged`, `cluster.SubjectChanged{Kind, ID}`, bounded by `publishWait` (5 s, not cancelled with the hook's ctx), and apply nothing: every node, the publisher included, applies each event once when it comes back. A failed publish logs at Warn (log, else `slog.Default()`) and applies the change here synchronously, exactly as NewReactor would; other nodes then see it only when their clients reconnect.
+
+On receipt: `key.invalidated` evicts the key at once on the bus goroutine, then on a goroutine `DisconnectPrincipal(id, 0x98)` when Disconnect, else `ExpirePrincipal(id, RotatedAt, GraceEnds)` when either time is set (a rotation; both zero shortens nothing, same as NewReactor), else nothing more. `role.changed` and `subject.changed` (connecting kinds only) run `ReloadRole` / `ReloadPrincipal` on a goroutine with a 30 s context (`applyWait`). Undecodable events are logged and dropped. The broker calls running on goroutines means two events can apply out of order; each reload reads current grants, so they converge.
+
+`EvictTenantsOnUpdate(bus Bus, evict func(tenantID string)) error`: subscribes evict to `tenant.updated` (empty IDs dropped), for `service.Tenants.Evict` on every node. The broker applies tenant changes itself (`broker.Cluster.Control`); subscribe this before `broker.New` so the eviction runs before the broker's handler.
+
+Tests: `reactor_test.go` has a `fakeBus` (keeps published events until `deliver`): `TestClusterReactorAppliesOnReceipt` (nothing applied before delivery; evictions in order at delivery, the broker calls once each after), `TestClusterReactorFallsBackWhenPublishFails`, `TestClusterReactorNeedsBus`, `TestEvictTenantsOnUpdate`. `cluster_test.go` (`newCellEnv`: two brokers over a three-server `clustertest` cluster, each with its own keysmith and warden engines, plugins, authenticator, tenant service and Control, sharing the tether, keysmith and warden memory stores, wired in the extension's order) covers `TestRevokeDisconnectsOnEveryNode` (revoked through node A's devices service: the device on B gets 0x98 within 2 s and its reconnect on B is 0x86), `TestRoleChangePrunesOnEveryNode` (a role narrowed through A's warden engine prunes the subscription on B, which then refuses it 0x87) and `TestTenantDisableAcrossNodes` (disabled through A's tenant service and broker as the API does: B's device gets 0x98 and B's tenant cache no longer lets it back).
 
 Wiring (what the extension does, and what `events_test.go` does): build the keysmith plugin and the warden plugin unbound, pass them to the engines at construction, build `auth.NewKeysmith`, `perm.NewLoader` and the broker, then `r := events.NewReactor(authn.Evict, b)` and `Bind(r)` on both plugins. Device roles go through `service.NewDevices(store, tenants, keysmithEngine, service.NewWardenRoles(wardenEngine))`.
 

@@ -179,6 +179,10 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		b.cluster = n
 
 		b.watchMembers()
+
+		if err := b.subscribeControl(); err != nil {
+			return nil, err
+		}
 	}
 
 	return b, nil

@@ -23,6 +23,8 @@ type testCell struct {
 	nats  *clustertest.Cluster
 	nodes []*Broker
 	conns []*cluster.Conn
+	// ctls are the nodes' control buses, set only by startControlCell.
+	ctls []*cluster.Control
 
 	// t1 and t2 are two tenants. The users "u1" (of t1) and "u2" (of t2)
 	// may publish and subscribe anything, "$app/#" included.
@@ -66,6 +68,32 @@ func startCellVia(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Iden
 ) *testCell {
 	t.Helper()
 
+	return buildCell(t, nodes, cfg, ids, perms, before, via, false)
+}
+
+// startControlCell is startCluster with a control bus on every node, wired
+// the way a host wires it: the bus is made before the broker (whose New
+// subscribes to it) and started before the broker's Start.
+func startControlCell(t *testing.T, nodes int) *testCell {
+	t.Helper()
+
+	t1, t2 := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#", "$app/#"}, Subscribe: []string{"#", "$app/#"}}
+
+	c := buildCell(t, nodes, testConfig(),
+		map[string]*auth.Identity{"u1": ident(t1, "u1"), "u2": ident(t2, "u2")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all, "u2": all}}, nil, nil, true)
+	c.t1, c.t2 = t1, t2
+
+	return c
+}
+
+// buildCell is startCellVia, with a control bus per node when control is set.
+func buildCell(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Identity, perms PermLoader, before func(*Broker),
+	via func(i int, url string) string, control bool,
+) *testCell {
+	t.Helper()
+
 	c := &testCell{nats: clustertest.StartCluster(t, 3)}
 	urls := c.nats.URLs()
 
@@ -75,6 +103,10 @@ func startCellVia(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Iden
 
 		for _, b := range c.nodes {
 			_ = b.Stop(ctx)
+		}
+
+		for _, ctl := range c.ctls {
+			ctl.Stop()
 		}
 
 		for _, conn := range c.conns {
@@ -108,16 +140,26 @@ func startCellVia(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Iden
 
 		c.conns = append(c.conns, conn)
 
+		cl := &Cluster{Conn: conn, Config: ccfg}
+		if control {
+			cl.Control = cluster.NewControl(conn, ccfg)
+			c.ctls = append(c.ctls, cl.Control)
+		}
+
 		b, err := New(cfg, Deps{
 			Auth:    auth.NewStatic(ids),
 			Perms:   perms,
 			Logger:  testLogger().With("node", ccfg.NodeID),
-			Cluster: &Cluster{Conn: conn, Config: ccfg},
+			Cluster: cl,
 		})
 		require.NoError(t, err)
 
 		if before != nil {
 			before(b)
+		}
+
+		if cl.Control != nil {
+			require.NoError(t, cl.Control.Start(t.Context()))
 		}
 
 		require.NoError(t, b.Start(t.Context()))

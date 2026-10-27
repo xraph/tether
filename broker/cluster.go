@@ -67,6 +67,18 @@ type Cluster struct {
 	// broker makes one on Conn over Log, and closes it on Stop. One you make
 	// yourself (cluster.NewShared) you close, after the broker's Stop.
 	Shared *cluster.Shared
+
+	// Control is the cell's control bus (clustercontrol.go). When it is set,
+	// New subscribes the broker's handlers on it (tenant.updated,
+	// session.kick, session.delete), UpdateTenant sends tenant changes to
+	// every node through it, and Kick and DeleteSession reach sessions other
+	// nodes serve. Starting and stopping it is the caller's job: Start it
+	// after New and after every other handler is subscribed (package events'
+	// reactor), and before the broker's Start, so no client connects before
+	// the node hears the bus; Stop it after the broker's Stop. Nil: tenant
+	// changes stay on this node and a session another node serves can be
+	// neither kicked nor deleted from here.
+	Control *cluster.Control
 }
 
 // injectorID is the client ID of the injector, the inline client that
@@ -182,6 +194,9 @@ type clusterNode struct {
 	// sharedNode is the node's memberships of shared groups and their
 	// deliveries (clustershared.go).
 	sharedNode
+
+	// controlNode is the control bus side (clustercontrol.go).
+	controlNode
 
 	// Test seams, set before Start: afterAcquire runs in a CONNECT right
 	// after its key is acquired, before the session is registered;

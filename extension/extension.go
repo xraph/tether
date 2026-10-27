@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 
@@ -35,7 +36,9 @@ import (
 	"github.com/xraph/tether/api"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/events"
+	"github.com/xraph/tether/id"
 	"github.com/xraph/tether/limits"
 	"github.com/xraph/tether/perm"
 	"github.com/xraph/tether/service"
@@ -100,6 +103,14 @@ type Extension struct {
 	// ksExts are the keysmith extensions Keysmith built, guarded by mu.
 	ksExts []*keysmithext.Extension
 
+	// clusterDeps, when set, makes the broker one node of a cell: the
+	// node's connection and config, provisioned by the caller, and any
+	// cluster services it built. Start adds the cell's control bus
+	// (startControl). Seam for Task 14, which sets it from the config
+	// (WithCluster, with Members and the rest of the lifecycle); until then
+	// only tests set it (export_test.go).
+	clusterDeps *broker.Cluster
+
 	// lifecycle serializes Start and Stop, so a second call (vessel starts
 	// every Starter it resolves, and *Extension is one) waits for the first
 	// and then finds it done.
@@ -111,6 +122,9 @@ type Extension struct {
 	services *api.Services
 	active   store.Store
 	started  bool
+	// control is the cell's control bus Start made, nil without a cell.
+	// Stop stops it after the broker.
+	control *cluster.Control
 }
 
 // New returns the extension. Options override DefaultConfig; the app's
@@ -236,20 +250,39 @@ func (e *Extension) Start(ctx context.Context) error {
 	loader := perm.NewLoader(wd, perm.WithLogger(slogger))
 	limiter := limits.New()
 
+	// The cell's control bus, when there is a cell: the tenant cache's
+	// eviction goes on it before the broker's handlers (New subscribes
+	// them), so it runs first.
+	cdeps, ctl, err := e.clusterControl(tenants)
+	if err != nil {
+		return err
+	}
+
 	b, err := broker.New(e.config.Broker, broker.Deps{
 		Auth:    connectAuth,
 		Perms:   loader,
 		Limits:  limiter,
 		Logger:  slogger,
 		Metrics: newBrokerMetrics(e.Metrics()),
+		Cluster: cdeps,
 	})
 	if err != nil {
+		stopControl(ctl)
+
 		return fmt.Errorf("tether: %w", err)
 	}
 
 	// Bound before the broker listens, so no connection can miss a change.
-	// Until Start the reactor's broker calls do nothing.
-	reactor := events.NewReactor(authn.Evict, b)
+	// Until Start the reactor's broker calls do nothing. In a cell the
+	// reactor sends every change through the control bus and applies what
+	// comes back.
+	reactor, err := newReactor(authn, b, ctl, slogger)
+	if err != nil {
+		stopControl(ctl)
+
+		return err
+	}
+
 	e.ksPlugin.Bind(reactor)
 	e.wdPlugin.Bind(reactor)
 
@@ -269,25 +302,91 @@ func (e *Extension) Start(ctx context.Context) error {
 	if !e.config.DisableRoutes {
 		if err := e.mountRoutes(*services); err != nil {
 			e.unbind()
+			stopControl(ctl)
 
 			return err
 		}
 	}
 
+	// Every handler is on the bus now. It starts before the broker
+	// listens, so no client connects before this node hears the cell.
+	if ctl != nil {
+		if err := ctl.Start(ctx); err != nil {
+			e.unbind()
+			stopControl(ctl)
+
+			return fmt.Errorf("tether: start control bus: %w", err)
+		}
+	}
+
 	if err := b.Start(ctx); err != nil {
 		e.unbind()
+		stopControl(ctl)
 
 		return fmt.Errorf("tether: start broker: %w", err)
 	}
 
 	e.mu.Lock()
-	e.broker, e.services, e.active, e.started = b, services, st, true
+	e.broker, e.services, e.active, e.started, e.control = b, services, st, true, ctl
 	e.mu.Unlock()
 
 	e.MarkStarted()
 	e.Logger().Info("tether: broker started", forge.F("mqtt", addrString(b)), forge.F("base_path", e.config.BasePath))
 
 	return nil
+}
+
+// clusterControl returns the broker's cluster deps with the cell's control
+// bus in them, and the bus, or nils when the extension runs no cell. The bus
+// is always made here, whatever clusterDeps.Control holds, because the
+// extension has to order the subscriptions and start it. The service's tenant
+// cache is evicted on every tenant.updated event; that handler goes on first.
+func (e *Extension) clusterControl(tenants *service.Tenants) (*broker.Cluster, *cluster.Control, error) {
+	if e.clusterDeps == nil {
+		return nil, nil, nil
+	}
+
+	cd := *e.clusterDeps
+	if cd.Conn == nil {
+		return nil, nil, errors.New("tether: cluster: no NATS connection")
+	}
+
+	cd.Control = cluster.NewControl(cd.Conn, cd.Config)
+
+	err := events.EvictTenantsOnUpdate(cd.Control, func(tenantID string) {
+		if tid, perr := id.ParseTenantID(tenantID); perr == nil {
+			tenants.Evict(tid)
+		}
+	})
+	if err != nil {
+		cd.Control.Stop()
+
+		return nil, nil, fmt.Errorf("tether: control bus: %w", err)
+	}
+
+	return &cd, cd.Control, nil
+}
+
+// newReactor returns the handler the plugins report to: a cluster reactor on
+// ctl in a cell, the local one otherwise.
+func newReactor(authn *auth.Keysmith, b *broker.Broker, ctl *cluster.Control, log *slog.Logger) (events.Handler, error) {
+	if ctl == nil {
+		return events.NewReactor(authn.Evict, b), nil
+	}
+
+	r, err := events.NewClusterReactor(authn.Evict, b, ctl, log)
+	if err != nil {
+		return nil, fmt.Errorf("tether: %w", err)
+	}
+
+	return r, nil
+}
+
+// stopControl stops ctl when there is one.
+func stopControl(ctl *cluster.Control) {
+	if ctl != nil {
+		ctl.Stop()
+	}
 }
 
 // connectAuth returns the authenticator MQTT CONNECT uses: keysmith alone, or
@@ -464,17 +563,24 @@ func (e *Extension) Stop(ctx context.Context) error {
 	e.unbind()
 
 	e.mu.Lock()
-	b := e.broker
-	e.started = false
+	b, ctl := e.broker, e.control
+	e.started, e.control = false, nil
 	e.mu.Unlock()
 
 	e.MarkStopped()
 
 	if b == nil {
+		stopControl(ctl)
+
 		return nil
 	}
 
-	if err := b.Stop(ctx); err != nil {
+	err := b.Stop(ctx)
+
+	// After the broker: its clients are gone, so nothing is left to apply.
+	stopControl(ctl)
+
+	if err != nil {
 		return fmt.Errorf("tether: %w", err)
 	}
 

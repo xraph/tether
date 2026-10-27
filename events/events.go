@@ -7,7 +7,9 @@
 // broker terms: a key is no longer valid, a role's grants changed, or a
 // subject's roles changed. [NewReactor] returns the Handler that applies those
 // to the broker: it evicts the key from the authenticator's cache, and
-// disconnects or reloads the affected connections.
+// disconnects or reloads the affected connections. In a cell,
+// [NewClusterReactor] sends each change through the control bus instead, and
+// every node applies it.
 //
 // Plugin hooks run synchronously inside the engine call that made the change,
 // so the reaction is done when that call returns. They never fail and never
