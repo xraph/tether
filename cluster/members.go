@@ -22,16 +22,16 @@ const (
 	minMonitorTick = 5 * time.Millisecond
 	// startWait bounds Start when its context has no deadline.
 	startWait = 10 * time.Second
-	// renewRetry is how soon a failed heartbeat write is tried again
-	// (ruling R47), well inside the Lease/2 before the fence, so the node
-	// renews as soon as the bucket has a leader again after an election,
-	// not a whole Heartbeat later.
+	// renewRetry is how soon another heartbeat write goes out after one
+	// failed, or while one has not been acknowledged yet (ruling R47), well
+	// inside the Lease/2 before the fence, so the node renews as soon as the
+	// bucket has a leader again after an election, not a Heartbeat later.
 	renewRetry = 250 * time.Millisecond
-	// maxPutTimeout caps one heartbeat write, so a write sent into a dead
-	// leader gives way to a retry instead of holding the loop for Lease/4.
-	// An acknowledged write takes milliseconds; a spurious timeout costs only
-	// a retry 250 ms later, with Lease/2 to go before the fence.
-	maxPutTimeout = 500 * time.Millisecond
+	// maxRenewsInFlight is how many heartbeat writes may be outstanding at
+	// once. The retries run alongside a write that is merely slow, and
+	// whichever is acknowledged first renews, so a slow write is never cut
+	// short and a dead one never holds the retries back.
+	maxRenewsInFlight = 2
 )
 
 // heartbeat is the value of a node's key in the members bucket.
@@ -381,11 +381,11 @@ func (m *Members) wrapErr(op string, err error) error {
 	return fmt.Errorf("cluster: members: %s: %w", op, err)
 }
 
-// putTimeout is how long one heartbeat write may take: Lease/4 up to 500 ms,
-// well under Lease/2, so a write that hangs neither holds the fence back nor
-// keeps the retries from coming every renewRetry.
+// putTimeout is how long one heartbeat write may take: Lease/4, well under
+// Lease/2, so a write that hangs cannot hold the fence back, and a write that
+// is slow but lands within it still renews.
 func (m *Members) putTimeout() time.Duration {
-	return min(max(m.cfg.Lease/4, 20*time.Millisecond), maxPutTimeout)
+	return max(m.cfg.Lease/4, 20*time.Millisecond)
 }
 
 // renew writes one heartbeat and, when it is acknowledged, records the renew.
@@ -426,13 +426,21 @@ func (m *Members) renew(ctx context.Context) error {
 	return nil
 }
 
-// heartbeatLoop renews every Heartbeat, and after a failed write every
-// renewRetry (or Heartbeat, if that is shorter) until one is acknowledged
-// (ruling R47): losing the server that leads the members bucket, with quorum
-// left, costs an election of 4 to 9 s, and the node must renew as soon as it
-// is over rather than at its next heartbeat.
+// heartbeatLoop renews every Heartbeat. When a write fails, or has not been
+// acknowledged renewRetry after it went out, another goes out every
+// renewRetry (or Heartbeat, if that is shorter), with at most
+// maxRenewsInFlight outstanding, each bounded by Lease/4 (ruling R47).
+// Whichever write is acknowledged first renews. Losing the server that leads
+// the members bucket, with quorum left, costs an election of 4 to 9 s, and
+// the node renews as soon as it is over; a bucket that is slow but working
+// renews within Lease/4, as it always did.
 func (m *Members) heartbeatLoop() {
 	defer m.wg.Done()
+
+	retry := min(renewRetry, m.cfg.Heartbeat)
+	results := make(chan error, maxRenewsInFlight)
+	inFlight := 0
+	lastSent := time.Now()
 
 	t := time.NewTimer(m.cfg.Heartbeat)
 	defer t.Stop()
@@ -441,23 +449,38 @@ func (m *Members) heartbeatLoop() {
 		select {
 		case <-m.ctx.Done():
 			return
+		case err := <-results:
+			inFlight--
+
+			if err != nil {
+				if m.ctx.Err() == nil {
+					m.noteFailure(err)
+				}
+
+				// The retry timer is running.
+				continue
+			}
+
+			if inFlight == 0 {
+				t.Reset(max(time.Until(lastSent.Add(m.cfg.Heartbeat)), 0))
+			}
 		case <-t.C:
+			if inFlight < maxRenewsInFlight {
+				inFlight++
+				lastSent = time.Now()
+
+				m.wg.Go(func() {
+					pctx, cancel := context.WithTimeout(m.ctx, m.putTimeout())
+					defer cancel()
+
+					results <- m.renew(pctx)
+				})
+			}
+
+			// Look again in renewRetry: the write is acknowledged by then,
+			// which puts the timer back on the Heartbeat, or another goes.
+			t.Reset(retry)
 		}
-
-		pctx, cancel := context.WithTimeout(m.ctx, m.putTimeout())
-		err := m.renew(pctx)
-
-		cancel()
-
-		next := m.cfg.Heartbeat
-
-		if err != nil && m.ctx.Err() == nil {
-			m.noteFailure(err)
-
-			next = min(renewRetry, m.cfg.Heartbeat)
-		}
-
-		t.Reset(next)
 	}
 }
 

@@ -2,14 +2,11 @@ package cluster
 
 import (
 	"errors"
-	"fmt"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/nats-io/nats-server/v2/server"
 
 	"github.com/xraph/tether/cluster/clustertest"
 	"github.com/xraph/tether/internal/chaos"
@@ -569,113 +566,6 @@ func TestMembersWatchRestarts(t *testing.T) {
 	}
 }
 
-// proxiedCluster is three in-process JetStream servers whose routes all run
-// through fault proxies (routes[i][j] carries server i's route to server j),
-// and that advertise a cluster address nothing listens on, so no route goes
-// around them. Isolating a server leaves it running, the way kill -9 or a
-// partition does: no shutdown event, no leadership handoff, so its peers sit
-// out a real raft election (4 to 9 s in nats-server 2.15).
-type proxiedCluster struct {
-	servers []*server.Server
-	routes  [3][3]*chaos.Proxy
-}
-
-func startProxiedCluster(t *testing.T) *proxiedCluster {
-	t.Helper()
-
-	ports := clustertest.FreePorts(t, 4)
-	cluster, dead := ports[:3], ports[3]
-	pc := &proxiedCluster{}
-
-	for i := range 3 {
-		for j := range 3 {
-			if i == j {
-				continue
-			}
-
-			p, err := chaos.NewProxy(fmt.Sprintf("127.0.0.1:%d", cluster[j]))
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			t.Cleanup(p.Close)
-
-			pc.routes[i][j] = p
-		}
-	}
-
-	for i := range 3 {
-		var routes []string
-
-		for j := range 3 {
-			if j != i {
-				routes = append(routes, "nats-route://"+pc.routes[i][j].Addr())
-			}
-		}
-
-		opts := &server.Options{
-			ServerName:   fmt.Sprintf("s%d", i),
-			Host:         "127.0.0.1",
-			Port:         -1,
-			NoLog:        true,
-			NoSigs:       true,
-			JetStream:    true,
-			StoreDir:     t.TempDir(),
-			PingInterval: time.Second,
-			MaxPingsOut:  3,
-			Cluster: server.ClusterOpts{
-				Name: clustertest.ClusterName, Host: "127.0.0.1", Port: cluster[i],
-				Advertise: fmt.Sprintf("127.0.0.1:%d", dead),
-			},
-			Routes: server.RoutesFromStr(strings.Join(routes, ",")),
-		}
-
-		s, err := server.NewServer(opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		pc.servers = append(pc.servers, s)
-
-		go s.Start()
-	}
-
-	t.Cleanup(func() {
-		for _, s := range pc.servers {
-			s.Shutdown()
-			s.WaitForShutdown()
-		}
-	})
-
-	for _, s := range pc.servers {
-		if !s.ReadyForConnections(30 * time.Second) {
-			t.Fatal("server not ready")
-		}
-	}
-
-	eventually(t, 30*time.Second, "a meta leader with three peers", func() bool {
-		for _, s := range pc.servers {
-			if s.JetStreamIsLeader() && len(s.JetStreamClusterPeers()) == 3 {
-				return true
-			}
-		}
-
-		return false
-	})
-
-	return pc
-}
-
-// isolate cuts server i's routes both ways.
-func (pc *proxiedCluster) isolate(i int) {
-	for j := range 3 {
-		if j != i {
-			pc.routes[i][j].SetMode(chaos.Both, chaos.Blackhole)
-			pc.routes[j][i].SetMode(chaos.Both, chaos.Blackhole)
-		}
-	}
-}
-
 // Ruling R47 with the R48 default lease: losing the server that leads the
 // members bucket, with quorum left, costs a raft election of 4 to 9 s, and
 // the node must ride it out. It is not fenced, and it renews within 1.5 s of
@@ -685,10 +575,10 @@ func (pc *proxiedCluster) isolate(i int) {
 // before the leader appeared can still take its 500 ms, or wait out the
 // stream's delayed 503, before the next one: 1.5 s covers both.)
 func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
-	pc := startProxiedCluster(t)
+	pc := clustertest.StartProxied(t)
 
 	connect := func(id string, i int) *Conn {
-		cfg := memberConfig(id, pc.servers[i].ClientURL())
+		cfg := memberConfig(id, pc.Servers[i].ClientURL())
 		cfg.Heartbeat = DefaultHeartbeat
 		cfg.Lease = DefaultLease
 
@@ -703,7 +593,7 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 	}
 
 	setup := connect("setup", 0)
-	cfg := memberConfig("setup", pc.servers[0].ClientURL())
+	cfg := memberConfig("setup", pc.Servers[0].ClientURL())
 
 	if err := Provision(tctx(t, 30*time.Second), setup, cfg, time.Hour); err != nil {
 		t.Fatal(err)
@@ -735,7 +625,7 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 
 	victim, survivor := -1, -1
 
-	for i, s := range pc.servers {
+	for i, s := range pc.Servers {
 		switch {
 		case s.Name() == leader:
 			victim = i
@@ -753,7 +643,7 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 	conn := connect("n1", survivor)
 	obs := connect("obs", survivor)
 
-	ncfg := memberConfig("n1", pc.servers[survivor].ClientURL())
+	ncfg := memberConfig("n1", pc.Servers[survivor].ClientURL())
 	ncfg.Heartbeat = DefaultHeartbeat
 	ncfg.Lease = DefaultLease
 
@@ -770,7 +660,7 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 
 	cut := time.Now()
 
-	pc.isolate(victim)
+	pc.Isolate(victim)
 
 	var elected time.Time
 
@@ -810,5 +700,74 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 
 	if n.m.Fenced() || len(n.ev.fenceTimes()) != 0 {
 		t.Fatal("the node fenced over one server's loss")
+	}
+}
+
+// A members bucket that is slow but working never fences: a heartbeat write
+// may take up to Lease/4, and the retries that go out every 250 ms while it
+// is outstanding run alongside it rather than cutting it short. Here every
+// write takes over 600 ms (the node's link delayed 300 ms each way) for 5 s,
+// more than twice Lease/2, with a 4 s lease (Lease/4 = 1 s). A fixed 500 ms
+// bound on a write failed every one of them and fenced the node at 2 s.
+func TestMembersSlowWritesDoNotFence(t *testing.T) {
+	cell := startMemberCell(t)
+
+	proxy, err := chaos.NewProxy(strings.TrimPrefix(cell.urls[0], "nats://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(proxy.Close)
+
+	cfg := memberConfig("n1", "nats://"+proxy.Addr())
+	cfg.Heartbeat = 200 * time.Millisecond
+	cfg.Lease = 4 * time.Second
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	n := &memberNode{cfg: cfg, conn: c, ev: &memberEvents{}}
+	n.m = n.newMembers()
+
+	if err := n.m.Start(tctx(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(n.m.Stop)
+
+	proxy.SetDelay(chaos.Both, 300*time.Millisecond)
+	proxy.SetMode(chaos.Both, chaos.Delay)
+
+	slowFrom := time.Now()
+	renews := 0
+	last := time.Time{}
+
+	for time.Since(slowFrom) < 5*time.Second {
+		time.Sleep(50 * time.Millisecond)
+
+		n.m.mu.Lock()
+		lr := n.m.lastRenew
+		n.m.mu.Unlock()
+
+		if lr.After(slowFrom) && lr.After(last) {
+			renews++
+			last = lr
+		}
+	}
+
+	proxy.SetMode(chaos.Both, chaos.Pass)
+
+	t.Logf("%d renews in 5 s of 600 ms writes", renews)
+
+	if n.m.Fenced() || len(n.ev.fenceTimes()) != 0 {
+		t.Fatal("fenced while every heartbeat write was landing within Lease/4")
+	}
+
+	if renews < 3 {
+		t.Fatalf("%d renews in 5 s, want them to keep landing", renews)
 	}
 }
