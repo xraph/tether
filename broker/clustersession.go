@@ -1118,6 +1118,7 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 
 		if pos > 0 {
 			n.pinIfFull(s, cl, pos)
+			n.recoverHandover(s, cl)
 		} else {
 			n.noteFull(s, cl)
 		}
@@ -1157,6 +1158,45 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 
 	if replaying {
 		b.startReplay(s, cl)
+	}
+}
+
+// recoverHandover finds the log deliveries a same-node handover lost: mochi
+// clones the old connection's inflight map into the new one but goes on
+// delivering to the old connection until Clients.Add, so a delivery injected
+// in between went to the old connection only. It is in the session's
+// deliveries (deliveriesOf takes the old connection) and in no inflight map
+// that will ever be resent. Each delivery of the session that the new
+// connection's inflight map does not hold under the same packet ID and
+// sequence is dropped from the books and the session is pinned below it, so
+// a repin replays it (as onPublishDropped does). followShare does the same
+// for shared deliveries. It runs at the CONNACK (established), after
+// Clients.Add, when nothing more can go to the old connection.
+func (n *clusterNode) recoverHandover(s *session, cl *mqtt.Client) {
+	s.mu.Lock()
+
+	repin := false
+
+	for id, seq := range s.out {
+		if held, ok := cl.State.Inflight.Get(id); ok {
+			if hs, tagged := seqOf(held); tagged && hs == seq {
+				continue
+			}
+		}
+
+		if s.pinLocked(seq - 1) {
+			repin = true
+		}
+
+		delete(s.out, id)
+		delete(s.skip, seq)
+		n.handoverLost.Add(1)
+	}
+
+	s.mu.Unlock()
+
+	if repin {
+		go n.b.repin(s)
 	}
 }
 

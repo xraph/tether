@@ -155,6 +155,14 @@ type clusterNode struct {
 	// earlier write and went again on its revision (persist).
 	ownWrites atomic.Uint64
 
+	// handoverLost counts log deliveries a same-node handover lost to the
+	// old connection and gave back to the replay (recoverHandover).
+	handoverLost atomic.Uint64
+
+	// qosDroppedHook, when a test sets it before Start, runs at the start
+	// of every OnQosDropped of a network client.
+	qosDroppedHook func(cl *mqtt.Client)
+
 	// holdAppend, when a test sets it before Start, runs before every
 	// append of a client publish and may block until ctx ends. An error
 	// fails that attempt, as a log that refuses appends would.

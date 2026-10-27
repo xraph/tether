@@ -1016,6 +1016,10 @@ func (h *hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 // one is finished (its message expired).
 func (h *hook) OnQosDropped(cl *mqtt.Client, pk packets.Packet) {
 	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		if hook := n.qosDroppedHook; hook != nil {
+			hook(cl)
+		}
+
 		n.onQosDropped(cl, pk)
 		n.shareDropped(cl, pk, false)
 	}

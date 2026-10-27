@@ -16,6 +16,7 @@ import (
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
+	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether"
@@ -1478,4 +1479,71 @@ func TestOwnLateWriteNotTakeover(t *testing.T) {
 
 	require.Positive(t, a.cluster.ownWrites.Load())
 	require.Zero(t, a.cluster.takeovers.Load())
+}
+
+// A log delivery injected during a same-node handover, after mochi cloned
+// the old connection's inflight map and before the new connection is in
+// mochi's clients, goes to the old connection only. The new connection gets
+// it anyway: the session is pinned below it and replays it (B-I3). The hook
+// injects at that moment: mochi clears the old connection's inflight map
+// there, which fires OnQosDropped.
+func TestHandoverWindowDeliveryNotLost(t *testing.T) {
+	var (
+		hookPub atomic.Pointer[client5]
+		fired   atomic.Bool
+	)
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			if b.cluster == nil {
+				return
+			}
+
+			b.cluster.qosDroppedHook = func(cl *mqtt.Client) {
+				pub := hookPub.Load()
+				if pub == nil || !cl.IsTakenOver() || !strings.HasSuffix(cl.ID, "/ho") || !fired.CompareAndSwap(false, true) {
+					return
+				}
+
+				ctx, cancel := context.WithTimeout(context.Background(), logWait)
+				defer cancel()
+
+				if _, err := pub.Publish(ctx, &paho.Publish{Topic: "ho/x", QoS: 1, Payload: []byte("late")}); err != nil {
+					return
+				}
+
+				// Until the reader has delivered it to the old connection.
+				for range 500 {
+					for _, pk := range cl.State.Inflight.GetAll(false) {
+						if string(pk.Payload) == "late" {
+							return
+						}
+					}
+
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		})
+
+	pub, _, err := connect5(t, c.addr(0), "ho-pub", "u1", true)
+	require.NoError(t, err)
+
+	sess := newRawSession()
+	old := dialRaw(t, c.addr(0), "ho", sess, true)
+	require.Equal(t, byte(0), old.ack(t).ReasonCode)
+	old.subscribe(t, "ho/#", 1)
+
+	require.Equal(t, byte(0), publishQ(t, pub, "ho/x", "m0", 1))
+	eventually(t, "m0 at the old connection", func() bool { return sess.count("m0") == 1 })
+
+	hookPub.Store(pub)
+
+	cur := dialRaw(t, c.addr(0), "ho", sess, false)
+	require.Equal(t, byte(0), cur.ack(t).ReasonCode)
+	require.True(t, fired.Load(), "the hook never ran")
+
+	eventually(t, "the message injected during the handover", func() bool { return sess.count("late") >= 1 })
+	require.Positive(t, c.nodes[0].cluster.handoverLost.Load())
 }
