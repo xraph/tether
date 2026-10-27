@@ -58,14 +58,19 @@ func (w *stallWatch) quiet() time.Duration { return time.Since(w.base) - time.Du
 // newest sequence the stream holds for the loop (want) and how far the loop
 // got (at). want above at is a stall: stalled is called once and run
 // returns. Otherwise the loop is idle and caught up, which counts as
-// progress, so an idle loop costs one behind call per after. An error from
-// behind (NATS unreachable, say) decides nothing and also counts as
-// progress: the consumer's own recovery runs meanwhile, and a stall has to
-// last a whole after while the stream answers before the loop is ended, so a
-// long outage never ends a consumer that is catching up once it is over.
+// progress, so an idle loop costs one behind call per after.
+//
+// An error from behind (NATS unreachable, say) decides nothing. The watch
+// then asks again at every look, whatever the quiet time, until the stream
+// answers, and counts that first answer as progress. So after an outage the
+// loop gets a whole after, from the moment the stream answers again (give or
+// take one look), to deliver before it can be ended: the consumer's own
+// recovery runs in that time, and a consumer catching up is not ended for
+// the outage it just sat through.
 func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context) (want, at uint64, err error), stalled func(want, at uint64)) {
 	every := max(w.after/4, minStallCheck)
 	timer := time.NewTimer(jitter(every))
+	outage := false
 
 	defer timer.Stop()
 
@@ -79,7 +84,7 @@ func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context
 			timer.Reset(jitter(every))
 		}
 
-		if w.busy.Load() || w.quiet() < w.after {
+		if !outage && (w.busy.Load() || w.quiet() < w.after) {
 			continue
 		}
 
@@ -88,13 +93,19 @@ func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context
 
 		cancel()
 
-		if err != nil {
+		switch {
+		case err != nil:
+			outage = true
+
+			continue
+		case outage:
+			// The first answer after an outage starts the clock again.
+			outage = false
+
 			w.progress()
 
 			continue
-		}
-
-		if want <= at {
+		case want <= at:
 			w.progress()
 
 			continue

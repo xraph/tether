@@ -308,10 +308,10 @@ func (p *PendingAppend) Wait(ctx context.Context) (seq uint64, dup bool, err err
 }
 
 // Settled reports, without waiting, whether the append has its answer, and
-// if so the error Wait will return (nil for a commit). An ack arrives in the
-// order the appends were sent, so an append that is not settled while a later
-// one is has lost its ack (the stream leader that had it died) and should be
-// sent again.
+// if so the error Wait will return (nil for a commit). The answer is kept, so
+// a later Wait returns it. Answers need not come in the order the appends
+// were sent: nats.go republishes on its own after a 503, and a leader
+// answers a duplicate message ID at once.
 func (p *PendingAppend) Settled() (bool, error) {
 	if !p.settled {
 		select {

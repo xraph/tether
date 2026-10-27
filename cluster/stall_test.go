@@ -1,12 +1,14 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -473,5 +475,56 @@ func TestControlReplacesConsumerOnOfflineReset(t *testing.T) {
 
 	if !replaced {
 		t.Fatal("the bus still runs its first consumer")
+	}
+}
+
+// After an outage the stall watch gives the loop a whole bound from the
+// moment the stream answers again. Here nothing is ever delivered and the
+// stream holds more throughout; behind fails for three bounds, then answers.
+// The stall verdict must come at least a bound (less one jittered look)
+// after that first answer. Counting a failed read as progress alone was not
+// enough: the read before the outage ended could be a bound old, and the
+// first answer then ended the loop at once.
+func TestStallWatchGivesABoundAfterAnOutage(t *testing.T) {
+	const after = 400 * time.Millisecond
+
+	w := newStallWatch(after)
+	w.progress()
+
+	var (
+		down     atomic.Bool
+		answered atomic.Int64
+	)
+
+	down.Store(true)
+
+	stalledAt := make(chan time.Time, 1)
+	stop, done := make(chan struct{}), make(chan struct{})
+
+	defer close(stop)
+
+	go w.run(stop, done, func(context.Context) (uint64, uint64, error) {
+		if down.Load() {
+			return 0, 0, errors.New("no responders")
+		}
+
+		answered.CompareAndSwap(0, time.Now().UnixNano())
+
+		return 10, 5, nil
+	}, func(uint64, uint64) { stalledAt <- time.Now() })
+
+	time.Sleep(3 * after)
+	down.Store(false)
+
+	select {
+	case at := <-stalledAt:
+		got := at.Sub(time.Unix(0, answered.Load()))
+		if floor := after - after*5/16; got < floor {
+			t.Fatalf("stalled %s after the stream answered again, want at least %s", got, floor)
+		}
+
+		t.Logf("stalled %s after the stream answered again (bound %s)", got.Round(time.Millisecond), after)
+	case <-time.After(5 * after):
+		t.Fatal("the watch never ended a loop that stayed behind")
 	}
 }
