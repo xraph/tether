@@ -110,6 +110,10 @@ type sharedNode struct {
 	// a QoS 2 pin enters the session's QoS2Out.
 	shareBeforeSend func(nsID string)
 	sharePinned     func()
+
+	// shareAfterWrite, a test seam set before Start, runs in the writer
+	// right after a shared message's write, before followShare.
+	shareAfterWrite func(nsID string)
 }
 
 func newSharedNode() sharedNode {
@@ -535,19 +539,35 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 	pk := it.pk
 	qos := pk.FixedHeader.Qos
 
-	s, cl, ok := n.shareTarget(nsID, out, qos)
-	if !ok {
-		it.done(errShareLost)
-		n.sharedLost.Add(1)
+	var (
+		s       *session
+		cl      *mqtt.Client
+		d       *shareDelivery
+		tracked bool
+		hooked  bool
+	)
 
-		return
-	}
+	for {
+		var ok bool
 
-	if hook := n.shareBeforeSend; hook != nil {
-		hook(nsID)
-	}
+		s, cl, ok = n.shareTarget(nsID, out, qos)
+		if !ok {
+			it.done(errShareLost)
+			n.sharedLost.Add(1)
 
-	if qos > 0 {
+			return
+		}
+
+		if hook := n.shareBeforeSend; hook != nil && !hooked {
+			hooked = true
+
+			hook(nsID)
+		}
+
+		if qos == 0 {
+			break
+		}
+
 		id, err := cl.NextPacketID()
 		if err != nil {
 			it.done(errShareLost)
@@ -558,10 +578,22 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 
 		pk.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
 
-		tracked := n.claimID(s, pk.PacketID)
+		// The ID is cl's. If the session has moved to another connection
+		// meanwhile, the books (which the new connection uses) must not be
+		// cleared under it: start again with the current connection.
+		if n.client(s) != cl {
+			continue
+		}
 
+		tracked = n.claimID(s, pk.PacketID)
+
+		break
+	}
+
+	if qos > 0 {
 		if qos == 1 {
-			if !n.registerShare(nsID, out, pk.PacketID, it.done) {
+			d = n.registerShare(nsID, out, pk.PacketID, it.done)
+			if d == nil {
 				return
 			}
 		} else if !n.pinShare(s, cl, out, tracked, pk.PacketID, it) {
@@ -588,7 +620,11 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 
 	err := cl.WritePacket(pk)
 
-	if qos > 0 && n.followShare(nsID, cl, pk, it.seq) {
+	if hook := n.shareAfterWrite; hook != nil {
+		hook(nsID)
+	}
+
+	if qos > 0 && n.followShare(nsID, cl, pk, it.seq, d) {
 		// The session moved to another connection of this node meanwhile:
 		// the delivery went with it.
 		n.sharedSent.Add(1)
@@ -615,13 +651,17 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 // and clears the old, so an entry set on the old connection after the clone
 // is in neither, and a takeover is not a resume from the record, so nothing
 // would send it again. When the session's connection is no longer cl, the
-// packet goes into the current connection's inflight map and is written to
-// it with DUP once its CONNACK is out (a copy mochi already resent from the
-// clone is the same packet ID: the client takes it once). If the new
-// connection gave that ID to another delivery meanwhile, this one moves to a
-// fresh ID (renumberShare). It reports whether the session had moved; false
-// leaves the outcome to cl's write.
-func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packet, seq uint64) bool {
+// delivery goes to the current connection once its CONNACK is out: mochi
+// replaces that connection's inflight map until then (inheritClientSession),
+// and has resent what it cloned by then. A delivery the clone carried, which
+// mochi resent, is left alone (isOwnShare); one at PUBREL is never sent as a
+// PUBLISH again. Otherwise it goes into the current connection's inflight
+// map and is written with DUP, under a fresh packet ID if that connection
+// gave its ID to another delivery (renumberShare). d is a QoS 1 delivery's
+// pending entry: once it is no longer the session's (given back to its
+// group, or finished), nothing is sent. It reports whether the session had
+// moved; false leaves the outcome to cl's write.
+func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packet, seq uint64, d *shareDelivery) bool {
 	moved := false
 
 	for {
@@ -632,14 +672,28 @@ func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packe
 			return moved
 		}
 
-		if !moved && cl.IsTakenOver() && cl.State.Inflight.Delete(pk.PacketID) {
-			// The orphan on the connection that was taken over.
+		if cl.IsTakenOver() && cl.State.Inflight.Delete(pk.PacketID) {
+			// The orphan on a connection that was taken over.
 			atomic.AddInt64(&n.mochi.Info.Inflight, -1)
 		}
 
 		moved = true
 
-		if held, taken := cur.State.Inflight.Get(pk.PacketID); taken && !samePublish(held, pk) {
+		select {
+		case <-acked:
+		case <-time.After(connackWait):
+			continue // read the session again: its connection may be gone
+		}
+
+		if !n.stillShared(nsID, pk, d) {
+			return true // given back to its group, or finished
+		}
+
+		if held, taken := cur.State.Inflight.Get(pk.PacketID); taken {
+			if n.isOwnShare(nsID, s, held, pk, seq, d) {
+				return true // cloned, and resent by mochi at the CONNACK
+			}
+
 			id, err := cur.NextPacketID()
 			if err != nil {
 				n.renumberShare(nsID, s, pk, 0, seq)
@@ -651,15 +705,13 @@ func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packe
 			pk.PacketID = uint16(id)                      //nolint:gosec // as above
 		}
 
+		if pk.FixedHeader.Qos == 2 && !n.repinShare(s, cur, pk.PacketID, seq) {
+			return true // the record write failed: persistNow stopped the client
+		}
+
 		if cur.State.Inflight.Set(pk) {
 			atomic.AddInt64(&n.mochi.Info.Inflight, 1)
 			cur.State.Inflight.DecreaseSendQuota()
-		}
-
-		select {
-		case <-acked:
-		case <-time.After(connackWait):
-			return true // it stays in cur's map; cur's own end handles it
 		}
 
 		pk.FixedHeader.Dup = true
@@ -672,18 +724,85 @@ func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packe
 	}
 }
 
-// samePublish reports whether an inflight entry is this shared PUBLISH.
-func samePublish(held, pk packets.Packet) bool {
-	return held.FixedHeader.Type == packets.Publish && held.TopicName == pk.TopicName &&
+// stillShared reports whether a QoS 1 shared delivery is still the
+// session's under pk's packet ID (its pending entry is d); QoS 2 always is,
+// once pinned.
+func (n *clusterNode) stillShared(nsID string, pk packets.Packet, d *shareDelivery) bool {
+	if pk.FixedHeader.Qos != 1 {
+		return true
+	}
+
+	n.shMu.Lock()
+	defer n.shMu.Unlock()
+
+	return d != nil && n.shPend[nsID][pk.PacketID] == d
+}
+
+// isOwnShare reports whether held, an inflight entry of the session's
+// current connection under pk's packet ID, is this shared delivery (cloned
+// from the old connection) rather than another one: a shared delivery is
+// never tagged with a log sequence, and the books say whose the ID is. QoS
+// 2: the session's pin under the ID is this message (Shared == seq), at
+// PUBLISH or PUBREL. QoS 1: its pending entry is d and the entry carries the
+// same message.
+func (n *clusterNode) isOwnShare(nsID string, s *session, held, pk packets.Packet, seq uint64, d *shareDelivery) bool {
+	if _, tagged := seqOf(held); tagged {
+		return false
+	}
+
+	if pk.FixedHeader.Qos == 2 {
+		s.mu.Lock()
+		or, ok := s.qos2Out[pk.PacketID]
+		s.mu.Unlock()
+
+		return ok && or.Seq == 0 && or.Shared == seq
+	}
+
+	n.shMu.Lock()
+	mine := n.shPend[nsID][pk.PacketID] == d
+	n.shMu.Unlock()
+
+	return mine && held.FixedHeader.Type == packets.Publish && held.TopicName == pk.TopicName &&
 		bytes.Equal(held.Payload, pk.Payload)
+}
+
+// repinShare makes sure the session's record pins a QoS 2 shared delivery
+// under id before it is written there: a pin the new connection's books
+// lost (claimID) or that moved to id (renumberShare) is written at once
+// (persistNow), so a resume finds it under the ID the client sees. It
+// reports false when that write failed.
+func (n *clusterNode) repinShare(s *session, cl *mqtt.Client, id uint16, seq uint64) bool {
+	s.mu.Lock()
+
+	tracked := s.tracked
+
+	or, ok := s.qos2Out[id]
+	if ok && or.Seq == 0 && or.Shared == seq && s.savedGen >= s.gen {
+		s.mu.Unlock()
+
+		return true
+	}
+
+	if !ok || or.Seq != 0 || or.Shared != seq {
+		s.qos2Out[id] = cluster.OutRecord{State: outPublish, Shared: seq}
+		s.gen++
+	}
+
+	s.mu.Unlock()
+
+	if !tracked {
+		return true
+	}
+
+	return n.persistNow(s, cl)
 }
 
 // renumberShare moves a shared delivery that followed a takeover to the
 // packet ID id, because the new connection used its old one for another
 // delivery. QoS 1: its pending entry moves (id 0: no ID left, it goes back
 // to its group). QoS 2: the session's pin moves, re-added if the other
-// delivery's record entry replaced it; the record is written by the next
-// flush.
+// delivery's record entry replaced it; followShare writes the record
+// before it sends under the new ID (repinShare).
 func (n *clusterNode) renumberShare(nsID string, s *session, pk packets.Packet, id uint16, seq uint64) {
 	old := pk.PacketID
 
@@ -754,10 +873,11 @@ func (n *clusterNode) claimID(s *session, id uint16) bool {
 	return tracked
 }
 
-// registerShare records a QoS 1 shared delivery until its PUBACK. A stale
-// one under the same ID (mochi lost its entry) goes back to its group. It
-// reports false, after giving the message back, when the session ended.
-func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done func(error)) bool {
+// registerShare records a QoS 1 shared delivery until its PUBACK and
+// returns its pending entry. A stale one under the same ID (mochi lost its
+// entry) goes back to its group. It returns nil, after giving the message
+// back, when the session ended.
+func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done func(error)) *shareDelivery {
 	n.shMu.Lock()
 
 	if out.ended.Load() {
@@ -765,7 +885,7 @@ func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done 
 		done(errShareLost)
 		n.sharedLost.Add(1)
 
-		return false
+		return nil
 	}
 
 	set := n.shPend[nsID]
@@ -775,7 +895,8 @@ func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done 
 	}
 
 	stale := set[id]
-	set[id] = &shareDelivery{done: done, qos: 1}
+	d := &shareDelivery{done: done, qos: 1}
+	set[id] = d
 	n.shMu.Unlock()
 
 	if stale != nil {
@@ -783,7 +904,7 @@ func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done 
 		n.sharedLost.Add(1)
 	}
 
-	return true
+	return d
 }
 
 // pinShare makes a QoS 2 shared delivery the session's (ruling R39): for a

@@ -1095,3 +1095,124 @@ func TestSharedOversizedDiscarded(t *testing.T) {
 	require.Equal(t, uint64(2), c.nodes[0].cluster.oversized.Load())
 	require.Zero(t, c.nodes[0].cluster.sharedLost.Load())
 }
+
+// C-I3 (2): a shared QoS 2 delivery at PUBREL when a same-node takeover
+// lands is the session's own: the new connection gets its PUBREL from the
+// clone, and the writer that wrote the PUBLISH to the old connection does
+// not take the cloned PUBREL entry for another delivery and send the
+// message again under a fresh packet ID.
+func TestSharedTakeoverAtPubrelNotResent(t *testing.T) {
+	seam := newGateSeam()
+	c, _ := sharedSeamCell(t, func(n *clusterNode) { n.shareAfterWrite = func(string) { seam.hold() } })
+
+	m1, _ := rawPersist(t, c.addr(0), "tp", 0)
+	rawSubscribe(t, m1, 2, "$share/g/tp/#")
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+
+	seam.armed.Store(true)
+	require.Equal(t, byte(0), publishQ(t, pub, "tp/x", "once", 2))
+	seam.wait(t)
+
+	cp := readLog(t, m1)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	id := cp.Content.(*packets.Publish).PacketID
+	writePacket(t, m1, &packets.Pubrec{PacketID: id, Properties: &packets.Properties{}})
+
+	cp = readLog(t, m1)
+	require.Equal(t, packets.PUBREL, cp.Type)
+
+	m2, ack := rawPersist(t, c.addr(0), "tp", 0)
+	require.True(t, ack.SessionPresent)
+
+	close(seam.release)
+
+	cp = readLog(t, m2)
+	require.Equal(t, packets.PUBREL, cp.Type)
+	require.Equal(t, id, cp.Content.(*packets.Pubrel).PacketID)
+
+	if cp := readFor(t, m2, time.Second); cp != nil {
+		t.Fatalf("after the PUBREL the new connection got %v: the message went out twice", cp)
+	}
+}
+
+// C-I3 (3): a writer that chose the old connection before a same-node
+// takeover must not take a packet ID from it and clear the session's books
+// under that ID: the new connection may carry another delivery there (here a
+// log QoS 2 delivery the new connection got after the takeover), which would
+// be dropped from the books and replayed under a fresh ID, a second copy of
+// a QoS 2 message. The writer starts again on the new connection.
+func TestSharedStaleWriterKeepsBooks(t *testing.T) {
+	seam := newGateSeam()
+	c, _ := sharedSeamCell(t, func(n *clusterNode) { n.shareBeforeSend = func(string) { seam.hold() } })
+
+	m1, _ := rawPersist(t, c.addr(0), "sw", 0)
+	rawSubscribe(t, m1, 2, "$share/g/sw/#", "swl/#")
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+
+	// The first stays in flight at PUBLISH: m1 does not answer it.
+	require.Equal(t, byte(0), publishQ(t, pub, "sw/x", "first", 2))
+
+	cp := readLog(t, m1)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	seam.armed.Store(true)
+	require.Equal(t, byte(0), publishQ(t, pub, "sw/x", "second", 2))
+	seam.wait(t)
+
+	m2, ack := rawPersist(t, c.addr(0), "sw", 0)
+	require.True(t, ack.SessionPresent)
+
+	// A log delivery on the new connection, while the writer still holds
+	// the old one: it takes the new connection's next packet ID.
+	require.Equal(t, byte(0), publishQ(t, pub, "swl/x", "log", 2))
+
+	ids := map[string]map[uint16]bool{}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		cp := readFor(t, m2, 200*time.Millisecond)
+		if cp == nil {
+			if len(ids["log"]) > 0 {
+				break
+			}
+
+			continue
+		}
+
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			if ids[string(p.Payload)] == nil {
+				ids[string(p.Payload)] = map[uint16]bool{}
+			}
+
+			ids[string(p.Payload)][p.PacketID] = true
+		}
+	}
+
+	require.Len(t, ids["log"], 1, "the log delivery reached the new connection before the writer went on")
+
+	close(seam.release)
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		cp := readFor(t, m2, 300*time.Millisecond)
+		if cp == nil {
+			continue
+		}
+
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			if ids[string(p.Payload)] == nil {
+				ids[string(p.Payload)] = map[uint16]bool{}
+			}
+
+			ids[string(p.Payload)][p.PacketID] = true
+		}
+	}
+
+	require.Len(t, ids["second"], 1, "the held shared delivery")
+	require.Len(t, ids["log"], 1, "the log QoS 2 message went out under two packet IDs")
+}
