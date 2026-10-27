@@ -1,4 +1,4 @@
-.PHONY: help h test clean fmt lint lint-fix vet tidy deps check coverage all t c f l lf v check-deps
+.PHONY: help h test clean fmt lint lint-fix vet tidy deps check coverage all t c f l lf v check-deps chaos
 
 # Default target
 .DEFAULT_GOAL := help
@@ -31,6 +31,7 @@ help h:
 	@echo "  make test-race      - Run tests with race detector"
 	@echo "  make coverage       - Generate test coverage report"
 	@echo "  make coverage-html  - Generate HTML coverage report"
+	@echo "  make chaos          - Run the chaos suite (real NATS and broker processes, several minutes)"
 	@echo ""
 	@echo "$(GREEN)Dependencies:$(NC)"
 	@echo "  make deps           - Install development dependencies"
@@ -101,6 +102,12 @@ test-race:
 	@echo "$(BLUE)Running tests with race detector...$(NC)"
 	$(GO) test -race -v ./...
 	@echo "$(GREEN)✓ Race tests complete$(NC)"
+
+## chaos: Run the chaos suite against a cell of real processes (see chaos/README.md)
+chaos:
+	@echo "$(BLUE)Running the chaos suite...$(NC)"
+	GOWORK=off $(GO) test -tags chaos -count=1 -v -timeout 30m ./chaos/
+	@echo "$(GREEN)✓ Chaos suite complete$(NC)"
 
 ## coverage: Generate test coverage
 coverage:

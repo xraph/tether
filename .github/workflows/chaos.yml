@@ -1,0 +1,55 @@
+name: Chaos
+
+# The chaos suite runs a three-node cell as real processes (three NATS servers
+# and three brokers) and kills, cuts and slows them. It takes several minutes,
+# so it runs nightly and on demand, not on every push. See chaos/README.md.
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  chaos:
+    name: Chaos suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      GOWORK: "off"
+      # Every cell keeps its data and logs here, for the upload on failure.
+      TETHER_CHAOS_KEEP: "1"
+      TMPDIR: ${{ runner.temp }}/chaos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Make the temp dir
+        run: mkdir -p "$TMPDIR"
+
+      - name: Run the chaos suite
+        run: go test -tags chaos -count=1 -v -timeout 30m ./chaos/
+
+      - name: Upload cell logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-cells
+          path: |
+            ${{ runner.temp }}/chaos/tether-chaos-*/**/*.log
+            ${{ runner.temp }}/chaos/tether-chaos-*/**/*.json
+          retention-days: 14
