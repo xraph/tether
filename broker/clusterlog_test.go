@@ -492,7 +492,7 @@ func TestInjectQoS12KeepsNoState(t *testing.T) {
 
 	for i := range 20 {
 		qos := byte(1 + i%2)
-		require.NoError(t, a.inject(tid, "i/x", []byte(fmt.Sprint(i)), qos, cluster.Props{}, "", 0))
+		require.NoError(t, a.inject(tid, "i/x", []byte(fmt.Sprint(i)), qos, cluster.Props{}, "", 0, false))
 	}
 
 	for i := range 20 {

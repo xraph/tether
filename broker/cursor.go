@@ -402,7 +402,7 @@ func (b *Broker) deliverLog(tenantID string, m cluster.LogMessage) error {
 		origin = namespacedID(m.Tenant, m.ClientID)
 	}
 
-	err := b.inject(m.Tenant, m.Topic, m.Payload, m.QoS, m.Props, origin, m.Seq)
+	err := b.inject(m.Tenant, m.Topic, m.Payload, m.QoS, m.Props, origin, m.Seq, m.Retain)
 	if err != nil {
 		// At Stop (errNotInjecting) the sessions are ending: pinned, not
 		// replayed.
@@ -997,12 +997,17 @@ func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage
 
 	now := time.Now()
 	out := packets.Packet{
-		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: min(m.QoS, sub.Qos, srv.Options.Capabilities.MaximumQos)},
-		TopicName:   ns,
-		Payload:     m.Payload,
-		Properties:  packetProps(m.Props),
-		Origin:      origin,
-		Created:     now.Unix(),
+		FixedHeader: packets.FixedHeader{
+			Type: packets.Publish, Qos: min(m.QoS, sub.Qos, srv.Options.Capabilities.MaximumQos),
+			// [MQTT-3.3.1-12], [MQTT-3.3.1-13]: the flag as published only
+			// for a 5.0 subscription with Retain As Published.
+			Retain: m.Retain && sub.RetainAsPublished && cl.Properties.ProtocolVersion == 5,
+		},
+		TopicName:  ns,
+		Payload:    m.Payload,
+		Properties: packetProps(m.Props),
+		Origin:     origin,
+		Created:    now.Unix(),
 	}
 
 	if len(ids) > 0 {
@@ -1041,8 +1046,9 @@ func (b *Broker) deliverDirect(s *session, cl *mqtt.Client, m cluster.LogMessage
 // match merges the subscriptions of s (those on cl and those still held out
 // of the index) that match the tenant-relative topic name, as mochi does for
 // a delivery: the highest QoS, every subscription identifier, and No Local
-// only when every matching subscription has it. Shared subscriptions are left
-// to their group.
+// only when every matching subscription has it. Retain As Published is set
+// when any matching subscription has it, as for a live delivery
+// (retainAsPublished). Shared subscriptions are left to their group.
 func (s *session) match(cl *mqtt.Client, name string) (packets.Subscription, []int, bool) {
 	all := cl.State.Subscriptions.GetAll()
 
@@ -1071,6 +1077,7 @@ func (s *session) match(cl *mqtt.Client, name string) (packets.Subscription, []i
 		found = true
 		merged.Qos = max(merged.Qos, sub.Qos)
 		merged.NoLocal = merged.NoLocal && sub.NoLocal
+		merged.RetainAsPublished = merged.RetainAsPublished || sub.RetainAsPublished
 
 		if sub.Identifier > 0 {
 			ids = append(ids, sub.Identifier)

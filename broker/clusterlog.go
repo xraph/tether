@@ -250,6 +250,9 @@ func (b *Broker) sweepReaders() {
 	for _, r := range idle {
 		r.Stop()
 	}
+
+	// The tenants' retained caches follow the same rule.
+	n.sweepRetained(live, now)
 }
 
 // closeReaders stops the sweep and every reader, for Stop. No reader starts
@@ -381,9 +384,9 @@ type pubItem struct {
 	msg   cluster.LogMessage
 	msgID string
 
-	// retained is the namespaced packet to keep as this node's retained
-	// message once committed, nil when the publish is not retained.
-	retained *packets.Packet
+	// retained is the write to the cell's retained store that follows the
+	// commit, nil when the publish is not retained.
+	retained *retainWrite
 
 	rec packets.Packet // the PUBREC reserved in the inflight map (QoS 2)
 
@@ -672,11 +675,11 @@ func (p *pubPipe) commit(it *pubItem) bool {
 			if err == nil {
 				n.appends.Add(1)
 
-				if it.retained != nil {
-					retainLocal(p.srv, it.retained)
+				if it.qos == 2 && !p.committed(it) {
+					return false
 				}
 
-				return it.qos != 2 || p.committed(it)
+				return it.retained == nil || p.retain(it)
 			}
 
 			it.err = err
@@ -708,6 +711,23 @@ func (p *pubPipe) commit(it *pubItem) bool {
 
 		p.start(it)
 	}
+}
+
+// retain writes the retained message of a committed publish to the cell's
+// store before its ack, so a PUBACK or PUBREC says the message is in the log
+// and retained in the cell (clusterretained.go). It retries while the
+// connection is open, for up to the retry window. When the connection ends
+// first the write goes on in the background queue (the message is in the
+// log, and a QoS 2 client will not send it again) and it reports false: no
+// ack. When the window runs out first it does the same and acks (in an
+// outage that long the node has fenced itself and closed the connection).
+func (p *pubPipe) retain(it *pubItem) bool {
+	err := p.b.cluster.storeRetained(p.ctx, it.retained, true)
+	if err == nil {
+		return true
+	}
+
+	return p.ctx.Err() == nil && !p.cl.Closed()
 }
 
 // ack writes the PUBACK or PUBREC of it. A successful PUBREC is the one
@@ -788,9 +808,7 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 	}
 
 	if pk.FixedHeader.Retain {
-		ret := pk.Copy(false)
-		ret.Payload = it.msg.Payload
-		it.retained = &ret
+		it.retained = n.newRetainWrite(st.tenantID, rel, it.msg.Payload, qos, it.msg.Props, st.rawID)
 	}
 
 	if qos == 2 {
@@ -819,9 +837,10 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 
 // appendHost appends a host publish (Publish, DevicePublish) at QoS 1 or 2
 // to the log and waits for the commit; every node, this one included,
-// delivers it from its reader. ns is the namespaced name, for the local
-// retained copy.
-func (b *Broker) appendHost(ctx context.Context, srv *mqtt.Server, tenantID, name, ns string, payload []byte, qos byte, retain bool) error {
+// delivers it from its reader. A retained one is then written to the cell's
+// retained store (clusterretained.go) under the same ctx; its error is
+// returned, though the message is in the log by then.
+func (b *Broker) appendHost(ctx context.Context, tenantID, name string, payload []byte, qos byte, retain bool) error {
 	n := b.cluster
 
 	_, _, err := n.Log.Append(ctx, cluster.LogMessage{
@@ -834,29 +853,12 @@ func (b *Broker) appendHost(ctx context.Context, srv *mqtt.Server, tenantID, nam
 	n.appends.Add(1)
 
 	if retain {
-		retainLocal(srv, &packets.Packet{
-			FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: qos, Retain: true},
-			TopicName:   ns,
-			Payload:     payload,
-			Created:     time.Now().Unix(),
-		})
+		if err := n.storeRetained(ctx, n.newRetainWrite(tenantID, name, payload, qos, cluster.Props{}, ""), false); err != nil {
+			return fmt.Errorf("in the log, not retained: %w", err)
+		}
 	}
 
 	return nil
-}
-
-// retainLocal keeps pk (namespaced) as this node's retained message on its
-// topic, or clears it for an empty payload, as mochi does for a retained
-// publish it delivers itself. Until retained messages live in the cell
-// (Task 11), a retained QoS 1 or 2 message is retained on the node it was
-// published on, like a QoS 0 one.
-func retainLocal(srv *mqtt.Server, pk *packets.Packet) {
-	if srv.Options.Capabilities.RetainAvailable == 0 {
-		return
-	}
-
-	srv.Topics.RetainMessage(pk.Copy(false))
-	atomic.StoreInt64(&srv.Info.Retained, int64(srv.Topics.Retained.Len()))
 }
 
 // qos2MsgID returns the message ID a QoS 2 publish of session nsID with

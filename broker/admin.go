@@ -16,6 +16,7 @@ import (
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/id"
 	"github.com/xraph/tether/subject"
 	"github.com/xraph/tether/tenant"
@@ -858,7 +859,9 @@ func (b *Broker) purgeSession(srv *mqtt.Server, cl *mqtt.Client) {
 // sorted by topic. As in MQTT, a filter starting with a wildcard matches no
 // topic starting with "$" (so "#" does not list the tenant's $SYS).
 // Shared filters ("$share/...") match nothing. Before Start, after Stop and
-// for a malformed tenant ID or filter it returns nil.
+// for a malformed tenant ID or filter it returns nil. In cluster mode it
+// lists the cell's retained messages, from the cell's store; when that
+// cannot be read, this node's cache.
 func (b *Broker) Retained(tenantID, filter string) []RetainedInfo {
 	if !validTenant(tenantID) || topic.Valid(filter, true, b.cfg.MaxTopicLength) != nil || withoutShare(filter) != filter {
 		return nil
@@ -867,6 +870,12 @@ func (b *Broker) Retained(tenantID, filter string) []RetainedInfo {
 	srv := b.running()
 	if srv == nil {
 		return nil
+	}
+
+	if b.cluster != nil {
+		if out, ok := b.clusterRetained(tenantID, filter); ok {
+			return out
+		}
 	}
 
 	var out []RetainedInfo
@@ -890,7 +899,10 @@ func (b *Broker) Retained(tenantID, filter string) []RetainedInfo {
 // which also deletes it from storage. As with any MQTT clearing, the
 // topic's current subscribers receive that empty message. Topics under
 // "$SYS" (in any casing) are refused like a client's publish would be.
-// It returns tether.ErrNotFound when nothing is retained on the topic.
+// It returns tether.ErrNotFound when nothing is retained on the topic. In
+// cluster mode the delete goes to the cell's store first (an error wrapping
+// cluster.ErrUnavailable when it cannot be reached), and the topic counts as
+// retained when the cell has a message on it.
 func (b *Broker) DeleteRetained(tenantID, topicName string) error {
 	ns, err := b.namespaceName(tenantID, topicName)
 	if err != nil {
@@ -900,6 +912,10 @@ func (b *Broker) DeleteRetained(tenantID, topicName string) error {
 	srv := b.running()
 	if srv == nil {
 		return noRetained(topicName)
+	}
+
+	if b.cluster != nil {
+		return b.clusterDeleteRetained(srv, tenantID, topicName, ns)
 	}
 
 	if _, ok := srv.Topics.Retained.Get(ns); !ok {
@@ -925,7 +941,8 @@ func (b *Broker) DeleteRetained(tenantID, topicName string) error {
 // lower of qos and the subscription's QoS. With retain, the message is
 // retained (an empty payload clears the retained message instead, as in
 // MQTT). The payload is copied. Before Start or after Stop it fails with
-// tether.ErrConflict.
+// tether.ErrConflict. In cluster mode a retained publish is also written to
+// the cell's retained store, under ctx, and a failure there is returned.
 func (b *Broker) Publish(ctx context.Context, tenantID, topicName string, payload []byte, qos byte, retain bool) error {
 	return b.publish(ctx, tenantID, topicName, payload, qos, retain, false)
 }
@@ -969,7 +986,18 @@ func (b *Broker) publish(ctx context.Context, tenantID, topicName string, payloa
 	case b.cluster != nil && qos > 0:
 		// Through the log, like a device's QoS 1 publish (ruling R21):
 		// every node delivers it from its reader, this one included.
-		if err := b.appendHost(ctx, srv, tenantID, topicName, ns, slices.Clone(payload), qos, retain); err != nil {
+		if err := b.appendHost(ctx, tenantID, topicName, slices.Clone(payload), qos, retain); err != nil {
+			return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+		}
+	case b.cluster != nil && retain:
+		// The cell's retained store first, then the live message, which
+		// the hook routes with its retain flag taken off.
+		n := b.cluster
+		if err := n.storeRetained(ctx, n.newRetainWrite(tenantID, topicName, slices.Clone(payload), 0, cluster.Props{}, ""), false); err != nil {
+			return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
+		}
+
+		if err := srv.Publish(ns, slices.Clone(payload), true, 0); err != nil {
 			return fmt.Errorf("tether/broker: publish %q: %w", topicName, err)
 		}
 	default:

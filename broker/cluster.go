@@ -55,6 +55,12 @@ type Cluster struct {
 	// after the broker's and Stop after it. Nil: the node neither fences
 	// itself nor takes over for dead nodes.
 	Members *cluster.Members
+
+	// Retained is the cell's retained message store. Every retained publish
+	// is written there, and mochi's retained store becomes this node's cache
+	// of it (clusterretained.go). Leave it nil and the broker makes one on
+	// Conn.
+	Retained *cluster.Retained
 }
 
 // injectorID is the client ID of the injector, the inline client that
@@ -160,6 +166,10 @@ type clusterNode struct {
 	// (clusterlive.go).
 	liveness
 
+	// retainedNode is the retained cache and the writes to the cell's
+	// retained store (clusterretained.go).
+	retainedNode
+
 	// Test seams, set before Start: afterAcquire runs in a CONNECT right
 	// after its key is acquired, before the session is registered;
 	// loadHook runs first in loadSession and fails it with its error.
@@ -209,6 +219,7 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 		appendRetry:    defaultAppendRetry,
 		appendRetryMax: defaultAppendRetryMax,
 		liveness:       newLiveness(),
+		retainedNode:   newRetainedNode(),
 	}
 
 	if n.Log == nil {
@@ -217,6 +228,10 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 
 	if n.Sessions == nil {
 		n.Sessions = cluster.NewSessions(c.Conn, c.Config)
+	}
+
+	if n.Retained == nil {
+		n.Retained = cluster.NewRetained(c.Conn, c.Config)
 	}
 
 	n.persistQoS2 = n.persistQoS2In
@@ -290,7 +305,13 @@ var errNotInjecting = fmt.Errorf("tether/broker: inject: %w: broker not running"
 //
 // seq, when not zero, is the message's log sequence, tagged on the packet
 // (tagSeq) so the copies mochi makes for each subscriber carry it.
-func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props, origin string, seq uint64) error {
+//
+// retain is the publish's retain flag. The packet goes in with its retain
+// flag clear, so mochi never stores it (the node's retained cache follows the
+// cell's store, clusterretained.go), and tagged instead (tagRetained), so a
+// 5.0 subscriber with Retain As Published gets it with the flag set
+// (OnPacketEncode).
+func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props cluster.Props, origin string, seq uint64, retain bool) error {
 	n := b.cluster
 
 	n.gate.RLock()
@@ -321,6 +342,10 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 		tagSeq(&pk, seq)
 	}
 
+	if retain {
+		tagRetained(&pk)
+	}
+
 	if err := n.srv.InjectPacket(n.injector.Load(), pk); err != nil {
 		return fmt.Errorf("tether/broker: inject: %w", err)
 	}
@@ -348,14 +373,16 @@ func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props clus
 		return
 	}
 
-	if err := b.inject(tenantID, name, payload, 0, props, "", 0); err != nil && !errors.Is(err, errNotInjecting) {
+	if err := b.inject(tenantID, name, payload, 0, props, "", 0, false); err != nil && !errors.Is(err, errNotInjecting) {
 		b.cluster.log.Warn("tether: routed message not injected", slog.String("tenant", tenantID), slog.String("topic", name), slog.Any("error", err))
 	}
 }
 
 // publish routes one QoS 0 message to the other nodes of the cell. QoS 0 is
 // best effort: a failure is logged and counted, and the local delivery goes
-// ahead regardless. The retained flag does not travel.
+// ahead regardless. The retain flag does not travel (the Router carries
+// none), so another node delivers a routed message with it clear; the
+// retained message itself reaches every node through the retained store.
 func (n *clusterNode) publish(tenantID, rel string, pk *packets.Packet) {
 	if err := n.Router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties)); err != nil {
 		n.routeErrors.Add(1)

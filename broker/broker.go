@@ -228,11 +228,13 @@ func (b *Broker) Start(ctx context.Context) error {
 	// reader started for that client has somewhere to deliver.
 	if b.cluster != nil {
 		b.cluster.attach(srv)
+		b.cluster.startRetainedWriters()
 
 		// The owned-sessions watch runs before the first CONNECT can take
 		// a session.
 		if err := b.startSessions(); err != nil {
 			b.cluster.detach()
+			b.cluster.stopRetainedWriters()
 			_ = srv.Close()
 			b.server = nil
 
@@ -244,6 +246,7 @@ func (b *Broker) Start(ctx context.Context) error {
 		if b.cluster != nil {
 			b.cluster.detach()
 			b.stopSessions()
+			b.cluster.stopRetainedWriters()
 		}
 
 		_ = srv.Close()
@@ -390,9 +393,12 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// during the shutdown still release their routes.
 		// The log readers stop with it; pending QoS 1 and 2 acks are
 		// abandoned as their clients disconnect.
+		// The retained caches stop with them; the writes to the cell's
+		// retained store go on until the wills are done.
 		if b.cluster != nil {
 			b.cluster.detach()
 			b.closeReaders()
+			b.cluster.closeRetainedCaches()
 		}
 
 		err := shutdown(srv, ids)
@@ -403,6 +409,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// its key's owner, for the cell to publish once this node is dead.
 		if b.cluster != nil {
 			b.stopLive()
+			b.cluster.stopRetainedWriters()
 			b.stopSessions()
 			b.cluster.close()
 		}

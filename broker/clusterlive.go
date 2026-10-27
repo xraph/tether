@@ -487,24 +487,22 @@ func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will 
 
 	msgID := newMsgID()
 
-	if err := b.publishWill(ctx, st.tenantID, st.rawID, w, false, msgID); err != nil {
+	// A QoS 0 will is delivered on this node by the injector (local), so a
+	// retained one carries its retain flag to Retain As Published
+	// subscribers without mochi storing it; the log delivers a QoS 1 or 2
+	// one here too. mochi's own publish is withheld either way.
+	if err := b.publishWill(ctx, st.tenantID, st.rawID, w, will.Qos == 0, msgID); err != nil {
 		n.log.Warn("tether: will not published to the cell", slog.String("client", cl.ID), slog.Any("error", err))
 
 		if will.Qos > 0 && mine && !errors.Is(err, errWillDropped) {
 			// The record keeps it, and finish has it settled like a
 			// reclaimed key, under the same message ID in case an append
-			// committed after all. (A QoS 0 will mochi delivers here
+			// committed after all. (A QoS 0 will was delivered here
 			// anyway.)
 			s.owe(msgID)
 		}
 	}
 
-	if will.Qos == 0 {
-		// mochi delivers it on this node, and keeps it if it is retained.
-		return will
-	}
-
-	// The log delivers it here too.
 	return withheld
 }
 
@@ -519,26 +517,22 @@ func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will 
 // at Error, with an error wrapping errWillDropped.
 //
 // local makes this node deliver a QoS 0 will itself (the Router never
-// delivers to its own node) and keep a retained will here, which is what
-// mochi does for a will it fires. A QoS 1 or 2 will is always retained here,
-// since mochi's own publish of it is withheld. Retained wills stay on the
-// node that publishes them until retained messages live in the cell (Task
-// 11).
+// delivers to its own node), which is what mochi does for a will it fires.
+// A retained will, once out, is written to the cell's retained store and
+// this node's cache (clusterretained.go) under the same ctx; when ctx ends
+// first the write goes on in the background.
 func (b *Broker) publishWill(ctx context.Context, tenantID, rawID string, w *cluster.WillRecord, local bool, msgID string) error {
 	n := b.cluster
-	srv := n.server()
 
 	if msgID == "" {
 		msgID = newMsgID()
 	}
 
 	if local && w.QoS == 0 {
-		err := b.inject(tenantID, w.Topic, w.Payload, 0, w.Props, namespacedID(tenantID, rawID), 0)
+		err := b.inject(tenantID, w.Topic, w.Payload, 0, w.Props, namespacedID(tenantID, rawID), 0, w.Retain)
 		if err != nil && !errors.Is(err, errNotInjecting) {
 			n.log.Warn("tether: will not delivered on this node", slog.String("tenant", tenantID), slog.Any("error", err))
 		}
-
-		b.retainWill(srv, tenantID, w)
 	}
 
 	delay := willRetry
@@ -570,11 +564,16 @@ func (b *Broker) publishWill(ctx context.Context, tenantID, rawID string, w *clu
 
 	if w.QoS > 0 {
 		n.appends.Add(1)
-		// mochi's local publish of it is withheld, so this node keeps it.
-		b.retainWill(srv, tenantID, w)
 	}
 
 	n.willsSent.Add(1)
+
+	if w.Retain {
+		rw := n.newRetainWrite(tenantID, w.Topic, w.Payload, w.QoS, w.Props, rawID)
+		if err := n.storeRetained(ctx, rw, true); err != nil {
+			n.log.Warn("tether: retained will not stored yet", slog.String("client", namespacedID(tenantID, rawID)), slog.Any("error", err))
+		}
+	}
 
 	return nil
 }
@@ -628,22 +627,6 @@ func (b *Broker) sendWill(ctx context.Context, tenantID, rawID string, w *cluste
 	}, msgID)
 
 	return err
-}
-
-// retainWill keeps a retained will as this node's retained message, as
-// mochi does for a will it publishes (retainLocal).
-func (b *Broker) retainWill(srv *mqtt.Server, tenantID string, w *cluster.WillRecord) {
-	if !w.Retain || srv == nil {
-		return
-	}
-
-	retainLocal(srv, &packets.Packet{
-		FixedHeader: packets.FixedHeader{Type: packets.Publish, Qos: w.QoS, Retain: true},
-		TopicName:   topic.Namespace(tenantID, w.Topic),
-		Payload:     w.Payload,
-		Properties:  packetProps(w.Props),
-		Created:     time.Now().Unix(),
-	})
 }
 
 // validWill reports whether a will read from a record is one this node may

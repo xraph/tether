@@ -54,10 +54,11 @@ var provided = []byte{
 }
 
 // clusterProvided lists the methods the hook implements only in cluster
-// mode, where they keep the node's QoS 0 routes (cluster.go) and its
-// sessions' cursors (cursor.go). Alone, the broker provides exactly the
-// methods it always did.
+// mode, where they keep the node's QoS 0 routes (cluster.go), its sessions'
+// cursors (cursor.go) and its retained cache (clusterretained.go). Alone, the
+// broker provides exactly the methods it always did.
 var clusterProvided = []byte{
+	mqtt.OnSubscribe,
 	mqtt.OnSubscribed,
 	mqtt.OnUnsubscribed,
 	mqtt.OnClientExpired,
@@ -154,6 +155,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 
 			return h.refuse(cl, log, packets.ErrServerUnavailable, "cluster log unavailable", err)
 		}
+
+		// The tenant's retained messages start loading into this node's
+		// cache; a SUBSCRIBE waits for them (OnSubscribe).
+		h.b.cluster.ensureRetained(tenantID)
 
 		// Last: once the key is this node's, the session's previous owner,
 		// anywhere in the cell, is on its way out. The session's lock stays
@@ -647,6 +652,12 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			return h.withhold(cl, pk)
 		}
 
+		// A retained message the hook took the flag off (cluster mode)
+		// carries it again to a 5.0 subscription with Retain As Published.
+		if retainedTag(pk) && cl.Properties.ProtocolVersion == 5 && retainAsPublished(cl, pk.TopicName) {
+			pk.FixedHeader.Retain = true
+		}
+
 		if n := h.b.cluster; n != nil && pk.FixedHeader.Qos == 2 && !n.beforeQoS2Send(cl, pk) {
 			// The delivery is not in the session's record, so it must not
 			// go out; beforeQoS2Send stopped the client.
@@ -713,7 +724,10 @@ func blankPublish(pk packets.Packet) packets.Packet {
 // PUBACK where a PUBREC belongs.
 //
 // In cluster mode a QoS 0 publish also goes to the Router, and a QoS 1 or 2
-// publish goes to the log instead of mochi (clusterlog.go): it must first fit
+// publish goes to the log instead of mochi (clusterlog.go). A retained one is
+// written to the cell's retained store and this node's cache, never by mochi
+// (clusterretained.go): mochi gets it with its retain flag clear and tagged
+// for Retain As Published. A QoS 1 or 2 publish must first fit
 // under the server's receive maximum (pubPipe.admit), then the connection's
 // pipe appends it and writes the ack once it is committed, and this returns
 // ErrRejectPacket so mochi neither acks nor delivers it. The 0x97 PUBACK
@@ -726,8 +740,17 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		if n := h.b.cluster; n != nil {
 			if n.isInjector(cl) {
 				injectedOrigin(&pk)
-			} else if pk.FixedHeader.Qos == 0 {
-				n.publishInline(&pk)
+			} else {
+				if pk.FixedHeader.Retain {
+					// The host's publish wrote the cell's store itself
+					// (admin.go).
+					pk.FixedHeader.Retain = false
+					tagRetained(&pk)
+				}
+
+				if pk.FixedHeader.Qos == 0 {
+					n.publishInline(&pk)
+				}
 			}
 		}
 
@@ -795,9 +818,25 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		// Mochi delivers to this node's subscribers once this returns; the
 		// Router takes the message to every other node with interest.
 		n.publish(st.tenantID, rel, &pk)
+
+		if pk.FixedHeader.Retain {
+			n.retainPublish(st, rel, &pk)
+		}
 	}
 
 	return pk, nil
+}
+
+// OnSubscribe holds a network client's SUBSCRIBE (cluster mode only) until
+// its tenant's retained messages are loaded into this node's cache, for up
+// to retainedLoadWait, so mochi's retained delivery after the SUBACK reads
+// them (awaitRetained). It holds no lock while it waits.
+func (h *hook) OnSubscribe(cl *mqtt.Client, pk packets.Packet) packets.Packet {
+	if n := h.b.cluster; n != nil && !cl.Net.Inline {
+		n.awaitRetained(cl, pk.Filters)
+	}
+
+	return pk
 }
 
 // OnSubscribed takes a Router reference for each filter mochi accepted from

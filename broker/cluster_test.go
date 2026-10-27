@@ -359,9 +359,12 @@ func TestRoutesReleased(t *testing.T) {
 	tid := t1.ID.String()
 	nc := b.cluster.Conn.NC()
 
-	// The tenant's log reader holds NATS subscriptions of its own from the
-	// first connection on; count from there.
+	// The tenant's log reader and its retained watch hold NATS
+	// subscriptions of their own from the first connection on; count from
+	// there.
 	require.NoError(t, b.ensureReader(tid))
+	b.cluster.ensureRetained(tid)
+	waitRetainedLoaded(t, b, tid)
 
 	base := nc.NumSubscriptions()
 
@@ -522,7 +525,7 @@ func TestDeliverRoutedDropsForeign(t *testing.T) {
 	// After Stop nothing is injected, and nothing fails.
 	require.NoError(t, b.Stop(t.Context()))
 	b.DeliverRouted(tid, "ok", []byte("late"), cluster.Props{})
-	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, "", 0), errNotInjecting))
+	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, "", 0, false), errNotInjecting))
 }
 
 // Ruling R3: the publish properties survive mochi to cluster and back.
@@ -603,6 +606,10 @@ func TestSubscribedAfterPruneLeavesNoRoute(t *testing.T) {
 
 	cl, ok := b.server.Clients.Get(nsID)
 	require.True(t, ok)
+
+	// The connection started the tenant's retained watch, which holds a
+	// NATS subscription of its own; count from there.
+	waitRetainedLoaded(t, b, tid)
 
 	nc := b.cluster.Conn.NC()
 	base := nc.NumSubscriptions()
