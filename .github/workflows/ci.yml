@@ -54,3 +54,25 @@ jobs:
             echo "$OUTPUT"
             exit 1
           fi
+
+  # ─── Chaos Package Vet ─────────────────────────────────────────────
+  # The chaos suite builds only with the chaos tag, so the shared workflow
+  # never compiles it. Vet it with the tag, so an API change elsewhere can't
+  # break it unnoticed. The suite itself doesn't run here.
+  chaos-vet:
+    name: Vet chaos package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Vet with the chaos tag
+        run: go vet -tags chaos ./chaos/
