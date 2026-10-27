@@ -392,7 +392,8 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 
 	if resume && !handover {
 		if pre, _, gerr := n.Sessions.Get(ctx, st.tenantID, st.rawID); gerr == nil && pre.ExpirySeconds > 0 {
-			if fetched, err = b.fetchLogs(st.tenantID, resendSeqs(pre)); err != nil {
+			own, pinned := resendSeqs(pre)
+			if fetched, err = b.fetchLogs(st.tenantID, own, pinned); err != nil {
 				return nil, err
 			}
 		}
@@ -744,15 +745,23 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 
 	// The messages of deliveries to send again: read before the acquire,
 	// and in one pass over the log for any the record gained since.
-	var missing []uint64
+	var missing, missingPinned []uint64
 
-	for _, seq := range resendSeqs(prev) {
+	own, pinned := resendSeqs(prev)
+
+	for _, seq := range own {
 		if _, ok := fetched[seq]; !ok {
 			missing = append(missing, seq)
 		}
 	}
 
-	msgs, err := b.fetchLogs(s.tenantID, missing)
+	for _, seq := range pinned {
+		if _, ok := fetched[seq]; !ok {
+			missingPinned = append(missingPinned, seq)
+		}
+	}
+
+	msgs, err := b.fetchLogs(s.tenantID, missing, missingPinned)
 	if err != nil {
 		return err
 	}
@@ -875,22 +884,21 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 const fetchAttempts = 3
 
 // resendSeqs lists the log sequences of a record's QoS 2 deliveries that are
-// resent as PUBLISH on resume (state outPublish): the session's own above the
-// cursor, and its pinned shared ones wherever they are in the log.
-func resendSeqs(rec *cluster.SessionRecord) []uint64 {
-	var out []uint64
-
+// resent as PUBLISH on resume (state outPublish): own, the session's own
+// above the cursor, and pinned, its pinned shared ones wherever they are in
+// the log (a group's consumer can lag the live log far behind the cursor).
+func resendSeqs(rec *cluster.SessionRecord) (own, pinned []uint64) {
 	for _, or := range rec.QoS2Out {
 		switch {
 		case or.State == outPubrel:
 		case or.Seq == 0 && or.Shared > 0:
-			out = append(out, or.Shared)
+			pinned = append(pinned, or.Shared)
 		case or.Seq > rec.Cursor:
-			out = append(out, or.Seq)
+			own = append(own, or.Seq)
 		}
 	}
 
-	return out
+	return own, pinned
 }
 
 // outSeq is the log sequence of an outbound QoS 2 record entry, its own or a
@@ -943,8 +951,8 @@ func sharedResend(tenantID string, id uint16, or cluster.OutRecord, msgs map[uin
 
 // fetchLogs reads the log messages seqs of tenantID in one replay, with its
 // own deadline; one the log no longer has is missing from the result.
-func (b *Broker) fetchLogs(tenantID string, seqs []uint64) (map[uint64]cluster.LogMessage, error) {
-	if len(seqs) == 0 {
+func (b *Broker) fetchLogs(tenantID string, seqs, pinned []uint64) (map[uint64]cluster.LogMessage, error) {
+	if len(seqs) == 0 && len(pinned) == 0 {
 		return nil, nil //nolint:nilnil // nothing asked, nothing read
 	}
 
@@ -956,7 +964,27 @@ func (b *Broker) fetchLogs(tenantID string, seqs []uint64) (map[uint64]cluster.L
 	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
 	defer cancel()
 
-	got := make(map[uint64]cluster.LogMessage, len(seqs))
+	got := make(map[uint64]cluster.LogMessage, len(seqs)+len(pinned))
+
+	// Pinned shared deliveries one by one (ruling R40): they can sit far
+	// below the session's own, and a ranged read from the lowest would
+	// stream the tenant's whole log in between on the CONNECT path. One
+	// gone from the log is not resent.
+	for _, seq := range pinned {
+		m, err := b.cluster.Log.Get(ctx, tenantID, seq)
+
+		switch {
+		case err == nil:
+			got[seq] = m
+		case errors.Is(err, tether.ErrNotFound):
+		default:
+			return nil, fmt.Errorf("tether/broker: read the log message of a pinned shared delivery: %w", err)
+		}
+	}
+
+	if len(seqs) == 0 {
+		return got, nil
+	}
 
 	// These messages were delivered, so the log has them unless they aged
 	// out; a read that misses one may have lagged and is tried again.
@@ -982,6 +1010,8 @@ func (b *Broker) fetchLogs(tenantID string, seqs []uint64) (map[uint64]cluster.L
 		}
 
 		err := b.cluster.Log.Replay(ctx, tenantID, slices.Min(missing), slices.Max(missing), func(m cluster.LogMessage) error {
+			b.cluster.fetchRead.Add(1)
+
 			if _, ok := want[m.Seq]; ok {
 				got[m.Seq] = m
 			}

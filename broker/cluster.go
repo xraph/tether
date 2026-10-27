@@ -164,6 +164,9 @@ type clusterNode struct {
 	// replayRetries counts replays that ended short of the reader's last
 	// message and went again.
 	replayRetries atomic.Uint64
+	// fetchRead counts the log messages fetchLogs' ranged reads went
+	// through, for tests.
+	fetchRead atomic.Uint64
 
 	// b is the broker, for the work a session starts on its own (repin).
 	b *Broker

@@ -343,3 +343,45 @@ func decodeLogMessage(subj string, h nats.Header, data []byte) (LogMessage, erro
 
 	return msg, nil
 }
+
+// Get reads one message of tenant's from the log by its sequence, from the
+// stream leader. A sequence that holds no message (aged out, or never used)
+// or a message of another tenant gives an error wrapping tether.ErrNotFound;
+// one that does not decode is an error. A context without a deadline gets
+// 10 s; an unreachable JetStream wraps ErrUnavailable. Use it for a few
+// scattered sequences; Replay reads a range.
+func (l *Log) Get(ctx context.Context, tenant string, seq uint64) (LogMessage, error) {
+	if subject.LogTenantAll(tenant) == "" || seq == 0 {
+		return LogMessage{}, fmt.Errorf("cluster: log get: empty tenant or sequence 0: %w", tether.ErrInvalidInput)
+	}
+
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	st, err := l.stream(ctx)
+	if err != nil {
+		return LogMessage{}, err
+	}
+
+	raw, err := st.GetMsg(ctx, seq)
+	if err != nil {
+		if errors.Is(err, jetstream.ErrMsgNotFound) {
+			return LogMessage{}, fmt.Errorf("cluster: log get %d: %w", seq, tether.ErrNotFound)
+		}
+
+		return LogMessage{}, l.wrapErr(fmt.Sprintf("log get %d", seq), err)
+	}
+
+	msg, err := decodeLogMessage(raw.Subject, raw.Header, raw.Data)
+	if err != nil {
+		return LogMessage{}, err
+	}
+
+	if msg.Tenant != tenant {
+		return LogMessage{}, fmt.Errorf("cluster: log get %d: not the tenant's: %w", seq, tether.ErrNotFound)
+	}
+
+	msg.Seq = raw.Sequence
+
+	return msg, nil
+}

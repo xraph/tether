@@ -1519,3 +1519,33 @@ func TestAppendAsyncKeepsOrder(t *testing.T) {
 		t.Fatalf("qos 3: %v", err)
 	}
 }
+
+// Get reads one message by sequence, refuses another tenant's and a
+// sequence that holds nothing.
+func TestLogGet(t *testing.T) {
+	logs := startLogs(t, 2)
+
+	seq := mustAppend(t, logs[0], LogMessage{Tenant: "t1", Topic: "a/b", Payload: []byte("x"), QoS: 2, Props: Props{ContentType: "c"}})
+	other := mustAppend(t, logs[0], LogMessage{Tenant: "t2", Topic: "a/b", Payload: []byte("y")})
+
+	m, err := logs[1].Get(tctx(t, 10*time.Second), "t1", seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if m.Seq != seq || m.Topic != "a/b" || string(m.Payload) != "x" || m.QoS != 2 || m.Props.ContentType != "c" {
+		t.Fatalf("got %+v", m)
+	}
+
+	if _, err := logs[1].Get(tctx(t, 10*time.Second), "t1", other); !errors.Is(err, tether.ErrNotFound) {
+		t.Fatalf("another tenant's: %v", err)
+	}
+
+	if _, err := logs[1].Get(tctx(t, 10*time.Second), "t1", other+100); !errors.Is(err, tether.ErrNotFound) {
+		t.Fatalf("past the end: %v", err)
+	}
+
+	if _, err := logs[1].Get(tctx(t, 10*time.Second), "", seq); !errors.Is(err, tether.ErrInvalidInput) {
+		t.Fatalf("empty tenant: %v", err)
+	}
+}

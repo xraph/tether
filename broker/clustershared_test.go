@@ -7,15 +7,21 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
 	"github.com/stretchr/testify/require"
+
+	"github.com/xraph/tether/acl"
+	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/tenant"
 )
 
-// collect counts the payloads c receives under prefix until want of them
+// collectShared counts the payloads c receives under prefix until want of them
 // arrived (duplicates included), then listens for settle more.
 func collectShared(t *testing.T, want int, prefix string, cs ...*client5) []map[string]int {
 	t.Helper()
@@ -827,4 +833,235 @@ func TestSharedQoS2DroppedWithSession(t *testing.T) {
 	require.Equal(t, "later", recvLog(t, other).Payload)
 	noMoreMsgs(t, other)
 	noMoreMsgs(t, fresh)
+}
+
+// gateSeam holds a seam when armed: reached is signalled once and the seam
+// waits for release.
+type gateSeam struct {
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func newGateSeam() *gateSeam {
+	return &gateSeam{reached: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+func (g *gateSeam) hold() {
+	if !g.armed.CompareAndSwap(true, false) {
+		return
+	}
+
+	g.reached <- struct{}{}
+	<-g.release
+}
+
+func (g *gateSeam) wait(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-g.reached:
+	case <-time.After(logWait):
+		t.Fatal("seam not reached")
+	}
+}
+
+// sharedSeamCell is a one-node cell of tenant t1 (user u1, everything
+// granted) whose broker runs before on its cluster node.
+func sharedSeamCell(t *testing.T, before func(n *clusterNode)) (*testCell, string) {
+	t.Helper()
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) { before(b.cluster) })
+
+	return c, t1.ID.String()
+}
+
+// Fix round 3, I1: a same-node takeover lands while the writer holds the old
+// connection for a shared QoS 2 delivery (seam between choosing the
+// connection and the pin). The delivery follows the session to the new
+// connection instead of being set on the old one after mochi cloned it.
+func TestSharedTakeoverDuringSend(t *testing.T) {
+	seam := newGateSeam()
+	c, _ := sharedSeamCell(t, func(n *clusterNode) { n.shareBeforeSend = func(string) { seam.hold() } })
+
+	m1, _ := rawPersist(t, c.addr(0), "ts", 0)
+	rawSubscribe(t, m1, 2, "$share/g/ts/#")
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+
+	seam.armed.Store(true)
+	require.Equal(t, byte(0), publishQ(t, pub, "ts/x", "held", 2))
+	seam.wait(t)
+
+	m2, ack := rawPersist(t, c.addr(0), "ts", 0)
+	require.True(t, ack.SessionPresent)
+
+	close(seam.release)
+
+	cp := readFor(t, m2, 10*time.Second)
+	require.NotNil(t, cp, "the delivery never reached the connection that took the session over")
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	p := cp.Content.(*packets.Publish)
+	require.Equal(t, "held", string(p.Payload))
+
+	writePacket(t, m2, &packets.Pubrec{PacketID: p.PacketID, Properties: &packets.Properties{}})
+
+	cp = readLog(t, m2)
+	require.Equal(t, packets.PUBREL, cp.Type)
+	writePacket(t, m2, &packets.Pubcomp{PacketID: p.PacketID, Properties: &packets.Properties{}})
+
+	for {
+		cp := readFor(t, m2, settle)
+		if cp == nil {
+			break
+		}
+
+		// A copy mochi resent from the clone is the same packet: DUP, same ID.
+		q, ok := cp.Content.(*packets.Publish)
+		require.True(t, ok, "unexpected %v", cp)
+		require.Equal(t, p.PacketID, q.PacketID)
+		require.True(t, q.Duplicate)
+	}
+}
+
+// Fix round 3, I2: a shared QoS 2 pin racing the session's end. Pinned after
+// the session's last record was written, it is not durable, so it goes back
+// to the group (another member gets it). Pinned before, the last record holds
+// it, so no other member gets it and the resumed session does.
+func TestSharedPinRacesSessionEnd(t *testing.T) {
+	t.Run("pin after the last record", func(t *testing.T) {
+		seam := newGateSeam()
+		c, tid := sharedSeamCell(t, func(n *clusterNode) { n.shareBeforeSend = func(string) { seam.hold() } })
+
+		m, _ := rawPersist(t, c.addr(0), "pr", 0)
+		rawSubscribe(t, m, 2, "$share/g/pr/#")
+
+		pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+		require.NoError(t, err)
+
+		seam.armed.Store(true)
+		require.Equal(t, byte(0), publishQ(t, pub, "pr/x", "late", 2))
+		seam.wait(t)
+
+		require.NoError(t, m.Close())
+		waitOffline(t, c.nodes[0], tid, "pr")
+
+		other, _, err := connect5(t, c.addr(0), "other", "u1", true)
+		require.NoError(t, err)
+		subscribeQoS(t, other, "$share/g/pr/#", 2, false)
+
+		close(seam.release)
+
+		require.Equal(t, "late", recvLog(t, other).Payload)
+
+		rec, err := sessionKey(t, c.nodes[0], tid, "pr")
+		require.NoError(t, err)
+		require.Empty(t, rec.QoS2Out)
+	})
+
+	t.Run("pin in the last record", func(t *testing.T) {
+		seam := newGateSeam()
+		c, tid := sharedSeamCell(t, func(n *clusterNode) { n.sharePinned = seam.hold })
+
+		m, _ := rawPersist(t, c.addr(0), "pi", 0)
+		rawSubscribe(t, m, 2, "$share/g/pi/#")
+
+		pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+		require.NoError(t, err)
+
+		seam.armed.Store(true)
+		require.Equal(t, byte(0), publishQ(t, pub, "pi/x", "kept", 2))
+		seam.wait(t)
+
+		require.NoError(t, m.Close())
+		waitOffline(t, c.nodes[0], tid, "pi")
+
+		other, _, err := connect5(t, c.addr(0), "other", "u1", true)
+		require.NoError(t, err)
+		subscribeQoS(t, other, "$share/g/pi/#", 2, false)
+
+		close(seam.release)
+		noMoreMsgs(t, other)
+
+		m2, ack := rawPersist(t, c.addr(0), "pi", 0)
+		require.True(t, ack.SessionPresent)
+
+		cp := readLog(t, m2)
+		require.Equal(t, packets.PUBLISH, cp.Type)
+		require.Equal(t, "kept", string(cp.Content.(*packets.Publish).Payload))
+		noMoreMsgs(t, other)
+	})
+}
+
+// Ruling R40: a resumed session's pinned shared QoS 2 far below its own QoS 2
+// in the log is read on its own, not by a ranged read across everything the
+// tenant logged in between.
+func TestSharedPinnedFetchedAlone(t *testing.T) {
+	const between = 2000
+
+	c := startCluster(t, 1)
+	n := c.nodes[0].cluster
+	tid := c.t1.ID.String()
+
+	m, _ := rawPersist(t, c.addr(0), "pf", 0)
+	rawSubscribe(t, m, 2, "$share/g/pf/#", "own/#")
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+
+	// The shared one, received and left without PUBREC: pinned.
+	require.Equal(t, byte(0), publishQ(t, pub, "pf/x", "pinned", 2))
+
+	cp := readLog(t, m)
+	require.Equal(t, "pinned", string(cp.Content.(*packets.Publish).Payload))
+
+	// The tenant logs a lot on other topics.
+	pending := make([]*cluster.PendingAppend, 0, between)
+
+	for i := range between {
+		pa, err := n.Log.AppendAsync(t.Context(), cluster.LogMessage{Tenant: tid, Topic: "noise/x", Payload: []byte(fmt.Sprint(i)), QoS: 1}, "")
+		require.NoError(t, err)
+
+		pending = append(pending, pa)
+	}
+
+	for _, pa := range pending {
+		_, _, err := pa.Wait(t.Context())
+		require.NoError(t, err)
+	}
+
+	// The session's own QoS 2, high in the log, also left without PUBREC.
+	require.Equal(t, byte(0), publishQ(t, pub, "own/x", "own", 2))
+
+	cp = readLog(t, m)
+	require.Equal(t, "own", string(cp.Content.(*packets.Publish).Payload))
+
+	require.NoError(t, m.Close())
+	waitOffline(t, c.nodes[0], tid, "pf")
+
+	before := n.fetchRead.Load()
+	start := time.Now()
+
+	m2, ack := rawPersist(t, c.addr(0), "pf", 0)
+	require.True(t, ack.SessionPresent)
+
+	got := map[string]bool{}
+
+	for len(got) < 2 {
+		cp := readLog(t, m2)
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			require.True(t, p.Duplicate)
+			got[string(p.Payload)] = true
+		}
+	}
+
+	require.Equal(t, map[string]bool{"pinned": true, "own": true}, got)
+	require.Less(t, n.fetchRead.Load()-before, uint64(10), "the resume read the log between the pinned and its own")
+	t.Logf("resumed in %v", time.Since(start))
 }

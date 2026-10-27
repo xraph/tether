@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -103,6 +104,12 @@ type sharedNode struct {
 	// Counters for tests: shared messages written, finished by the member,
 	// given back as lost, and joins that failed.
 	sharedSent, sharedDone, sharedLost, shareErrors atomic.Uint64
+
+	// Test seams, set before Start: shareBeforeSend runs in the session's
+	// writer once it has the connection to send to, sharePinned right after
+	// a QoS 2 pin enters the session's QoS2Out.
+	shareBeforeSend func(nsID string)
+	sharePinned     func()
 }
 
 func newSharedNode() sharedNode {
@@ -536,6 +543,10 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 		return
 	}
 
+	if hook := n.shareBeforeSend; hook != nil {
+		hook(nsID)
+	}
+
 	if qos > 0 {
 		id, err := cl.NextPacketID()
 		if err != nil {
@@ -553,7 +564,7 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 			if !n.registerShare(nsID, out, pk.PacketID, it.done) {
 				return
 			}
-		} else if !n.pinShare(s, cl, tracked, pk.PacketID, it) {
+		} else if !n.pinShare(s, cl, out, tracked, pk.PacketID, it) {
 			return
 		}
 
@@ -575,7 +586,17 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 		}
 	}
 
-	if err := cl.WritePacket(pk); err != nil {
+	err := cl.WritePacket(pk)
+
+	if qos > 0 && n.followShare(nsID, cl, pk, it.seq) {
+		// The session moved to another connection of this node meanwhile:
+		// the delivery went with it.
+		n.sharedSent.Add(1)
+
+		return
+	}
+
+	if err != nil {
 		n.shareWriteFailed(nsID, s, cl, pk, it, err)
 
 		return
@@ -587,6 +608,118 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 		it.done(nil)
 		n.sharedDone.Add(1)
 	}
+}
+
+// followShare handles a same-node takeover that raced a QoS 1 or 2 shared
+// delivery: mochi clones the old connection's inflight map into the new one
+// and clears the old, so an entry set on the old connection after the clone
+// is in neither, and a takeover is not a resume from the record, so nothing
+// would send it again. When the session's connection is no longer cl, the
+// packet goes into the current connection's inflight map and is written to
+// it with DUP once its CONNACK is out (a copy mochi already resent from the
+// clone is the same packet ID: the client takes it once). If the new
+// connection gave that ID to another delivery meanwhile, this one moves to a
+// fresh ID (renumberShare). It reports whether the session had moved; false
+// leaves the outcome to cl's write.
+func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packet, seq uint64) bool {
+	moved := false
+
+	for {
+		s, cur, acked, ok := n.shareClient(nsID)
+		if !ok || cur == cl {
+			// The same connection, or the session ended or went to another
+			// node: the record (QoS 2) or the session's end (QoS 1) has it.
+			return moved
+		}
+
+		if !moved && cl.IsTakenOver() && cl.State.Inflight.Delete(pk.PacketID) {
+			// The orphan on the connection that was taken over.
+			atomic.AddInt64(&n.mochi.Info.Inflight, -1)
+		}
+
+		moved = true
+
+		if held, taken := cur.State.Inflight.Get(pk.PacketID); taken && !samePublish(held, pk) {
+			id, err := cur.NextPacketID()
+			if err != nil {
+				n.renumberShare(nsID, s, pk, 0, seq)
+
+				return true
+			}
+
+			n.renumberShare(nsID, s, pk, uint16(id), seq) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
+			pk.PacketID = uint16(id)                      //nolint:gosec // as above
+		}
+
+		if cur.State.Inflight.Set(pk) {
+			atomic.AddInt64(&n.mochi.Info.Inflight, 1)
+			cur.State.Inflight.DecreaseSendQuota()
+		}
+
+		select {
+		case <-acked:
+		case <-time.After(connackWait):
+			return true // it stays in cur's map; cur's own end handles it
+		}
+
+		pk.FixedHeader.Dup = true
+
+		if cur.WritePacket(pk) == nil {
+			return true
+		}
+
+		cl = cur
+	}
+}
+
+// samePublish reports whether an inflight entry is this shared PUBLISH.
+func samePublish(held, pk packets.Packet) bool {
+	return held.FixedHeader.Type == packets.Publish && held.TopicName == pk.TopicName &&
+		bytes.Equal(held.Payload, pk.Payload)
+}
+
+// renumberShare moves a shared delivery that followed a takeover to the
+// packet ID id, because the new connection used its old one for another
+// delivery. QoS 1: its pending entry moves (id 0: no ID left, it goes back
+// to its group). QoS 2: the session's pin moves, re-added if the other
+// delivery's record entry replaced it; the record is written by the next
+// flush.
+func (n *clusterNode) renumberShare(nsID string, s *session, pk packets.Packet, id uint16, seq uint64) {
+	old := pk.PacketID
+
+	if pk.FixedHeader.Qos == 1 {
+		n.shMu.Lock()
+		d := n.shPend[nsID][old]
+
+		if d != nil {
+			delete(n.shPend[nsID], old)
+
+			if id != 0 {
+				n.shPend[nsID][id] = d
+			}
+		}
+		n.shMu.Unlock()
+
+		if d != nil && id == 0 {
+			d.done(errShareLost)
+			n.sharedLost.Add(1)
+		}
+
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if or, ok := s.qos2Out[old]; ok && or.Seq == 0 && or.Shared == seq {
+		delete(s.qos2Out, old)
+	}
+
+	if id != 0 {
+		s.qos2Out[id] = cluster.OutRecord{State: outPublish, Shared: seq}
+	}
+
+	s.gen++
 }
 
 // claimID clears what s's books still hold under a packet ID mochi just
@@ -655,20 +788,39 @@ func (n *clusterNode) registerShare(nsID string, out *shareOut, id uint16, done 
 
 // pinShare makes a QoS 2 shared delivery the session's (ruling R39): for a
 // tracked session the record gets it before the PUBLISH goes out; then the
-// group's message is acked. When the write fails (the client is then
-// disconnected or stopped by persistNow) nothing was sent, so the message
-// goes back to its group, and it reports false. An untracked session ends
-// with its connection, so its delivery is never sent again anywhere.
-func (n *clusterNode) pinShare(s *session, cl *mqtt.Client, tracked bool, id uint16, it shareItem) bool {
+// group's message is acked. When that write fails (persistNow then
+// disconnects or stops the client), or the session's end got there first
+// (its last record was written without the pin), nothing
+// was sent, so the pin is removed, the message goes back to its group, and it
+// reports false. A pin the session's last record holds stays: the resume
+// sends it. An untracked session ends with its connection, so its delivery
+// is never sent again anywhere (an ended one gives the message back).
+func (n *clusterNode) pinShare(s *session, cl *mqtt.Client, out *shareOut, tracked bool, id uint16, it shareItem) bool {
 	if tracked {
 		s.mu.Lock()
 		s.qos2Out[id] = cluster.OutRecord{State: outPublish, Shared: it.seq}
 		s.gen++
+		gen := s.gen
 		s.mu.Unlock()
 
-		if !n.persistNow(s, cl) {
+		if hook := n.sharePinned; hook != nil {
+			hook()
+		}
+
+		// persist reports success without writing for a session whose last
+		// record is in, so the pin counts only once a written record had
+		// it: the session's last record snapshotted after the insert holds
+		// it (and the resume sends it), one snapshotted before does not.
+		ok := n.persistNow(s, cl)
+		if ok {
 			s.mu.Lock()
-			if or, ok := s.qos2Out[id]; ok && or.Seq == 0 && or.Shared == it.seq {
+			ok = s.savedGen >= gen
+			s.mu.Unlock()
+		}
+
+		if !ok {
+			s.mu.Lock()
+			if or, found := s.qos2Out[id]; found && or.Seq == 0 && or.Shared == it.seq {
 				delete(s.qos2Out, id)
 			}
 			s.mu.Unlock()
@@ -678,6 +830,11 @@ func (n *clusterNode) pinShare(s *session, cl *mqtt.Client, tracked bool, id uin
 
 			return false
 		}
+	} else if out.ended.Load() {
+		it.done(errShareLost)
+		n.sharedLost.Add(1)
+
+		return false
 	}
 
 	it.done(nil)
