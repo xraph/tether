@@ -480,10 +480,9 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 
 			return pk, nil
 		case packets.Pubrec:
-			n.sharePubrec(cl.ID, pk.PacketID, pk.ReasonCode)
-
-			// The record says PUBREL before mochi sends it.
-			if !n.onPubrec(cl, pk) {
+			// The record says PUBREL before mochi sends it, for a shared
+			// delivery (sharePubrec) and the session's own (onPubrec).
+			if !n.sharePubrec(cl, pk) || !n.onPubrec(cl, pk) {
 				return pk, packets.ErrRejectPacket
 			}
 
@@ -996,7 +995,7 @@ func (h *hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 func (h *hook) OnQosDropped(cl *mqtt.Client, pk packets.Packet) {
 	if n := h.b.cluster; n != nil && !cl.Net.Inline {
 		n.onQosDropped(cl, pk)
-		n.shareDropped(cl.ID, pk, false)
+		n.shareDropped(cl, pk, false)
 	}
 }
 

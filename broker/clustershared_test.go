@@ -2,6 +2,7 @@ package broker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -476,4 +477,262 @@ func TestSharedUnsubscribeLeaves(t *testing.T) {
 	require.NoError(t, err)
 	subscribeQoS(t, next, "$share/g/u/#", 1, false)
 	require.Equal(t, "after", recvLog(t, next).Payload)
+}
+
+// rawPersist connects a raw 5.0 client of u1 as clientID with a one-hour
+// session expiry and, when recvMax is not zero, that Receive Maximum. It
+// returns the connection and its CONNACK.
+func rawPersist(t *testing.T, addr, clientID string, recvMax uint16) (net.Conn, *packets.Connack) {
+	t.Helper()
+
+	conn, err := dial(t, addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	expiry := uint32(3600)
+	props := &packets.Properties{SessionExpiryInterval: &expiry}
+
+	if recvMax > 0 {
+		props.ReceiveMaximum = &recvMax
+	}
+
+	writePacket(t, conn, &packets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: clientID, CleanStart: false, KeepAlive: 30,
+		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: props,
+	})
+
+	cp := readLog(t, conn)
+	require.Equal(t, packets.CONNACK, cp.Type)
+
+	ack := cp.Content.(*packets.Connack)
+	require.Equal(t, byte(0), ack.ReasonCode)
+
+	return conn, ack
+}
+
+func rawSubscribe(t *testing.T, conn net.Conn, qos byte, filters ...string) {
+	t.Helper()
+
+	opts := make([]packets.SubOptions, 0, len(filters))
+	for _, f := range filters {
+		opts = append(opts, packets.SubOptions{Topic: f, QoS: qos})
+	}
+
+	writePacket(t, conn, &packets.Subscribe{PacketID: 1, Subscriptions: opts, Properties: &packets.Properties{}})
+
+	cp := readLog(t, conn)
+	require.Equal(t, packets.SUBACK, cp.Type)
+
+	for _, r := range cp.Content.(*packets.Suback).Reasons {
+		require.Equal(t, qos, r)
+	}
+}
+
+// readFor reads one packet from conn, or returns nil when none comes within d.
+func readFor(t *testing.T, conn net.Conn, d time.Duration) *packets.ControlPacket {
+	t.Helper()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(d)))
+
+	cp, err := packets.ReadPacket(conn)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil
+		}
+
+		require.NoError(t, err)
+	}
+
+	return cp
+}
+
+// A same-node takeover of a persistent session with a shared QoS 1 message
+// in flight: mochi clones the inflight map into the new connection and
+// clears the old one's, which must not finish the delivery (and ack it to
+// the group). The new connection dies before its PUBACK, and the message
+// goes to the next member.
+func TestSharedTakeoverKeepsInflight(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	m1, _ := rawPersist(t, c.addr(0), "tk", 0)
+	rawSubscribe(t, m1, 1, "$share/g/tk/#")
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+	require.Equal(t, byte(0), publishQ(t, pub, "tk/x", "one", 1))
+
+	cp := readLog(t, m1)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+	require.Equal(t, "one", string(cp.Content.(*packets.Publish).Payload))
+
+	// The same client again, on the same node: handed over, session present,
+	// and mochi resends the delivery to it.
+	m2, ack := rawPersist(t, c.addr(0), "tk", 0)
+	require.True(t, ack.SessionPresent)
+
+	cp = readLog(t, m2)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+	require.Equal(t, "one", string(cp.Content.(*packets.Publish).Payload))
+	require.Equal(t, 1, c.nodes[0].cluster.pendingShares(namespacedID(tid, "tk")))
+
+	// Gone before the PUBACK.
+	require.NoError(t, m2.Close())
+	waitOffline(t, c.nodes[0], tid, "tk")
+
+	next, _, err := connect5(t, c.addr(1), "next", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, next, "$share/g/tk/#", 1, false)
+	require.Equal(t, "one", recvLog(t, next).Payload)
+}
+
+// A 5.0 member with a Receive Maximum of 5 holding an ordinary and a shared
+// subscription to the same topics resumes with 20 log messages to replay and
+// 20 waiting in its group: it never has more than 5 unacknowledged
+// deliveries [MQTT-3.3.4-9], and once it acks, it gets all 40.
+func TestSharedReceiveMaximum(t *testing.T) {
+	const (
+		recvMax = 5
+		total   = 20
+	)
+
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	m, _ := rawPersist(t, c.addr(0), "rm", recvMax)
+	rawSubscribe(t, m, 1, "rm/#", "$share/g/rm/#")
+	require.NoError(t, m.Close())
+	waitOffline(t, c.nodes[0], tid, "rm")
+
+	pub, _, err := connect5(t, c.addr(1), "pub", "u1", true)
+	require.NoError(t, err)
+
+	for i := range total {
+		require.Equal(t, byte(0), publishQ(t, pub, "rm/x", fmt.Sprintf("m%d", i), 1))
+	}
+
+	m, ack := rawPersist(t, c.addr(0), "rm", recvMax)
+	require.True(t, ack.SessionPresent)
+
+	got := map[string]int{}
+	var unacked []uint16
+
+	// Nothing acked: the window fills and stays full.
+	for {
+		cp := readFor(t, m, 1500*time.Millisecond)
+		if cp == nil {
+			break
+		}
+
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			require.False(t, p.Duplicate)
+
+			unacked = append(unacked, p.PacketID)
+			got[string(p.Payload)]++
+			require.LessOrEqual(t, len(unacked), recvMax, "unacknowledged deliveries over the Receive Maximum")
+		}
+	}
+
+	require.Len(t, unacked, recvMax)
+
+	// Ack as they come: everything arrives, once from each subscription.
+	for _, id := range unacked {
+		writePacket(t, m, &packets.Puback{PacketID: id, Properties: &packets.Properties{}})
+	}
+
+	deadline := time.Now().Add(logWait)
+
+	for len(got) < total || sum(got) < 2*total {
+		require.False(t, time.Now().After(deadline), "got %v", got)
+
+		cp := readFor(t, m, time.Second)
+		if cp == nil {
+			continue
+		}
+
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			got[string(p.Payload)]++
+			writePacket(t, m, &packets.Puback{PacketID: p.PacketID, Properties: &packets.Properties{}})
+		}
+	}
+
+	for i := range total {
+		require.Equal(t, 2, got[fmt.Sprintf("m%d", i)], "m%d", i)
+	}
+}
+
+func sum(m map[string]int) int {
+	n := 0
+	for _, v := range m {
+		n += v
+	}
+
+	return n
+}
+
+// Ruling R37: a member that disconnects between a shared QoS 2 delivery's
+// PUBREC and PUBCOMP gets the PUBREL when its session resumes, on another
+// node, and the packet ID stays taken until the PUBCOMP, so a new QoS 2
+// delivery right after does not reuse it (the client would take it for the
+// old one and drop it). The first message is not sent again.
+func TestSharedPubrelResumed(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	m, _ := rawPersist(t, c.addr(0), "q2", 0)
+	rawSubscribe(t, m, 2, "$share/g/q2/#")
+
+	pub, _, err := connect5(t, c.addr(1), "pub", "u1", true)
+	require.NoError(t, err)
+	require.Equal(t, byte(0), publishQ(t, pub, "q2/a", "first", 2))
+
+	cp := readLog(t, m)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	first := cp.Content.(*packets.Publish)
+	require.Equal(t, "first", string(first.Payload))
+
+	writePacket(t, m, &packets.Pubrec{PacketID: first.PacketID, Properties: &packets.Properties{}})
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBREL, cp.Type)
+	require.Equal(t, first.PacketID, cp.Content.(*packets.Pubrel).PacketID)
+
+	// Gone without the PUBCOMP.
+	require.NoError(t, m.Close())
+	waitOffline(t, c.nodes[0], tid, "q2")
+
+	m, ack := rawPersist(t, c.addr(1), "q2", 0)
+	require.True(t, ack.SessionPresent)
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBREL, cp.Type, "the PUBREL is sent again on resume")
+	require.Equal(t, first.PacketID, cp.Content.(*packets.Pubrel).PacketID)
+
+	require.Equal(t, byte(0), publishQ(t, pub, "q2/b", "second", 2))
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBLISH, cp.Type)
+
+	second := cp.Content.(*packets.Publish)
+	require.Equal(t, "second", string(second.Payload))
+	require.NotEqual(t, first.PacketID, second.PacketID, "the new delivery reused the packet ID still awaiting PUBCOMP")
+
+	writePacket(t, m, &packets.Pubcomp{PacketID: first.PacketID, Properties: &packets.Properties{}})
+	writePacket(t, m, &packets.Pubrec{PacketID: second.PacketID, Properties: &packets.Properties{}})
+
+	cp = readLog(t, m)
+	require.Equal(t, packets.PUBREL, cp.Type)
+	writePacket(t, m, &packets.Pubcomp{PacketID: second.PacketID, Properties: &packets.Properties{}})
+
+	// Nothing more: "first" is not sent again.
+	require.Nil(t, readFor(t, m, settle))
+
+	eventually(t, "the record free of shared QoS 2 state", func() bool {
+		rec, err := sessionKey(t, c.nodes[1], tid, "q2")
+
+		return err == nil && len(rec.QoS2Out) == 0
+	})
 }

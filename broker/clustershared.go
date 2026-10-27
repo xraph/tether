@@ -321,7 +321,7 @@ func (b *Broker) deliverShared(nsID, nsFilter string, m cluster.LogMessage, done
 		return errShareBusy
 	}
 
-	_, cl, acked, ok := n.shareClient(nsID)
+	s, cl, acked, ok := n.shareClient(nsID)
 	if !ok {
 		return errShareBusy
 	}
@@ -400,14 +400,13 @@ func (b *Broker) deliverShared(nsID, nsFilter string, m cluster.LogMessage, done
 		pk.Expiry = exp.Unix()
 	}
 
-	return n.enqueueShare(nsID, nsFilter, cl, pk, done)
+	return n.enqueueShare(nsID, nsFilter, s, cl, pk, done)
 }
 
 // enqueueShare queues pk for nsID's writer, starting the writer on first use.
-func (n *clusterNode) enqueueShare(nsID, nsFilter string, cl *mqtt.Client, pk packets.Packet, done func(error)) error {
-	limit := n.maxInflight
-	if rm := int(cl.Properties.Props.ReceiveMaximum); rm > 0 {
-		limit = min(limit, rm)
+func (n *clusterNode) enqueueShare(nsID, nsFilter string, s *session, cl *mqtt.Client, pk packets.Packet, done func(error)) error {
+	if pk.FixedHeader.Qos > 0 && !n.outboundRoom(s, cl, n.sharedQueued(nsID)) {
+		return errShareBusy
 	}
 
 	n.shMu.Lock()
@@ -425,10 +424,6 @@ func (n *clusterNode) enqueueShare(nsID, nsFilter string, cl *mqtt.Client, pk pa
 		go n.runShareOut(nsID, out)
 	}
 
-	if pk.FixedHeader.Qos > 0 && cl.State.Inflight.Len()+int(out.queued.Load()) >= limit {
-		return errShareBusy
-	}
-
 	select {
 	case out.q <- shareItem{pk: pk, done: done}:
 	default:
@@ -440,6 +435,67 @@ func (n *clusterNode) enqueueShare(nsID, nsFilter string, cl *mqtt.Client, pk pa
 	}
 
 	return nil
+}
+
+// sharedQueued counts nsID's QoS 1 and 2 shared messages queued for its
+// writer, not yet in the inflight map.
+func (n *clusterNode) sharedQueued(nsID string) int {
+	n.shMu.Lock()
+	defer n.shMu.Unlock()
+
+	if out := n.shOut[nsID]; out != nil {
+		return int(out.queued.Load())
+	}
+
+	return 0
+}
+
+// sharedOutstanding counts nsID's QoS 1 and 2 shared messages not yet
+// finished by the client: in flight (PUBLISH or PUBREL sent) or queued. The
+// replay's window counts them (windowFull).
+func (n *clusterNode) sharedOutstanding(nsID string) int {
+	n.shMu.Lock()
+	defer n.shMu.Unlock()
+
+	c := len(n.shPend[nsID])
+	if out := n.shOut[nsID]; out != nil {
+		c += int(out.queued.Load())
+	}
+
+	return c
+}
+
+// outboundRoom reports whether cl can be sent one more QoS 1 or 2 message,
+// with extra more already promised to it and not yet in its inflight map:
+// its inflight map stays under MaxInflight, and its unacknowledged outbound
+// messages under the client's Receive Maximum [MQTT-3.3.4-9]. Outbound are
+// the inflight map's PUBLISH and PUBREL entries (whoever sent them: mochi,
+// the replay, a group; a PUBREC entry is the client's own QoS 2 publish)
+// plus what the replay has queued. It walks the inflight map, at most
+// MaxInflight entries.
+func (n *clusterNode) outboundRoom(s *session, cl *mqtt.Client, extra int) bool {
+	s.mu.Lock()
+	queued := len(s.queued)
+	s.mu.Unlock()
+
+	if cl.State.Inflight.Len()+queued+extra >= n.maxInflight {
+		return false
+	}
+
+	rm := int(cl.Properties.Props.ReceiveMaximum)
+	if rm == 0 {
+		return true
+	}
+
+	outbound := queued + extra
+
+	for _, pk := range cl.State.Inflight.GetAll(false) {
+		if t := pk.FixedHeader.Type; t == packets.Publish || t == packets.Pubrel {
+			outbound++
+		}
+	}
+
+	return outbound < rm
 }
 
 // runShareOut writes nsID's shared messages until its queue is closed.
@@ -466,24 +522,16 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 		return
 	}
 
-	s, cl, acked, ok := n.shareClient(nsID)
-	if ok {
-		select {
-		case <-acked:
-		case <-time.After(connackWait):
-			ok = false
-		}
-	}
+	pk := it.pk
+	qos := pk.FixedHeader.Qos
 
-	if !ok || cl.Closed() {
+	s, cl, ok := n.shareTarget(nsID, out, qos)
+	if !ok {
 		it.done(errShareLost)
 		n.sharedLost.Add(1)
 
 		return
 	}
-
-	pk := it.pk
-	qos := pk.FixedHeader.Qos
 
 	if qos > 0 {
 		id, err := cl.NextPacketID()
@@ -559,6 +607,8 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 
 			if cl.State.Inflight.Delete(pk.PacketID) {
 				atomic.AddInt64(&n.mochi.Info.Inflight, -1)
+				// mochi's own rollback of a delivery it could not queue.
+				cl.State.Inflight.IncreaseSendQuota()
 			}
 		}
 
@@ -588,6 +638,41 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 	}
 }
 
+// shareTarget waits until nsID's session has a connection whose CONNACK is
+// out and, for QoS 1 and 2, room for one more outbound message: the room
+// counted at enqueue can be gone by the time the writer gets to the item
+// (the replay, mochi or other shared messages took it, or the connection
+// changed). It blocks only this session's writer. False when the session or
+// its connection is gone, or its CONNACK does not come within connackWait.
+func (n *clusterNode) shareTarget(nsID string, out *shareOut, qos byte) (*session, *mqtt.Client, bool) {
+	for {
+		if out.ended.Load() {
+			return nil, nil, false
+		}
+
+		s, cl, acked, ok := n.shareClient(nsID)
+		if !ok {
+			return nil, nil, false
+		}
+
+		select {
+		case <-acked:
+		case <-time.After(connackWait):
+			return nil, nil, false
+		}
+
+		if cl.Closed() {
+			return nil, nil, false
+		}
+
+		if qos == 0 || n.outboundRoom(s, cl, 0) {
+			return s, cl, true
+		}
+
+		time.Sleep(replayPoll)
+	}
+}
+
 // shareAcked handles a PUBACK or PUBCOMP read from nsID's connection for one
 // of its shared deliveries: the member is through with it.
 func (n *clusterNode) shareAcked(nsID string, id uint16, typ byte) {
@@ -607,40 +692,84 @@ func (n *clusterNode) shareAcked(nsID string, id uint16, typ byte) {
 	n.sharedDone.Add(1)
 }
 
-// sharePubrec handles a PUBREC for a QoS 2 shared delivery: the member has
-// the message, so losing the session from here on finishes it rather than
-// giving it to another member. A PUBREC with a failure code ends the flow.
-func (n *clusterNode) sharePubrec(nsID string, id uint16, code byte) {
+// sharePubrec handles a PUBREC for a QoS 2 shared delivery (ruling R37):
+// the member has the message, so losing the session from here on finishes
+// it rather than giving it to another member. For that to hold, a tracked
+// session's record says PUBREL for the packet ID before mochi sends it
+// (QoS2Out with Seq 0, which no log message has), so a resume on any node
+// sends the PUBREL and keeps the ID from a new delivery until the PUBCOMP.
+// It reports false when that write failed; the client is then stopped and
+// mochi must not answer. A PUBREC with a failure code ends the flow.
+func (n *clusterNode) sharePubrec(cl *mqtt.Client, pk packets.Packet) bool {
+	nsID, id := cl.ID, pk.PacketID
+
 	n.shMu.Lock()
 
 	d := n.shPend[nsID][id]
 	if d == nil || d.qos != 2 {
 		n.shMu.Unlock()
 
-		return
+		return true
 	}
 
-	if code < packets.ErrUnspecifiedError.Code {
-		d.pubrec = true
+	if pk.ReasonCode >= packets.ErrUnspecifiedError.Code {
+		delete(n.shPend[nsID], id)
 		n.shMu.Unlock()
 
-		return
+		d.done(nil)
+		n.sharedDone.Add(1)
+
+		return true
 	}
 
-	delete(n.shPend[nsID], id)
+	if d.pubrec {
+		n.shMu.Unlock()
+
+		return true // a repeated PUBREC
+	}
+
+	d.pubrec = true
 	n.shMu.Unlock()
 
-	d.done(nil)
-	n.sharedDone.Add(1)
+	s := n.sessionOf(cl)
+	if s == nil {
+		return true
+	}
+
+	s.mu.Lock()
+	tracked := s.tracked
+
+	if tracked {
+		s.qos2Out[id] = cluster.OutRecord{Seq: 0, State: outPubrel}
+		s.gen++
+	}
+	s.mu.Unlock()
+
+	if !tracked {
+		return true
+	}
+
+	return n.persistNow(s, cl)
 }
 
-// shareDropped handles mochi dropping one of nsID's shared deliveries from
+// shareDropped handles mochi dropping one of cl's shared deliveries from
 // the inflight map: expired (finished, nobody is owed it), or pruned at a
 // CONNACK because the grants no longer allow it (lost: another member may).
-func (n *clusterNode) shareDropped(nsID string, pk packets.Packet, lost bool) {
+//
+// Only for the connection that serves the session: a same-node takeover
+// clones the inflight map into the new connection and then clears the old
+// one, which fires OnQosDropped for every entry; those deliveries live on in
+// the new connection.
+func (n *clusterNode) shareDropped(cl *mqtt.Client, pk packets.Packet, lost bool) {
 	if _, tagged := seqOf(pk); tagged || pk.FixedHeader.Type != packets.Publish {
 		return
 	}
+
+	if cl.IsTakenOver() || n.sessionOf(cl) == nil {
+		return
+	}
+
+	nsID := cl.ID
 
 	n.shMu.Lock()
 

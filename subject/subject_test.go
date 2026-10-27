@@ -466,3 +466,45 @@ func TestLengthBound(t *testing.T) {
 		}
 	}
 }
+
+func TestLogFilter(t *testing.T) {
+	const tn = "t1"
+
+	cases := map[string]string{
+		"a/b/c":   "d.t1.a.b.c",
+		"a/+/c":   "d.t1.a.*.c",
+		"a/b/#":   "d.t1.a.>",
+		"a/b/c/#": "d.t1.a.b.>",
+		"a/#":     "d.t1.>",
+		"#":       "d.t1.>",
+		"+/#":     "d.t1.>",
+		"a/+/#":   "d.t1.a.>",
+		"+":       "d.t1.*",
+		"$SYS/x":  "d.t1.=JFNZUw.x",
+		"é/+":     "d.t1.=w6k.*",
+		"a//b":    "d.t1.a.=.b",
+	}
+
+	for filter, want := range cases {
+		if got := LogFilter(tn, filter); got != want {
+			t.Errorf("%q: got %q, want %q", filter, got, want)
+		}
+
+		// It covers every log subject of a topic the filter matches.
+		for _, name := range topicSeeds {
+			if topic.Valid(name, false, 0) == nil && topic.Match(filter, name) && !natsMatch(LogFilter(tn, filter), Log(tn, name)) {
+				t.Errorf("%q does not cover %q", LogFilter(tn, filter), name)
+			}
+		}
+	}
+
+	for _, name := range []string{"a", "a/b", "a/b/c/d", "$SYS/x"} {
+		if !natsMatch(LogFilter(tn, "#"), Log(tn, name)) || natsMatch(LogFilter(tn, "#"), Log("t2", name)) {
+			t.Errorf("tenant scope of %q", name)
+		}
+	}
+
+	if LogFilter("", "a") != "" || LogFilter(tn, strings.Repeat("a", MaxTopicBytes+1)) != "" {
+		t.Error("refusals")
+	}
+}

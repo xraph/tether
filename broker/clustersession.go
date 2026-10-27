@@ -769,6 +769,25 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 
 	for i, id := range ids {
 		or := prev.QoS2Out[id]
+
+		if or.Seq == 0 {
+			// A shared delivery between its PUBREC and PUBCOMP (ruling R37):
+			// the PUBREL goes again, and the packet ID stays taken until
+			// the PUBCOMP. No log message and no cursor are involved.
+			if or.State != outPubrel {
+				continue
+			}
+
+			pk := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id}
+			pk.Created = now - int64(len(ids)) + int64(i)
+
+			s.qos2Out[id] = or
+			inflight = append(inflight, pk)
+			s.restored++
+
+			continue
+		}
+
 		if or.Seq <= prev.Cursor {
 			continue
 		}

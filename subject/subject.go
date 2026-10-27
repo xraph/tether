@@ -240,9 +240,25 @@ func filterNames(prefix, tenant, filter string) []string {
 		return nil
 	}
 
+	toks, hash := filterTokens(filter)
+	head := prefix + tenantToken(tenant, dollar(filter))
+	body := strings.Join(toks, tokenSep)
+
+	switch {
+	case !hash:
+		return []string{head + tokenSep + body}
+	case body == "":
+		return []string{head + tokenSep + ">"}
+	default:
+		return []string{head + tokenSep + body, head + tokenSep + body + tokenSep + ">"}
+	}
+}
+
+// filterTokens turns a filter's levels into tokens: "+" becomes "*", a
+// trailing "#" is left out and reported, every other level is encoded.
+func filterTokens(filter string) (toks []string, hash bool) {
 	levels := strings.Split(filter, levelSep)
-	toks := make([]string, 0, len(levels))
-	hash := false
+	toks = make([]string, 0, len(levels))
 
 	for i, level := range levels {
 		switch {
@@ -255,17 +271,7 @@ func filterNames(prefix, tenant, filter string) []string {
 		}
 	}
 
-	head := prefix + tenantToken(tenant, dollar(filter))
-	body := strings.Join(toks, tokenSep)
-
-	switch {
-	case !hash:
-		return []string{head + tokenSep + body}
-	case body == "":
-		return []string{head + tokenSep + ">"}
-	default:
-		return []string{head + tokenSep + body, head + tokenSep + body + tokenSep + ">"}
-	}
+	return toks, hash
 }
 
 // QoS0 returns the core NATS subject a QoS 0 message on topic is published to:
@@ -301,6 +307,35 @@ func LogTenantAll(tenant string) string {
 	}
 
 	return logPrefix + EncodeLevel(tenant) + tokenSep + ">"
+}
+
+// LogFilter returns the one log subject filter that covers every topic an
+// MQTT filter matches, for a consumer that may have only one filter (a shared
+// subscription's): the filter's tokens as for [QoS0Filters] under the plain
+// tenant token, and for a trailing "#" the tokens before its parent level
+// followed by ">", since one subject cannot hold both the parent and what is
+// under it ("a/b/#" gives "d.<tenant>.a.>"; "a/#", "+/#" and "#" give
+// "d.<tenant>.>"). It can match more than the MQTT filter, and "$" topics
+// stay under the plain tenant token in the log, so the reader matches with
+// MQTT rules after delivery. It returns "" for an empty tenant or a filter
+// over MaxTopicBytes. The filter must be valid MQTT with any "$share/<group>/"
+// prefix stripped.
+func LogFilter(tenant, filter string) string {
+	if checkTenant(tenant) != nil || CheckTopic(filter) != nil {
+		return ""
+	}
+
+	toks, hash := filterTokens(filter)
+	head := logPrefix + EncodeLevel(tenant)
+
+	switch {
+	case !hash:
+		return head + tokenSep + strings.Join(toks, tokenSep)
+	case len(toks) <= 1:
+		return head + tokenSep + ">"
+	default:
+		return head + tokenSep + strings.Join(toks[:len(toks)-1], tokenSep) + tokenSep + ">"
+	}
 }
 
 // SessionKey returns the key of a client's record in the sessions bucket:

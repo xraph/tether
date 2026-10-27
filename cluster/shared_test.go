@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/cluster/clustertest"
 )
@@ -525,28 +527,7 @@ func TestSharedConsumerKeepsMessages(t *testing.T) {
 	}
 }
 
-func TestSharedLogFilter(t *testing.T) {
-	cases := map[string]string{
-		"a/b/c":   "d.t1.a.b.c",
-		"a/+/c":   "d.t1.a.*.c",
-		"a/b/#":   "d.t1.a.>",
-		"a/#":     "d.t1.>",
-		"#":       "d.t1.>",
-		"+/#":     "d.t1.>",
-		"a/+/#":   "d.t1.a.>",
-		"$SYS/x":  "d.t1.=JFNZUw.x",
-		"é/+":     "d.t1.=w6k.*",
-		"a//b":    "d.t1.a.=.b",
-		"+":       "d.t1.*",
-		"a/b/c/#": "d.t1.a.b.>",
-	}
-
-	for filter, want := range cases {
-		if got := sharedLogFilter("t1", filter); got != want {
-			t.Errorf("%q: got %q, want %q", filter, got, want)
-		}
-	}
-
+func TestSharedNames(t *testing.T) {
 	if a, b := sharedName("t1", "g", "a/#"), sharedName("t2", "g", "a/#"); a == b {
 		t.Fatal("names collide across tenants")
 	}
@@ -590,5 +571,63 @@ func TestSharedInvalidInputAndClose(t *testing.T) {
 
 	if _, err := sh.Join("t", "g", "a", ok); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("join after close: %v", err)
+	}
+}
+
+// A consumer deleted between fetches (its inactive threshold, an operator)
+// is made again: a pull to it gets no responders, which counts as gone.
+func TestSharedConsumerRecreated(t *testing.T) {
+	nodes := startShared(t, 1, 5*time.Second)
+	a := &member{}
+
+	mustJoin(t, nodes[0].sh, "t1", "g", "r/#", a)
+
+	st, err := nodes[0].log.stream(tctx(t, 10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.DeleteConsumer(tctx(t, 10*time.Second), sharedName("t1", "g", "r/#")); err != nil {
+		t.Fatal(err)
+	}
+
+	// A message published while the group has no consumer is not the
+	// group's (DeliverNew), so wait for the pull loop's recreate.
+	waitFor(t, "the consumer made again", 15*time.Second, func() bool { return nodes[0].sh.recreated.Load() == 1 })
+
+	mustAppend(t, nodes[0].log, LogMessage{Tenant: "t1", Topic: "r/x", Payload: []byte("back"), QoS: 1})
+	waitFor(t, "delivery through the new consumer", 10*time.Second, func() bool { return a.count() == 1 })
+}
+
+// A fetch on a consumer deleted before it started fails in a way the pull
+// loop takes as "gone", so it makes the consumer again.
+func TestSharedFetchOnDeletedConsumer(t *testing.T) {
+	nodes := startShared(t, 1, 5*time.Second)
+
+	st, err := nodes[0].log.stream(tctx(t, 10*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cons, err := st.CreateOrUpdateConsumer(tctx(t, 10*time.Second), jetstream.ConsumerConfig{Durable: "gone", AckPolicy: jetstream.AckExplicitPolicy})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if derr := st.DeleteConsumer(tctx(t, 10*time.Second), "gone"); derr != nil {
+		t.Fatal(derr)
+	}
+
+	batch, err := cons.Fetch(1, jetstream.FetchMaxWait(time.Second))
+	if err == nil {
+		for range batch.Messages() {
+			t.Fatal("a message from a deleted consumer")
+		}
+
+		err = batch.Error()
+	}
+
+	if !consumerGone(err) {
+		t.Fatalf("fetch on a deleted consumer: %v, not taken as gone", err)
 	}
 }

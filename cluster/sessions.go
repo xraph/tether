@@ -95,7 +95,9 @@ type WillRecord struct {
 }
 
 // OutRecord is the state of one outbound QoS 2 delivery: the log sequence of
-// the message and where the handshake stands.
+// the message and where the handshake stands. Seq 0 (no log message has it)
+// is a shared subscription's delivery past its PUBREC, kept so a resume sends
+// the PUBREL again (the broker's state 1).
 type OutRecord struct {
 	Seq   uint64 `json:"seq"`
 	State byte   `json:"state"`

@@ -111,8 +111,8 @@ type Shared struct {
 	// Counters for tests: messages handed to a member (both halves), log
 	// messages acked after a member was through, naked for redelivery,
 	// acked at once because they did not match, QoS 0 messages no member on
-	// the node took.
-	delivered, acked, naked, skipped, dropped atomic.Uint64
+	// the node took, consumers made again by a pull loop.
+	delivered, acked, naked, skipped, dropped, recreated atomic.Uint64
 }
 
 // NewShared returns this node's shared subscriptions over c, on the log l
@@ -162,42 +162,6 @@ func sharedName(tenant, group, filter string) string {
 	h := sha256.Sum256([]byte(tenant + "\x00" + group + "\x00" + filter))
 
 	return sharedPrefix + hex.EncodeToString(h[:20])
-}
-
-// sharedLogFilter returns the single log subject filter of a group's
-// consumer (ruling R34): the filter's levels encoded as the log encodes them,
-// "+" as "*", and for a trailing "#" the levels before its parent level
-// followed by ">", so the parent topic and everything under it are covered
-// ("a/b/#" reads "d.<tenant>.a.>", "a/#" and "#" read "d.<tenant>.>"). It can
-// cover more than the MQTT filter, and "$" topics stay under the plain
-// tenant token in the log, so the consumer's messages are matched with MQTT
-// rules after they arrive.
-func sharedLogFilter(tenant, filter string) string {
-	levels := strings.Split(filter, "/")
-	toks := make([]string, 0, len(levels))
-	hash := false
-
-	for i, level := range levels {
-		switch {
-		case level == "+":
-			toks = append(toks, "*")
-		case level == "#" && i == len(levels)-1:
-			hash = true
-		default:
-			toks = append(toks, subject.EncodeLevel(level))
-		}
-	}
-
-	head := "d." + subject.EncodeLevel(tenant)
-
-	switch {
-	case !hash:
-		return head + "." + strings.Join(toks, ".")
-	case len(toks) <= 1:
-		return head + ".>"
-	default:
-		return head + "." + strings.Join(toks[:len(toks)-1], ".") + ".>"
-	}
 }
 
 // checkShared validates a Join.
@@ -464,7 +428,7 @@ func (g *sharedGroup) consumer(ctx context.Context) (jetstream.Consumer, error) 
 
 	cons, err := st.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:           g.name,
-		FilterSubject:     sharedLogFilter(g.key.tenant, g.key.filter),
+		FilterSubject:     subject.LogFilter(g.key.tenant, g.key.filter),
 		DeliverPolicy:     jetstream.DeliverNewPolicy,
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		AckWait:           s.ackWait,
@@ -606,7 +570,7 @@ func (p *sharedPull) run() {
 
 		delay = min(2*delay, sharedRetryMax)
 
-		if errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+		if consumerGone(err) {
 			ctx, cancel := context.WithTimeout(context.Background(), sharedJoinWait)
 			cons, cerr := g.consumer(ctx)
 
@@ -619,8 +583,18 @@ func (p *sharedPull) run() {
 			}
 
 			p.cons = cons
+			g.s.recreated.Add(1)
 		}
 	}
+}
+
+// consumerGone reports whether a fetch failed because its consumer no
+// longer exists. A pull to a consumer that is gone gets no responders (503)
+// from the server, not a not-found error; one deleted under a running fetch
+// says so.
+func consumerGone(err error) bool {
+	return errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) ||
+		errors.Is(err, nats.ErrNoResponders)
 }
 
 // fetch runs one fetch and hands what it brings to handle. A fetch that

@@ -904,9 +904,14 @@ func (b *Broker) waitRoom(ctx context.Context, s *session, cl *mqtt.Client, ro *
 
 // windowFull reports whether cl cannot take another QoS 1 or 2 delivery now,
 // counting those queued for the replay's writer: its inflight map would be
-// full, or as many deliveries as its Receive Maximum would be unacknowledged.
+// full, or as many deliveries as its Receive Maximum would be unacknowledged
+// (its shared deliveries in flight or queued included).
 func (b *Broker) windowFull(s *session, cl *mqtt.Client) bool {
 	n := b.cluster
+
+	// The session's shared messages count against its Receive Maximum too
+	// (clustershared.go); read before s.mu, which is never held with shMu.
+	shared := n.sharedOutstanding(s.nsID)
 
 	// Both under s.mu: the writer moves a delivery from queued into the
 	// inflight map under it, so reading the map before the lock could miss
@@ -917,7 +922,7 @@ func (b *Broker) windowFull(s *session, cl *mqtt.Client) bool {
 	inflight := cl.State.Inflight.Len()
 	queued := len(s.queued)
 
-	return inflight+queued >= n.maxInflight || s.recvMax > 0 && len(s.out)+queued >= s.recvMax
+	return inflight+queued >= n.maxInflight || s.recvMax > 0 && len(s.out)+queued+shared >= s.recvMax
 }
 
 // replayOne hands m to ro if it matches s, and moves s's position past it.
@@ -1232,7 +1237,13 @@ func (n *clusterNode) onAck(cl *mqtt.Client, id uint16, comp bool) {
 
 	if or, ok := s.qos2Out[id]; ok {
 		delete(s.qos2Out, id)
-		s.qos2Done[or.Seq] = struct{}{}
+
+		// Seq 0 is a shared delivery's PUBREL (sharePubrec): no log message
+		// to mark done.
+		if or.Seq > 0 {
+			s.qos2Done[or.Seq] = struct{}{}
+		}
+
 		s.gen++
 	}
 }
@@ -1349,7 +1360,7 @@ func (n *clusterNode) persistNow(s *session, cl *mqtt.Client) bool {
 // goes back to its group for another member.
 func (n *clusterNode) prunedDelivery(cl *mqtt.Client, pk packets.Packet) {
 	n.onQosDropped(cl, pk)
-	n.shareDropped(cl.ID, pk, true)
+	n.shareDropped(cl, pk, true)
 }
 
 // heldOut reports whether s's subscriptions are out of mochi's index.
