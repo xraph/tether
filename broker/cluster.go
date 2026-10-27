@@ -61,6 +61,12 @@ type Cluster struct {
 	// of it (clusterretained.go). Leave it nil and the broker makes one on
 	// Conn.
 	Retained *cluster.Retained
+
+	// Shared runs this node's side of the cell's shared subscription groups
+	// ("$share/<group>/<filter>", clustershared.go). Leave it nil and the
+	// broker makes one on Conn over Log, and closes it on Stop. One you make
+	// yourself (cluster.NewShared) you close, after the broker's Stop.
+	Shared *cluster.Shared
 }
 
 // injectorID is the client ID of the injector, the inline client that
@@ -170,6 +176,10 @@ type clusterNode struct {
 	// retained store (clusterretained.go).
 	retainedNode
 
+	// sharedNode is the node's memberships of shared groups and their
+	// deliveries (clustershared.go).
+	sharedNode
+
 	// Test seams, set before Start: afterAcquire runs in a CONNECT right
 	// after its key is acquired, before the session is registered;
 	// loadHook runs first in loadSession and fails it with its error.
@@ -220,6 +230,7 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 		appendRetryMax: defaultAppendRetryMax,
 		liveness:       newLiveness(),
 		retainedNode:   newRetainedNode(),
+		sharedNode:     newSharedNode(),
 	}
 
 	if n.Log == nil {
@@ -232,6 +243,11 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 
 	if n.Retained == nil {
 		n.Retained = cluster.NewRetained(c.Conn, c.Config)
+	}
+
+	if n.Shared == nil {
+		n.Shared = cluster.NewShared(c.Conn, c.Config, n.Log)
+		n.ownShared = true
 	}
 
 	n.persistQoS2 = n.persistQoS2In
@@ -267,11 +283,16 @@ func (n *clusterNode) detach() {
 	n.gate.Unlock()
 }
 
-// close closes the Router the broker made. Called after mochi has shut
-// down, so the releases of the last clean sessions still reach it.
+// close closes the Router and the Shared the broker made. Called after
+// mochi has shut down, so the releases of the last clean sessions still
+// reach them.
 func (n *clusterNode) close() {
 	if n.ownRouter {
 		n.Router.Close()
+	}
+
+	if n.ownShared {
+		n.Shared.Close()
 	}
 }
 
@@ -497,8 +518,11 @@ func (n *clusterNode) release(nsID, tenantID string, filters []string) {
 	}
 }
 
-// releaseAll drops every reference nsID holds.
+// releaseAll drops every reference nsID holds, and ends its shared group
+// memberships (endShared): the session is over on this node.
 func (n *clusterNode) releaseAll(nsID, tenantID string) {
+	defer n.endShared(nsID)
+
 	n.routesMu.Lock()
 
 	filters := make([]string, 0, len(n.routes[nsID]))
@@ -545,7 +569,8 @@ func (n *clusterNode) routed(nsID string) []string {
 
 // routedFilter returns the tenant-relative form of a namespaced filter of
 // tenantID that the Router carries, and false for one it does not: a shared
-// filter (Task 12 routes those) or one outside the tenant.
+// filter (its group carries those, clustershared.go) or one outside the
+// tenant.
 func routedFilter(tenantID, filter string) (string, bool) {
 	rel, ok := topic.Strip(tenantID, filter)
 	if !ok || rel == "" || withoutShare(rel) != rel {

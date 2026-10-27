@@ -907,11 +907,14 @@ func (b *Broker) waitRoom(ctx context.Context, s *session, cl *mqtt.Client, ro *
 // full, or as many deliveries as its Receive Maximum would be unacknowledged.
 func (b *Broker) windowFull(s *session, cl *mqtt.Client) bool {
 	n := b.cluster
-	inflight := cl.State.Inflight.Len()
 
+	// Both under s.mu: the writer moves a delivery from queued into the
+	// inflight map under it, so reading the map before the lock could miss
+	// the move and count that delivery in neither, letting one more through.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	inflight := cl.State.Inflight.Len()
 	queued := len(s.queued)
 
 	return inflight+queued >= n.maxInflight || s.recvMax > 0 && len(s.out)+queued >= s.recvMax
@@ -1342,9 +1345,11 @@ func (n *clusterNode) persistNow(s *session, cl *mqtt.Client) bool {
 }
 
 // prunedDelivery is pruneSession dropping a queued delivery the grants no
-// longer allow: it no longer holds the session's cursor.
+// longer allow: it no longer holds the session's cursor, and a shared one
+// goes back to its group for another member.
 func (n *clusterNode) prunedDelivery(cl *mqtt.Client, pk packets.Packet) {
 	n.onQosDropped(cl, pk)
+	n.shareDropped(cl.ID, pk, true)
 }
 
 // heldOut reports whether s's subscriptions are out of mochi's index.

@@ -30,6 +30,11 @@ const (
 // NATS messages it publishes itself, even when it also subscribes to a
 // matching subject. The router (a later task) relies on this to tell its own
 // publishes from a peer's, so do not hand a Conn to code that needs the echo.
+//
+// A second connection, without NoEcho, carries the QoS 0 queue groups of
+// shared subscriptions (ruling R5): a group member on the publishing node
+// must be able to win the queue pick of that node's own publish. It is opened
+// on first use (queueConn) and closed with the Conn.
 type Conn struct {
 	nc       *nats.Conn
 	js       jetstream.JetStream
@@ -38,6 +43,17 @@ type Conn struct {
 	closed   chan struct{} // closed by nats when the connection is closed
 	replicas int
 	once     sync.Once
+
+	// addr and qopts open the queue connection: the main connection's
+	// address and options, without NoEcho.
+	addr  string
+	qopts []nats.Option
+	// qmu guards qnc and qdone; it is held while the queue connection is
+	// dialled, which happens once.
+	qmu   sync.Mutex
+	qnc   *nats.Conn
+	qdone chan struct{} // closed by nats when the queue connection is closed
+	qshut bool          // Close ran: no queue connection opens after it
 }
 
 // Connect opens the node's connection. In embedded mode it first starts the
@@ -70,8 +86,9 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 	c := &Conn{logger: logger, closed: make(chan struct{})}
 
 	var (
-		addr string
-		opts = c.natsOptions(cfg)
+		addr  string
+		opts  = c.natsOptions(cfg)
+		qopts = c.queueOptions(cfg)
 	)
 
 	if cfg.Mode == ModeEmbedded {
@@ -84,13 +101,17 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 		addr = srv.ClientURL()
 
 		opts = append(opts, nats.InProcessServer(srv))
+		qopts = append(qopts, nats.InProcessServer(srv))
 	} else {
 		addr = strings.Join(cfg.URLs, ",")
 
 		if cfg.Credentials != "" {
 			opts = append(opts, nats.UserCredentials(cfg.Credentials))
+			qopts = append(qopts, nats.UserCredentials(cfg.Credentials))
 		}
 	}
+
+	c.addr, c.qopts = addr, qopts
 
 	nc, err := nats.Connect(addr, opts...)
 	if err != nil {
@@ -146,6 +167,59 @@ func (c *Conn) natsOptions(cfg Config) []nats.Option {
 	}
 
 	return opts
+}
+
+// queueOptions are the options of the queue connection: the main
+// connection's, without NoEcho and with handlers of its own.
+func (c *Conn) queueOptions(cfg Config) []nats.Option {
+	opts := []nats.Option{
+		nats.Name("tether-" + cfg.NodeID + "-shared"),
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(500 * time.Millisecond),
+		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+			c.logger.Warn("nats queue connection disconnected", "error", err)
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			c.logger.Info("nats queue connection reconnected", "url", nc.ConnectedUrlRedacted())
+		}),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			c.logger.Warn("nats queue connection error", "error", err)
+		}),
+	}
+
+	if cfg.NoDiscovery {
+		opts = append(opts, nats.IgnoreDiscoveredServers(), nats.DontRandomize())
+	}
+
+	return opts
+}
+
+// queueConn returns the queue connection, opening it on first use. It fails
+// with an error wrapping ErrUnavailable when it cannot be opened, or after
+// Close.
+func (c *Conn) queueConn() (*nats.Conn, error) {
+	c.qmu.Lock()
+	defer c.qmu.Unlock()
+
+	if c.qnc != nil {
+		return c.qnc, nil
+	}
+
+	if c.qshut || c.nc.IsClosed() {
+		return nil, fmt.Errorf("cluster: queue connection: %w: connection closed", ErrUnavailable)
+	}
+
+	done := make(chan struct{})
+	opts := append(append([]nats.Option{}, c.qopts...), nats.ClosedHandler(func(*nats.Conn) { close(done) }))
+
+	nc, err := nats.Connect(c.addr, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: %w: queue connection: %w", ErrUnavailable, err)
+	}
+
+	c.qnc, c.qdone = nc, done
+
+	return nc, nil
 }
 
 // waitJetStream polls until JetStream answers an account info request.
@@ -237,12 +311,39 @@ func (c *Conn) Healthy(ctx context.Context) error {
 // is safe to call more than once.
 func (c *Conn) Close() {
 	c.once.Do(func() {
+		c.closeQueue()
+
 		if c.nc != nil {
 			c.drain()
 		}
 
 		c.shutdownServer()
 	})
+}
+
+// closeQueue drains the queue connection, if one was opened, and keeps a
+// later queueConn from opening one.
+func (c *Conn) closeQueue() {
+	c.qmu.Lock()
+	nc, done := c.qnc, c.qdone
+	c.qshut = true
+	c.qmu.Unlock()
+
+	if nc == nil {
+		return
+	}
+
+	if err := nc.Drain(); err != nil {
+		nc.Close()
+
+		return
+	}
+
+	select {
+	case <-done:
+	case <-time.After(drainWait):
+		nc.Close()
+	}
 }
 
 func (c *Conn) drain() {

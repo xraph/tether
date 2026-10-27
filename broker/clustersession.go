@@ -834,13 +834,17 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 	// QoS 0 from other nodes for the loaded filters; until the replay is done
 	// the session is not in the index, so it gets none of it (QoS 0 may be
 	// dropped).
-	for ns := range s.loaded {
+	for ns, sub := range s.loaded {
 		if rel, ok := routedFilter(s.tenantID, ns); ok {
 			if err := n.subscribe(s.nsID, s.tenantID, rel); err != nil {
 				n.routeErrors.Add(1)
 				n.log.Warn("tether: route of a resumed subscription failed", slog.String("client", s.nsID),
 					slog.String("filter", rel), slog.Any("error", err))
 			}
+		} else if mqtt.IsSharedFilter(ns) {
+			// The session rejoins its groups here; deliveries wait for its
+			// CONNACK (deliverShared).
+			n.joinLoaded(s, sub)
 		}
 	}
 

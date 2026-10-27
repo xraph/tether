@@ -55,8 +55,9 @@ var provided = []byte{
 
 // clusterProvided lists the methods the hook implements only in cluster
 // mode, where they keep the node's QoS 0 routes (cluster.go), its sessions'
-// cursors (cursor.go) and its retained cache (clusterretained.go). Alone, the
-// broker provides exactly the methods it always did.
+// cursors (cursor.go), its retained cache (clusterretained.go) and its shared
+// groups (clustershared.go). Alone, the broker provides exactly the methods
+// it always did.
 var clusterProvided = []byte{
 	mqtt.OnSubscribe,
 	mqtt.OnSubscribed,
@@ -66,6 +67,7 @@ var clusterProvided = []byte{
 	mqtt.OnQosPublish,
 	mqtt.OnQosDropped,
 	mqtt.OnPublishDropped,
+	mqtt.OnSelectSubscribers,
 }
 
 // Provides implements mqtt.Hook.
@@ -471,11 +473,15 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 
 			return pk, nil
 		case packets.Puback, packets.Pubcomp:
-			// One of the session's deliveries is complete (cursor.go).
+			// One of the session's deliveries is complete (cursor.go), or
+			// one of its shared ones (clustershared.go).
 			n.onAck(cl, pk.PacketID, pk.FixedHeader.Type == packets.Pubcomp)
+			n.shareAcked(cl.ID, pk.PacketID, pk.FixedHeader.Type)
 
 			return pk, nil
 		case packets.Pubrec:
+			n.sharePubrec(cl.ID, pk.PacketID, pk.ReasonCode)
+
 			// The record says PUBREL before mochi sends it.
 			if !n.onPubrec(cl, pk) {
 				return pk, packets.ErrRejectPacket
@@ -842,15 +848,17 @@ func (h *hook) OnSubscribe(cl *mqtt.Client, pk packets.Packet) packets.Packet {
 // OnSubscribed takes a Router reference for each filter mochi accepted from
 // a network client's SUBSCRIBE (cluster mode only), with the client's tenant
 // and the tenant-relative filter, so QoS 0 messages for it published on
-// other nodes come here. Shared filters are left alone.
+// other nodes come here. A shared filter joins its group instead
+// (joinShared, clustershared.go).
 //
 // Mochi has stored the subscriptions when this runs and writes the SUBACK
 // right after, from the same reasonCodes slice. A filter whose Router
-// subscribe fails is refused there: its code becomes 0x80 (unspecified
-// error, also the 3.1.1 failure code), mochi's subscription is removed, and
-// mochi skips its retained messages. The failure is logged at Warn and
-// counted (routeErrors). A filter the session no longer holds once its
-// reference is taken (a prune got there first) gives the reference back.
+// subscribe or group join fails is refused there: its code becomes 0x80
+// (unspecified error, also the 3.1.1 failure code), mochi's subscription is
+// removed, and mochi skips its retained messages. The failure is logged at
+// Warn and counted (routeErrors, shareErrors). A filter the session no
+// longer holds once its reference is taken (a prune got there first) gives
+// the reference back.
 func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []byte) {
 	n := h.b.cluster
 	if n == nil || cl.Net.Inline {
@@ -871,6 +879,10 @@ func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 
 		rel, ok := routedFilter(tenantID, sub.Filter)
 		if !ok {
+			if mqtt.IsSharedFilter(sub.Filter) && !h.joinShared(cl, tenantID, sub) {
+				reasonCodes[i] = packets.ErrUnspecifiedError.Code
+			}
+
 			continue
 		}
 
@@ -920,9 +932,9 @@ func (h *hook) OnSubscribed(cl *mqtt.Client, pk packets.Packet, reasonCodes []by
 	}
 }
 
-// OnUnsubscribed drops the Router references of the filters a network
-// client's session no longer holds (cluster mode only): after an
-// UNSUBSCRIBE, and when mochi unsubscribes a clean session that ended or was
+// OnUnsubscribed drops the Router references and shared group memberships
+// of the filters a network client's session no longer holds (cluster mode
+// only): after an UNSUBSCRIBE, and when mochi unsubscribes a clean session that ended or was
 // taken over. Mochi also calls it for an UNSUBSCRIBE it refused (packet
 // identifier in use) and for filters the client never had, so only filters
 // gone from the session are released.
@@ -937,7 +949,7 @@ func (h *hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 		return
 	}
 
-	var gone []string
+	var gone, goneShared []string
 
 	for _, sub := range pk.Filters {
 		if _, held := cl.State.Subscriptions.Get(sub.Filter); held {
@@ -946,10 +958,13 @@ func (h *hook) OnUnsubscribed(cl *mqtt.Client, pk packets.Packet) {
 
 		if rel, ok := routedFilter(tenantID, sub.Filter); ok {
 			gone = append(gone, rel)
+		} else if mqtt.IsSharedFilter(sub.Filter) {
+			goneShared = append(goneShared, sub.Filter)
 		}
 	}
 
 	n.release(cl.ID, tenantID, gone)
+	n.leaveShared(cl.ID, goneShared)
 
 	if s := n.sessionOf(cl); s != nil {
 		s.unloaded(pk.Filters)
@@ -976,11 +991,27 @@ func (h *hook) OnQosPublish(cl *mqtt.Client, pk packets.Packet, _ int64, _ int) 
 	}
 }
 
-// OnQosDropped forgets a delivery mochi gave up on (cluster mode).
+// OnQosDropped forgets a delivery mochi gave up on (cluster mode); a shared
+// one is finished (its message expired).
 func (h *hook) OnQosDropped(cl *mqtt.Client, pk packets.Packet) {
 	if n := h.b.cluster; n != nil && !cl.Net.Inline {
 		n.onQosDropped(cl, pk)
+		n.shareDropped(cl.ID, pk, false)
 	}
+}
+
+// OnSelectSubscribers empties mochi's shared selection in cluster mode
+// (ruling R35): a shared subscription receives only from its group
+// (clustershared.go), never from a message this node injects or a client of
+// this node publishes. mochi calls it only when the topic has shared
+// subscribers here, and then selects from what this returns.
+func (h *hook) OnSelectSubscribers(subs *mqtt.Subscribers, _ packets.Packet) *mqtt.Subscribers {
+	if h.b.cluster != nil && subs != nil {
+		subs.Shared = map[string]map[string]packets.Subscription{}
+		subs.SharedSelected = map[string]packets.Subscription{}
+	}
+
+	return subs
 }
 
 // OnPublishDropped holds the cursor below a delivery mochi could not queue

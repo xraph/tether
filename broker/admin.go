@@ -518,8 +518,8 @@ func (b *Broker) unsubscribe(srv *mqtt.Server, cl *mqtt.Client, drop func(filter
 	return len(removed)
 }
 
-// releaseRoutes drops the Router references of subscriptions unsubscribe
-// removed from cl's session.
+// releaseRoutes drops the Router references and shared group memberships of
+// subscriptions unsubscribe removed from cl's session.
 func (b *Broker) releaseRoutes(cl *mqtt.Client, removed []packets.Subscription) {
 	tenantID, ok := tenantOfID(cl.ID)
 	if !ok {
@@ -528,13 +528,18 @@ func (b *Broker) releaseRoutes(cl *mqtt.Client, removed []packets.Subscription) 
 
 	rels := make([]string, 0, len(removed))
 
+	var shared []string
+
 	for _, sub := range removed {
 		if rel, ok := routedFilter(tenantID, sub.Filter); ok {
 			rels = append(rels, rel)
+		} else if mqtt.IsSharedFilter(sub.Filter) {
+			shared = append(shared, sub.Filter)
 		}
 	}
 
 	b.cluster.release(cl.ID, tenantID, rels)
+	b.cluster.leaveShared(cl.ID, shared)
 }
 
 // Admin operations. The host's admin API calls these for one tenant, after
