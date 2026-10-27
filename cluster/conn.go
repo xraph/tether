@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
@@ -43,6 +44,12 @@ type Conn struct {
 	closed   chan struct{} // closed by nats when the connection is closed
 	replicas int
 	once     sync.Once
+
+	// jsSeen is when JetStream last answered Healthy (unix nanoseconds),
+	// set first when Connect saw it answer; jsGrace is how long Healthy
+	// lets it not answer before it reports the node unhealthy.
+	jsSeen  atomic.Int64
+	jsGrace time.Duration
 
 	// addr and qopts open the queue connection: the main connection's
 	// address and options, without NoEcho.
@@ -143,6 +150,8 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 	}
 
 	c.replicas = replicasFor(cfg, nc)
+	c.jsGrace = healthGrace(cfg)
+	c.jsSeen.Store(time.Now().UnixNano())
 
 	logger.Info("cluster connected", "mode", cfg.Mode, "replicas", c.replicas, "url", nc.ConnectedUrlRedacted())
 
@@ -330,16 +339,45 @@ func (c *Conn) MaxPayload() int64 { return c.nc.MaxPayload() }
 
 // Healthy reports whether the connection is up and JetStream answers. The
 // error wraps ErrUnavailable.
+//
+// Only the JetStream meta leader answers the account info request Healthy
+// sends, so during a meta leader election (4 to 9 s on nats-server 2.15)
+// nothing does, on every node at once. A readiness probe that failed then
+// would take the whole cell out of service for an election the cell rides
+// out. So JetStream not answering is reported only once it has gone on for
+// longer than Lease/2 since it last answered: the time after which a node
+// that cannot renew its lease fences itself. A connection that is down is
+// reported at once.
 func (c *Conn) Healthy(ctx context.Context) error {
 	if !c.nc.IsConnected() {
 		return fmt.Errorf("cluster: %w: nats connection is %s", ErrUnavailable, c.nc.Status())
 	}
 
-	if _, err := c.js.AccountInfo(ctx); err != nil {
-		return fmt.Errorf("cluster: %w: %w", ErrUnavailable, err)
+	_, err := c.js.AccountInfo(ctx)
+	if err == nil {
+		c.jsSeen.Store(time.Now().UnixNano())
+
+		return nil
 	}
 
-	return nil
+	if since := time.Since(time.Unix(0, c.jsSeen.Load())); since <= c.jsGrace {
+		c.logger.Debug("cluster: jetstream did not answer the health check, within the grace", "since", since, "err", err)
+
+		return nil
+	}
+
+	return fmt.Errorf("cluster: %w: jetstream has not answered for over %s: %w", ErrUnavailable, c.jsGrace, err)
+}
+
+// healthGrace is how long Healthy lets JetStream not answer: Lease/2, the
+// default lease's when cfg has none.
+func healthGrace(cfg Config) time.Duration {
+	lease := cfg.Lease
+	if lease <= 0 {
+		lease = DefaultConfig().Lease
+	}
+
+	return lease / 2
 }
 
 // Close drains the connection and, in embedded mode, shuts the server down. It

@@ -398,8 +398,9 @@ func (n *clusterNode) dropClient(srv *mqtt.Server, cl *mqtt.Client) {
 // ClusterHealth reports whether this node can act for its cell: nil when it
 // can, or when the broker runs without a cluster. It returns an error
 // wrapping cluster.ErrFenced while the node is fenced, and one wrapping
-// cluster.ErrUnavailable when its NATS connection is down or JetStream does
-// not answer within ctx.
+// cluster.ErrUnavailable when its NATS connection is down or JetStream has
+// not answered for longer than Lease/2 (cluster.Conn.Healthy: a meta leader
+// election, during which no node gets an answer, does not fail it).
 func (b *Broker) ClusterHealth(ctx context.Context) error {
 	n := b.cluster
 	if n == nil {
