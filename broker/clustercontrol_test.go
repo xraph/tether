@@ -223,3 +223,29 @@ func TestDeleteSessionPublishesHeldWill(t *testing.T) {
 		require.Empty(t, c.nodes[0].cluster.pendingWills(), "the delay timer still runs")
 	}
 }
+
+// Kicking, from another node, a client whose will has a delay succeeds: the
+// owner keeps the record with DisconnectedAt set while the will waits, which
+// counts as the connection gone, and Clients no longer lists it as connected
+// (C-I2).
+func TestKickRemoteWithDelayedWill(t *testing.T) {
+	c := startControlCell(t, 2)
+	tid := c.t1.ID.String()
+
+	conn := rawConnectWill(t, c.addr(0), willSpec{id: "kd", topic: "wills/kd", qos: 1, expiry: 3600, delay: 60})
+	t.Cleanup(func() { _ = conn.Close() })
+
+	start := time.Now()
+	require.NoError(t, c.nodes[1].Kick(tid, "kd"))
+	require.Less(t, time.Since(start), remoteAdminWait, "the kick waited out its bound")
+
+	rec, err := sessionKey(t, c.nodes[1], tid, "kd")
+	require.NoError(t, err)
+	require.False(t, rec.DisconnectedAt.IsZero())
+
+	for _, ci := range c.nodes[1].Clients(tid) {
+		if ci.ClientID == "kd" {
+			require.False(t, ci.Connected, "a session waiting out its will delay is not connected")
+		}
+	}
+}

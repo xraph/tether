@@ -2169,7 +2169,7 @@ func (b *Broker) clusterClients(local []ClientInfo, tenantID string) []ClientInf
 			ClientID:        e.ClientID,
 			Username:        rec.Username,
 			DeviceID:        rec.DeviceID,
-			Connected:       rec.Owner != "",
+			Connected:       rec.Owner != "" && rec.DisconnectedAt.IsZero(),
 			ProtocolVersion: rec.ProtocolVersion,
 			Subscriptions:   subs,
 			SessionExpiry:   rec.ExpirySeconds,

@@ -306,8 +306,9 @@ func (b *Broker) deleteRemote(tenantID, clientID, owner string, epoch uint64) er
 // awaitRemote reads the session's record until owner has let it go at epoch,
 // for at most remoteAdminWait.
 //
-// For a kick, any record that is not owner's at epoch any more means the
-// connection is gone: nil. For a delete: no record is nil; a record of
+// For a kick, any record that is not owner's at epoch any more, or that is
+// marked disconnected (the owner keeps a session whose delayed will waits),
+// means the connection is gone: nil. For a delete: no record is nil; a record of
 // another epoch is a client that connected again (tether.ErrConflict); an
 // offline record of the same epoch (the owner let it go without deleting it)
 // is deleted here at the revision read, as for any offline session, and read
@@ -328,6 +329,10 @@ func (b *Broker) awaitRemote(op, tenantID, clientID, owner string, epoch uint64)
 			return nil
 		case err != nil:
 			return fmt.Errorf("tether/broker: %s %q: %w", op, clientID, err)
+		case op == "kick" && rec.Epoch == epoch && !rec.DisconnectedAt.IsZero():
+			// The connection is gone; the owner keeps the record while
+			// a delayed will waits out its delay (finish).
+			return nil
 		case rec.Owner == owner && rec.Epoch == epoch:
 			// Not yet.
 		case op == "kick":
