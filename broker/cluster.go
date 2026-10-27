@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,6 +224,32 @@ type clusterNode struct {
 // leaves the Router alone and the subscriber gives the reference back.
 type routeRef struct {
 	active bool
+}
+
+// cellHeadroom is what a log entry's or a session record's own fields can
+// add to an MQTT packet's bytes in NATS: Tether's headers (message ID,
+// origin, client ID, publish time) and the record's fields besides a will.
+const cellHeadroom = 16 << 10
+
+// fitPacketSize returns the Maximum Packet Size a node of a cell whose NATS
+// server takes messages of up to maxPayload bytes can accept: want, or less
+// when a packet that large could not reach the cell (cluster.ErrTooLarge).
+// Every packet must fit as a retained value, base64 in JSON (four thirds of
+// its size), after cellHeadroom. A lowered size is logged at Warn.
+func fitPacketSize(want uint32, maxPayload int64, log *slog.Logger) uint32 {
+	if maxPayload <= cellHeadroom {
+		return want
+	}
+
+	fit := uint32(min((maxPayload-cellHeadroom)*3/4, math.MaxUint32)) //nolint:gosec // bounded above
+	if want <= fit {
+		return want
+	}
+
+	log.Warn("tether: max_packet_size lowered to what the cell's nats server can carry; raise its max_payload to keep it",
+		slog.Uint64("max_packet_size", uint64(want)), slog.Uint64("lowered_to", uint64(fit)), slog.Int64("nats_max_payload", maxPayload))
+
+	return fit
 }
 
 // newClusterNode checks c and returns the broker's cluster side. deliver

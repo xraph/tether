@@ -85,6 +85,10 @@ func (r *Retained) handles(ctx context.Context) (*retainedHandles, error) {
 }
 
 func (r *Retained) wrapErr(op string, err error) error {
+	if isTooLarge(err) {
+		return wrapTooLarge(op, err)
+	}
+
 	if isUnavailable(err) {
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrUnavailable, err)
 	}
@@ -160,12 +164,9 @@ func (r *Retained) Put(ctx context.Context, tenant, topic string, msg LogMessage
 		at = time.Now()
 	}
 
-	data, err := json.Marshal(retainedValue{
-		Payload: msg.Payload, QoS: msg.QoS, Props: msg.Props,
-		Origin: msg.Origin, ClientID: msg.ClientID, PublishedAt: at.UTC(),
-	})
+	data, err := encodeRetained(msg, at)
 	if err != nil {
-		return fmt.Errorf("cluster: put retained: encode: %w", err)
+		return err
 	}
 
 	ctx, cancel := opContext(ctx)
@@ -188,6 +189,55 @@ func (r *Retained) Put(ctx context.Context, tenant, topic string, msg LogMessage
 	}
 
 	return nil
+}
+
+// retainedHeaderRoom is what Put's headers can take besides the value: the
+// Nats-TTL header and the header block's framing.
+const retainedHeaderRoom = 128
+
+// Check reports whether Put would refuse msg as too large for the NATS
+// server (Conn.MaxPayload): nil if it fits or has no payload (a delete), else
+// an error wrapping ErrTooLarge and tether.ErrInvalidInput. It checks size
+// only, and sends nothing. The value is base64 in JSON, so a payload takes
+// about four thirds of its size.
+func (r *Retained) Check(msg LogMessage) error {
+	if len(msg.Payload) == 0 {
+		return nil
+	}
+
+	limit := r.c.MaxPayload()
+	if limit <= 0 {
+		return nil
+	}
+
+	at := msg.PublishedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+
+	data, err := encodeRetained(msg, at)
+	if err != nil {
+		return err
+	}
+
+	if int64(len(data))+retainedHeaderRoom > limit {
+		return wrapTooLarge("put retained", nats.ErrMaxPayload)
+	}
+
+	return nil
+}
+
+// encodeRetained is the bucket value Put stores for msg, published at at.
+func encodeRetained(msg LogMessage, at time.Time) ([]byte, error) {
+	data, err := json.Marshal(retainedValue{
+		Payload: msg.Payload, QoS: msg.QoS, Props: msg.Props,
+		Origin: msg.Origin, ClientID: msg.ClientID, PublishedAt: at.UTC(),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cluster: put retained: encode: %w", err)
+	}
+
+	return data, nil
 }
 
 // Delete removes the retained message of topic in tenant. It leaves a purge

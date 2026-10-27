@@ -34,7 +34,7 @@ Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store
   6. In a cell, `openCell` (see Cell): connect, provision, the cluster services, the tenant cache eviction on the bus.
   7. `broker.New(cfg.Broker, Deps{..., Metrics, Cluster})`.
   8. `events.NewReactor(authn.Evict, broker)` bound to both plugins, before the broker listens. In a cell, `events.NewClusterReactor(authn.Evict, broker, control, logger)` instead.
-  9. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: cfg.Broker.MaxPacketSize}` (0 means api's 1 MiB default). Its error fails Start.
+  9. Routes unless disabled: admin group `Router().Group(BasePath)` with the admin middleware added by `Use`, and a second plain group for `POST <base>/v1/publish`; `api.Register` with `Services{..., MaxPublishPayload: b.MaxPacketSize()}` (the broker's, lowered in a cell whose NATS max_payload cannot carry the configured size) (0 means api's 1 MiB default). Its error fails Start.
   10. In a cell, the control bus's `Start`, so the node hears the cell before any client connects.
   11. `broker.Start`.
   12. In a cell, `Members.Start`, after the broker so its fence, unfence and dead-peer callbacks find a running broker. If it fails, the broker is stopped (10 s bound) and the cell closed.

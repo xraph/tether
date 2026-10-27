@@ -427,6 +427,11 @@ type pubItem struct {
 	// writer only.
 	sentAt    time.Time
 	persisted bool
+
+	// refused, set before the starter sees it, fails every attempt
+	// without sending: a retained publish the retained store cannot hold
+	// (cluster.Retained.Check).
+	refused error
 }
 
 func newPubPipe(b *Broker, srv *mqtt.Server, cl *mqtt.Client, st *clientState) *pubPipe {
@@ -655,6 +660,12 @@ func (p *pubPipe) start(it *pubItem) {
 	it.sentAt = time.Now()
 	it.pend = nil
 
+	if it.refused != nil {
+		it.err = it.refused
+
+		return
+	}
+
 	if it.qos == 2 && n.persistQoS2 != nil && !it.persisted {
 		if err := n.persistQoS2(p.st.tenantID, p.st.rawID, it.id, it.msgID); err != nil {
 			it.err = err
@@ -742,6 +753,12 @@ func (p *pubPipe) commit(it *pubItem) bool {
 			it.err = err
 		}
 
+		if errors.Is(it.err, cluster.ErrTooLarge) {
+			// Over what NATS carries (fitPacketSize keeps that rare): it
+			// never commits, so it is refused, not retried.
+			return p.refuseTooLarge(it)
+		}
+
 		if errors.Is(it.err, tether.ErrInvalidInput) {
 			// Every publish was checked before it got here, so this is a
 			// bug. The client would wait for this ack for good; close it.
@@ -762,6 +779,56 @@ func (p *pubPipe) commit(it *pubItem) bool {
 		retried = true
 
 		p.start(it)
+	}
+}
+
+// errTooLargeCode is the reason code of a PUBACK or PUBREC refusing a
+// publish the cell cannot carry. MQTT 5 has no "packet too large" code for
+// them (0x95 is for CONNACK and DISCONNECT), so it is 0x83, implementation
+// specific error: the PUBLISH is valid but the server will not take it.
+var errTooLargeCode = packets.Code{Code: packets.ErrImplementationSpecificError.Code, Reason: "message too large for the cell"}
+
+// refuseTooLarge ends it's commit on a publish the log refused as too large
+// (cluster.ErrTooLarge). A 5.0 client gets its PUBACK or PUBREC with
+// errTooLargeCode, which ends a QoS 2 flow (its pending entry goes); a 3.1.1
+// client has no failure code to read, so it is disconnected with 0x95. It
+// reports whether the pipe goes on.
+func (p *pubPipe) refuseTooLarge(it *pubItem) bool {
+	p.b.log.Warn("tether: publish too large for the cell, refused", slog.String("client", p.cl.ID),
+		slog.Int("payload_bytes", len(it.msg.Payload)), slog.Any("error", it.err))
+
+	if p.cl.Properties.ProtocolVersion < 5 {
+		p.cl.Stop(packets.ErrPacketTooLarge)
+
+		return false
+	}
+
+	it.code = errTooLargeCode.Code
+	it.retained = nil
+
+	if it.qos == 2 {
+		p.unreserve(it)
+		p.b.cluster.clearQoS2(p.cl.ID, it.id)
+	}
+
+	return true
+}
+
+// unreserve removes the PUBREC reservation of a QoS 2 publish that is
+// refused rather than committed: nothing of its flow may be resent.
+func (p *pubPipe) unreserve(it *pubItem) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.reserved[it.id] != it {
+		return
+	}
+
+	delete(p.reserved, it.id)
+
+	if held, ok := p.cl.State.Inflight.Get(it.id); ok && held.FixedHeader.Type == packets.Pubrec &&
+		p.cl.State.Inflight.Delete(it.id) {
+		atomic.AddInt64(&p.srv.Info.Inflight, -1)
 	}
 }
 
@@ -1151,7 +1218,14 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 	}
 
 	if pk.FixedHeader.Retain {
-		it.retained = n.newRetainWrite(st.tenantID, rel, it.msg.Payload, qos, it.msg.Props, st.rawID)
+		if err := n.Retained.Check(it.msg); err != nil {
+			// The log could take it but the retained store could not: it
+			// is refused whole (start, refuseTooLarge), so a client is never
+			// told a message is retained when it is not.
+			it.refused = err
+		} else {
+			it.retained = n.newRetainWrite(st.tenantID, rel, it.msg.Payload, qos, it.msg.Props, st.rawID)
+		}
 	}
 
 	if qos == 2 {

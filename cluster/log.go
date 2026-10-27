@@ -158,6 +158,10 @@ func (l *Log) stream(ctx context.Context) (jetstream.Stream, error) {
 }
 
 func (l *Log) wrapErr(op string, err error) error {
+	if isTooLarge(err) {
+		return wrapTooLarge(op, err)
+	}
+
 	if isUnavailable(err) {
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrUnavailable, err)
 	}

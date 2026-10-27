@@ -24,6 +24,7 @@ A second connection, without NoEcho, carries the QoS 0 queue groups of shared su
 
 - `(*Conn).JS() jetstream.JetStream`, `NC() *nats.Conn`.
 - `Healthy(ctx) error`: connected and JetStream answers; the error wraps ErrUnavailable.
+- `MaxPayload() int64`: the server's max_payload, headers included (0 before the connection has heard from a server). Embedded mode sets it to `EmbeddedMaxPayload` (4 MiB: a 1 MiB MQTT packet fits as a retained value, base64 in JSON); external servers keep theirs (nats-server's default is 1 MiB). The broker lowers its Maximum Packet Size to fit it.
 - `Close()`: drains the connection, then shuts down the embedded server. Idempotent.
 - `Replicas() int`: the replica count Provision uses. `Config.Replicas` when set. Otherwise min(3, servers): embedded mode counts 1 + len(Routes); external mode counts max(len(URLs), 1 + servers the client discovered) when the server reports a cluster name, else 1. A deployment that advertises nothing and runs two servers should set Replicas.
 
@@ -41,7 +42,7 @@ All with `Conn.Replicas()` replicas. Pass `cfg.LogAge()` as maxSessionExpiry (th
 
 ## Errors
 
-`ErrLostCAS` (JetStream 10071 and 10164 both mean this; Sessions maps both, and the returned error also wraps the `*jetstream.APIError`), `ErrFenced`, `ErrUnavailable`. Messages start `tether/cluster: `.
+`ErrLostCAS` (JetStream 10071 and 10164 both mean this; Sessions maps both, and the returned error also wraps the `*jetstream.APIError`), `ErrFenced`, `ErrUnavailable`, `ErrTooLarge` (a write over `Conn.MaxPayload`, nats.go's `ErrMaxPayload` before anything is sent, or JetStream 10054; Log, Retained and Sessions map it, and the error also wraps `tether.ErrInvalidInput`: sending it again never helps). Messages start `tether/cluster: `.
 
 ## Sessions
 
@@ -120,7 +121,8 @@ members_test.go (package cluster, `startMemberCell` provisions a three-server ce
 
 Every method checks first: a topic over 1024 bytes (`subject.CheckTopic`), a topic that is not a valid MQTT topic name (`topic.Valid`: empty, `+`, `#`, NUL), an empty tenant and a QoS over 2 all wrap `tether.ErrInvalidInput`, and nothing is written, so no "" key exists. A NATS timeout or no responders wraps `ErrUnavailable`. A call without a context deadline gets 10 s.
 
-- `Put(ctx, tenant, topic, msg LogMessage, expiry time.Duration) error`: stores Payload, QoS, Props, Origin, ClientID and PublishedAt (zero = now); Tenant, Topic, Seq and Retain of msg are ignored. An empty payload is a Delete. A positive expiry is a raw publish to `$KV.<bucket>.<key>` with `Nats-TTL` (whole seconds, rounded up, min 1 s, as `Sessions.Expire`); pass what is left of the MQTT 5 message expiry. When it runs out the key becomes a limit marker and watchers see a removal.
+- `Put(ctx, tenant, topic, msg LogMessage, expiry time.Duration) error`: stores Payload, QoS, Props, Origin, ClientID and PublishedAt (zero = now); Tenant, Topic, Seq and Retain of msg are ignored. An empty payload is a Delete. A positive expiry is a raw publish to `$KV.<bucket>.<key>` with `Nats-TTL` (whole seconds, rounded up, min 1 s, as `Sessions.Expire`); pass what is left of the MQTT 5 message expiry. When it runs out the key becomes a limit marker and watchers see a removal. A value over the server's max_payload fails with `ErrTooLarge`.
+- `Check(msg LogMessage) error`: size only, nothing sent: an error wrapping `ErrTooLarge` (and `tether.ErrInvalidInput`) when Put would be refused as too large, nil when it fits or the payload is empty. The broker calls it before appending a retained publish, so one the store cannot hold is refused whole.
 - `Delete(ctx, tenant, topic) error`: a purge (rollup) whose marker carries `Nats-TTL` of the bucket's `LimitMarkerTTL` (1 min), so markers do not pile up. Deleting an unset topic is not an error.
 - `Load(ctx, tenant) ([]LogMessage, error)`: every retained message of the tenant, both key spaces, sorted by topic, through one watcher pass over `<tenant>.>` and `==<tenant>.>`. Each has Tenant, Topic and `Retain` set, and `Seq` = the key's revision (cell-wide, so of two readings of a topic the higher Seq is newer). Every write acknowledged before the call is in the result (the leader mark below), so set on node A then Load or Watch on node B right after sees it.
 - Leader mark (`catchUp`): a KV watcher's consumer is R1 and nats-server places it on any active peer, possibly a follower a few ms behind, which delivers what it lacks later as updates. So after the watcher exists, Load and every Watch pass ask the stream leader for the newest revision under the two filters (non-direct `$JS.API.STREAM.MSG.GET.KV_<bucket>` with a wildcard `last_by_subj`, as `Sessions.read` does), and the pass is done only when the watcher has sent its end-of-first-pass nil and delivered a revision at or above that mark. Markers stay in the pass (no IgnoreDeletes): the newest entry can be one, and a marker removes the key. While waiting, the mark is re-read every 250 ms and only ever lowered, for an entry at the mark that vanished (a purge marker whose TTL ran out); it is never raised, so steady writes cannot hold a pass back.

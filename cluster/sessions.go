@@ -228,6 +228,8 @@ func (s *Sessions) wrapErr(op string, err error) error {
 		}
 
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrLostCAS, err)
+	case isTooLarge(err):
+		return wrapTooLarge(op, err)
 	case isUnavailable(err):
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrUnavailable, err)
 	default:

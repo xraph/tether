@@ -13,6 +13,11 @@ import (
 
 const defaultEmbeddedListen = "127.0.0.1:-1"
 
+// EmbeddedMaxPayload is the max_payload of an embedded server: room for a
+// 1 MiB MQTT packet once its retained copy is base64 in JSON, or its log
+// entry carries Tether's headers (nats-server's own default is 1 MiB).
+const EmbeddedMaxPayload = 4 << 20
+
 // startEmbedded starts an in-process nats-server with JetStream and waits
 // until it takes connections. In a cluster the JetStream meta group may not
 // have a leader yet; Connect waits for that.
@@ -39,6 +44,7 @@ func startEmbedded(cfg Config, wait time.Duration) (*server.Server, error) {
 		StoreDir:   e.StoreDir,
 		Username:   e.User,
 		Password:   e.Password,
+		MaxPayload: EmbeddedMaxPayload,
 	}
 
 	if e.ClusterName != "" {

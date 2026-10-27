@@ -298,6 +298,13 @@ func (c *Conn) NC() *nats.Conn { return c.nc }
 // buckets.
 func (c *Conn) Replicas() int { return c.replicas }
 
+// MaxPayload is the largest message, headers included, the NATS server the
+// connection is on takes (its max_payload); 0 before the connection has
+// heard from a server. A write over it fails with an error wrapping
+// ErrTooLarge. Embedded mode raises the server's default 1 MiB to
+// EmbeddedMaxPayload.
+func (c *Conn) MaxPayload() int64 { return c.nc.MaxPayload() }
+
 // Healthy reports whether the connection is up and JetStream answers. The
 // error wraps ErrUnavailable.
 func (c *Conn) Healthy(ctx context.Context) error {

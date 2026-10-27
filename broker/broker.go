@@ -178,6 +178,8 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 		n.b = b
 		b.cluster = n
 
+		b.cfg.MaxPacketSize = fitPacketSize(b.cfg.MaxPacketSize, deps.Cluster.Conn.MaxPayload(), b.log)
+
 		if cm, ok := deps.Metrics.(ClusterMetrics); ok {
 			n.metrics = cm
 			n.Log.OnAppend(cm.LogAppended)
@@ -509,6 +511,12 @@ func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, code packet
 
 	cl.Stop(code)
 }
+
+// MaxPacketSize is the largest MQTT packet the broker accepts, in bytes:
+// Config.MaxPacketSize, or less in a cell whose NATS server cannot carry
+// packets that large (fitPacketSize). Bound other ways in with it, such as an
+// HTTP publish.
+func (b *Broker) MaxPacketSize() uint32 { return b.cfg.MaxPacketSize }
 
 // Running reports whether the broker is started and not yet stopped. The
 // admin operations that need mochi (Clients, Kick, DeleteSession, Retained,

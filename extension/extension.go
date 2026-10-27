@@ -302,7 +302,7 @@ func (e *Extension) Start(ctx context.Context) error {
 		Perms:             loader,
 		Limits:            limiter,
 		Logger:            slogger,
-		MaxPublishPayload: int(e.config.Broker.MaxPacketSize),
+		MaxPublishPayload: int(b.MaxPacketSize()),
 	}
 
 	if !e.config.DisableRoutes {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"slices"
 	"strconv"
@@ -1504,4 +1505,84 @@ func TestOversizedMessageDoesNotPinCursor(t *testing.T) {
 
 		return err == nil && len(rec.Pending) == 0 && rec.Cursor >= tt.livePos.Load()
 	})
+}
+
+// fitPacketSize lowers a Maximum Packet Size the cell's NATS server could not
+// carry, so a client gets 0x95 from mochi at the door rather than a publish
+// the log refuses (A-I1).
+func TestFitPacketSize(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+
+	require.Equal(t, uint32(1<<20), fitPacketSize(1<<20, 4<<20, log), "fits under an embedded server's max_payload")
+	require.Equal(t, uint32(((1<<20)-cellHeadroom)*3/4), fitPacketSize(1<<20, 1<<20, log), "lowered under nats' default")
+	require.Equal(t, uint32(1<<20), fitPacketSize(1<<20, 0, log), "unknown limit: unchanged")
+}
+
+// A publish the log refuses as too large for NATS is refused to the client,
+// not retried for ever behind its acks: a 5.0 client gets 0x83 on its
+// PUBACK or PUBREC and its later publishes go on; a will too large for the
+// session record refuses the CONNECT with 0x95 (A-I1). The broker's packet
+// size is raised past what fitPacketSize allows, to reach the log's refusal.
+func TestPublishTooLargeForCellRefused(t *testing.T) {
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.cfg.MaxPacketSize = 8 << 20
+		})
+
+	limit := int(c.nodes[0].cluster.Conn.MaxPayload())
+	big := strings.Repeat("x", limit+1)
+
+	pub, _, err := connect5(t, c.addr(0), "big-pub", "u1", true)
+	require.NoError(t, err)
+
+	code := func(p *paho.Publish) byte {
+		ctx, cancel := context.WithTimeout(t.Context(), logWait)
+		defer cancel()
+
+		resp, err := pub.Publish(ctx, p)
+		require.NotNil(t, resp, "no PUBACK or PUBREC: %v", err)
+
+		return resp.ReasonCode
+	}
+
+	require.Equal(t, byte(0x83), code(&paho.Publish{Topic: "big/x", QoS: 1, Payload: []byte(big)}))
+	require.Equal(t, byte(0x83), code(&paho.Publish{Topic: "big/x", QoS: 2, Payload: []byte(big)}))
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", "small", 2))
+
+	// Retained: the log could take it, the retained store (base64 in JSON)
+	// could not, so the whole publish is refused.
+	require.Equal(t, byte(0x83), code(&paho.Publish{Topic: "big/r", QoS: 1, Retain: true, Payload: []byte(strings.Repeat("r", limit*4/5))}))
+
+	// A session record that the CONNECT's will takes over the limit: an
+	// MQTT will payload is at most 64 KiB, so the record already holds
+	// subscriptions up to near it.
+	tid := t1.ID.String()
+	sess := c.nodes[0].cluster.Sessions
+	sctx, scancel := context.WithTimeout(t.Context(), logWait)
+	defer scancel()
+
+	_, rev, _, err := sess.Acquire(sctx, tid, "big-will", "ghost")
+	require.NoError(t, err)
+
+	filler := strings.Repeat("f", 900)
+	subs := make([]cluster.SubRecord, 0, limit/1000)
+
+	for i := range (limit - 48<<10) / 950 {
+		subs = append(subs, cluster.SubRecord{Filter: fmt.Sprintf("s/%d/%s", i, filler), QoS: 1})
+	}
+
+	_, err = sess.Update(sctx, tid, "big-will", rev, &cluster.SessionRecord{ExpirySeconds: 3600, Subscriptions: subs})
+	require.NoError(t, err)
+
+	expiry := uint32(3600)
+	_, ca, err := dial5(t, c.addr(0), &paho.Connect{
+		ClientID: "big-will", Username: "u1", UsernameFlag: true, Password: []byte("secret"), PasswordFlag: true,
+		CleanStart: false, KeepAlive: 30, Properties: &paho.ConnectProperties{SessionExpiryInterval: &expiry},
+		WillMessage: &paho.WillMessage{Topic: "w", QoS: 1, Payload: []byte(strings.Repeat("w", 60000))},
+	})
+	require.Error(t, err)
+	require.NotNil(t, ca)
+	require.Equal(t, byte(0x95), ca.ReasonCode)
 }

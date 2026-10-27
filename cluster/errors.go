@@ -3,9 +3,12 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/xraph/tether"
 )
 
 // Sentinel errors of the cluster package. Wrap them with %w and match with
@@ -24,7 +27,35 @@ var (
 
 	// ErrUnavailable means NATS or JetStream could not be reached in time.
 	ErrUnavailable = errors.New("tether/cluster: nats or jetstream unavailable")
+
+	// ErrTooLarge means a write is over the NATS server's max_payload
+	// (Conn.MaxPayload), headers included, or over a stream's maximum
+	// message size (JetStream error 10054). Sending it again never helps:
+	// an error wrapping it also wraps tether.ErrInvalidInput.
+	ErrTooLarge = errors.New("tether/cluster: message too large for nats")
 )
+
+// codeMessageTooLarge is nats-server's JSStreamMessageExceedsMaximumErr
+// (10054). nats.go has no exported constant for it.
+const codeMessageTooLarge jetstream.ErrorCode = 10054
+
+// isTooLarge reports whether err says a write was too large: nats.go's
+// ErrMaxPayload, checked before anything is sent, or JetStream error 10054.
+func isTooLarge(err error) bool {
+	if errors.Is(err, nats.ErrMaxPayload) {
+		return true
+	}
+
+	var api *jetstream.APIError
+
+	return errors.As(err, &api) && api.ErrorCode == codeMessageTooLarge
+}
+
+// wrapTooLarge wraps a too large err for op with ErrTooLarge and
+// tether.ErrInvalidInput.
+func wrapTooLarge(op string, err error) error {
+	return fmt.Errorf("cluster: %s: %w: %w: %w", op, ErrTooLarge, tether.ErrInvalidInput, err)
+}
 
 // codeWrongLastSeqConstant is nats-server's JSStreamWrongLastSequenceConstantErr
 // (10164). nats.go has no exported constant for it.

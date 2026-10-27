@@ -165,9 +165,13 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		// Last: once the key is this node's, the session's previous owner,
 		// anywhere in the cell, is on its way out. The session's lock stays
 		// held until OnSessionEstablish is done (st.sessUnlock).
-		if !h.b.acquireSession(cl, st, log) {
+		if err := h.b.acquireSession(cl, st, log); err != nil {
 			h.b.state.remove(cl)
 			st.returnSlot(from)
+
+			if errors.Is(err, cluster.ErrTooLarge) {
+				return h.refuse(cl, log, packets.ErrPacketTooLarge, "session record too large for the cell", err)
+			}
 
 			return h.refuse(cl, log, packets.ErrServerUnavailable, "session unavailable in the cell", nil)
 		}

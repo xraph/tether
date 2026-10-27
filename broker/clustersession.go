@@ -284,9 +284,11 @@ func (n *clusterNode) isLost(s *session) bool {
 // OnConnectAuthenticate, and prepares what mochi will find when it looks the
 // session up: the offline client of a session resumed from the cell, or the
 // local session it is taking over. It holds the session's lock and leaves it
-// to OnSessionEstablish (st.sessUnlock). It reports false, with the lock
-// released, when the CONNECT must be refused (0x88).
-func (b *Broker) acquireSession(cl *mqtt.Client, st *clientState, log *slog.Logger) bool {
+// to OnSessionEstablish (st.sessUnlock). It returns an error, with the lock
+// released, when the CONNECT must be refused: 0x88, or 0x95 for one whose
+// session record (its will, say) is too large for the cell
+// (cluster.ErrTooLarge).
+func (b *Broker) acquireSession(cl *mqtt.Client, st *clientState, log *slog.Logger) error {
 	n := b.cluster
 	nsID := namespacedID(st.tenantID, st.rawID)
 	unlock := n.locks.lock(nsID)
@@ -299,13 +301,13 @@ func (b *Broker) acquireSession(cl *mqtt.Client, st *clientState, log *slog.Logg
 		unlock()
 		log.Info("tether: session not acquired", slog.Any("error", err))
 
-		return false
+		return err
 	}
 
 	st.sess = s
 	st.sessUnlock = unlock
 
-	return true
+	return nil
 }
 
 // establish is acquireSession under the session's lock.
