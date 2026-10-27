@@ -68,7 +68,7 @@ func startCellVia(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Iden
 ) *testCell {
 	t.Helper()
 
-	return buildCell(t, nodes, cfg, ids, perms, before, via, false)
+	return buildCell(t, nil, nodes, cfg, ids, perms, before, via, false)
 }
 
 // startControlCell is startCluster with a control bus on every node, wired
@@ -80,7 +80,7 @@ func startControlCell(t *testing.T, nodes int) *testCell {
 	t1, t2 := newTenant(tenant.Limits{}), newTenant(tenant.Limits{})
 	all := acl.Rules{Publish: []string{"#", "$app/#"}, Subscribe: []string{"#", "$app/#"}}
 
-	c := buildCell(t, nodes, testConfig(),
+	c := buildCell(t, nil, nodes, testConfig(),
 		map[string]*auth.Identity{"u1": ident(t1, "u1"), "u2": ident(t2, "u2")},
 		fakePerms{rules: map[string]acl.Rules{"u1": all, "u2": all}}, nil, nil, true)
 	c.t1, c.t2 = t1, t2
@@ -88,13 +88,18 @@ func startControlCell(t *testing.T, nodes int) *testCell {
 	return c
 }
 
-// buildCell is startCellVia, with a control bus per node when control is set.
-func buildCell(t *testing.T, nodes int, cfg Config, ids map[string]*auth.Identity, perms PermLoader, before func(*Broker),
+// buildCell is startCellVia, with a control bus per node when control is set,
+// on nats when it is not nil (clustertest.StartProxied, say).
+func buildCell(t *testing.T, nats *clustertest.Cluster, nodes int, cfg Config, ids map[string]*auth.Identity, perms PermLoader, before func(*Broker),
 	via func(i int, url string) string, control bool,
 ) *testCell {
 	t.Helper()
 
-	c := &testCell{nats: clustertest.StartCluster(t, 3)}
+	if nats == nil {
+		nats = clustertest.StartCluster(t, 3)
+	}
+
+	c := &testCell{nats: nats}
 	urls := c.nats.URLs()
 
 	t.Cleanup(func() {

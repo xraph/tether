@@ -724,7 +724,7 @@ func (p *pubPipe) commit(it *pubItem) bool {
 				p.delay = 0
 
 				if retried {
-					p.resendQueued()
+					p.resendQueued(time.Since(it.sentAt))
 				}
 
 				if it.qos == 2 && !p.committed(it) {
@@ -787,6 +787,24 @@ func (p *pubPipe) wait(it *pubItem) error {
 	ctx, cancel := context.WithTimeout(p.ctx, p.late)
 	defer cancel()
 
+	// An attempt sent while the log is down most likely went nowhere (a
+	// stream member without the leadership drops it, with no answer). When
+	// the node sees the log back, stop waiting for it and send it again,
+	// rather than wait out a late bound that grew during the outage.
+	back := n.logUp.whileDown()
+	if back != nil {
+		stop := make(chan struct{})
+		defer close(stop)
+
+		go func() {
+			select {
+			case <-back:
+				cancel()
+			case <-stop:
+			}
+		}()
+	}
+
 	_, _, err := it.pend.Wait(ctx)
 
 	switch {
@@ -794,6 +812,8 @@ func (p *pubPipe) wait(it *pubItem) error {
 		if !before && time.Since(it.sentAt) <= n.appendLate {
 			p.late = max(n.appendLate, p.late/2)
 		}
+	case p.ctx.Err() == nil && isClosed(back):
+		return fmt.Errorf("%w: the log came back while waiting: %w", errAckLate, err)
 	case p.ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
 		p.late = min(2*p.late, max(n.appendAttempt, n.appendLate))
 
@@ -853,17 +873,28 @@ func (p *pubPipe) pace(it *pubItem) bool {
 	return true
 }
 
-// resendQueued sends again, in order and without waiting, the publishes
-// queued behind the head whose latest attempt failed or lost its ack, once a
-// retried head has committed. Acks come back in the order the appends went
-// out, so an attempt still unanswered while a later one has its answer will
-// not get one: the stream leader that had it died. One that is merely slow
-// is left alone (nothing after it has an answer either), so a slow log is
-// not flooded with resends. Same message IDs, so whatever did commit is
-// stored once. A publish the starter has not reached yet goes out fresh
-// from there.
-func (p *pubPipe) resendQueued() {
-	var queued []*pubItem
+// lostAckFloor is the least time an attempt must have gone unanswered,
+// after a retried publish committed promptly, before resendQueued takes its
+// ack as lost.
+const lostAckFloor = 50 * time.Millisecond
+
+// resendQueued runs when a publish that had to be retried has committed, in
+// headLatency from its last send. It sends again, in order and without
+// waiting, the started publishes queued behind it whose latest attempt
+// failed, and, when the head committed within appendLate (the log answers
+// promptly again), those still unanswered after more than twice that
+// latency (at least lostAckFloor): the leader they went to died with their
+// acks, and a client that sends nothing more would otherwise wait out a late
+// bound for each of them in turn. When the head was slow the log is slow,
+// and an unanswered publish is most likely just in flight: only failures go
+// again, so a slow log is not flooded. Same message IDs, so whatever did
+// commit is stored once. A publish the starter has not reached yet goes out
+// fresh from there.
+func (p *pubPipe) resendQueued(headLatency time.Duration) {
+	n := p.b.cluster
+	prompt := headLatency <= n.appendLate
+	lostAfter := max(2*headLatency, lostAckFloor)
+	sent := 0
 
 	for _, x := range p.toAck.snapshot() {
 		// The starter goes in order: nothing after this one has started.
@@ -871,32 +902,18 @@ func (p *pubPipe) resendQueued() {
 			break
 		}
 
-		if x.code == 0 {
-			queued = append(queued, x)
-		}
-	}
-
-	resend := make([]bool, len(queued))
-	laterSettled := false
-
-	for i := len(queued) - 1; i >= 0; i-- {
-		x := queued[i]
-
-		if x.err != nil {
-			resend[i] = true
-
+		if x.code != 0 {
 			continue
 		}
 
-		done, err := x.pend.Settled()
-		resend[i] = (done && err != nil) || (!done && laterSettled)
-		laterSettled = laterSettled || done
-	}
+		resend := x.err != nil
 
-	sent := 0
+		if !resend {
+			done, err := x.pend.Settled()
+			resend = (done && err != nil) || (!done && prompt && time.Since(x.sentAt) > lostAfter)
+		}
 
-	for i, x := range queued {
-		if !resend[i] {
+		if !resend {
 			continue
 		}
 
@@ -910,7 +927,8 @@ func (p *pubPipe) resendQueued() {
 	}
 
 	if sent > 0 {
-		p.b.cluster.log.Info("tether: the log is back, sending the queued publishes that failed again", slog.String("client", p.cl.ID), slog.Int("publishes", sent))
+		n.log.Info("tether: the log is back, sending the queued publishes that failed or lost their ack again",
+			slog.String("client", p.cl.ID), slog.Int("publishes", sent))
 	}
 }
 
@@ -950,6 +968,15 @@ func (h *logHealth) up() {
 		close(h.back)
 		h.back = nil
 	}
+}
+
+// whileDown returns the channel that closes when the log comes back, or nil
+// when it is not down.
+func (h *logHealth) whileDown() <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.back
 }
 
 // cameBackSince reports whether the log came back after t.

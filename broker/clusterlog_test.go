@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,11 +17,13 @@ import (
 	"github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
 	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/nats-io/nats-server/v2/server"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/cluster/clustertest"
 	"github.com/xraph/tether/internal/chaos"
 	"github.com/xraph/tether/tenant"
 )
@@ -1144,17 +1147,32 @@ func readAcksInOrder(t *testing.T, conn net.Conn, n int) {
 }
 
 // storedOnce checks the tenant's log holds the payloads 1..n once each, in
-// order.
+// order. The read is retried for logWait: after a server loss the meta layer
+// may still be electing, and a consumer cannot be made until it is done.
 func storedOnce(t *testing.T, b *Broker, tenantID string, n int) {
 	t.Helper()
 
-	var stored []string
+	var (
+		stored  []string
+		lastErr error
+	)
 
-	require.NoError(t, b.cluster.Log.Replay(t.Context(), tenantID, 1, 1<<62, func(m cluster.LogMessage) error {
-		stored = append(stored, string(m.Payload))
+	read := func() bool {
+		stored = stored[:0]
 
-		return nil
-	}))
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		lastErr = b.cluster.Log.Replay(ctx, tenantID, 1, 1<<62, func(m cluster.LogMessage) error {
+			stored = append(stored, string(m.Payload))
+
+			return nil
+		})
+
+		return lastErr == nil
+	}
+
+	require.Eventually(t, read, logWait, 200*time.Millisecond, "reading the log back: %v", lastErr)
 
 	want := make([]string, n)
 	for i := range want {
@@ -1244,4 +1262,101 @@ func TestLateAckResentOnceAndAcked(t *testing.T) {
 	require.LessOrEqual(t, attempts, uint64(n+4), "publishes behind the head were resent")
 
 	storedOnce(t, a, c.t1.ID.String(), n)
+}
+
+// A stream leader that dies takes the acks of the appends it had with it, for
+// real: the server leading the log is cut off through its route proxies while
+// a client's publishes are in flight to it, so what was on the routes is lost
+// when they time out, and the survivors sit out a raft election. The client
+// then sends nothing more. Once the log has a leader again the head is sent
+// again and commits promptly, and every publish behind it that is still
+// unanswered goes again at once: all of them are acked within a couple of
+// seconds of the new leader, in order, and stored once. (Resending only an
+// unanswered publish with a later answer behind it left these waiting a
+// late bound each, about a second per lost ack.)
+func TestLostAcksResentWhenLogReturns(t *testing.T) {
+	const n = 20
+
+	nats := clustertest.StartProxied(t)
+	home := nats.Servers[0].ClientURL()
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := buildCell(t, nats, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, nil,
+		func(int, string) string { return home }, false)
+	a := c.nodes[0]
+
+	js := c.conns[0].JS()
+	stream := a.cluster.Config.LogStream()
+
+	leaderOf := func() string {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+
+		st, err := js.Stream(ctx, stream)
+		if err != nil {
+			return ""
+		}
+
+		info, err := st.Info(ctx)
+		if err != nil || info.Cluster == nil {
+			return ""
+		}
+
+		return info.Cluster.Leader
+	}
+
+	// The leader must be another server than the node's, so the node stays
+	// connected and only the log goes away.
+	var leader string
+
+	require.Eventually(t, func() bool {
+		leader = leaderOf()
+		if leader == "" {
+			return false
+		}
+
+		if leader != nats.Servers[0].Name() {
+			return true
+		}
+
+		_, _ = c.conns[0].NC().Request("$JS.API.STREAM.LEADER.STEPDOWN."+stream, nil, 2*time.Second)
+
+		return false
+	}, logWait, 500*time.Millisecond)
+
+	victim := slices.IndexFunc(nats.Servers, func(s *server.Server) bool { return s.Name() == leader })
+	require.GreaterOrEqual(t, victim, 0)
+
+	conn, _ := rawConnectAck(t, c.addr(0), "lost")
+	base := a.cluster.appendAttempts.Load()
+
+	nats.Isolate(victim)
+
+	for id := uint16(1); id <= n; id++ {
+		writePacket(t, conn, &packets.Publish{Topic: "lost/x", QoS: 1, PacketID: id, Payload: []byte(strconv.Itoa(int(id))), Properties: &packets.Properties{}})
+	}
+
+	var elected time.Time
+
+	require.Eventually(t, func() bool {
+		if l := leaderOf(); l != "" && l != leader {
+			elected = time.Now()
+
+			return true
+		}
+
+		return false
+	}, logWait, 50*time.Millisecond)
+
+	readAcksInOrder(t, conn, n)
+
+	took := time.Since(elected)
+	attempts := a.cluster.appendAttempts.Load() - base
+
+	t.Logf("leader %s cut off; %d acks %s after the new leader showed, %d append attempts", leader, n, took.Round(time.Millisecond), attempts)
+
+	require.Less(t, took, 3*time.Second, "lost acks were waited out one by one")
+	storedOnce(t, a, t1.ID.String(), n)
 }
