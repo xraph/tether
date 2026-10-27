@@ -1129,3 +1129,119 @@ func TestAcksPromptAfterLogReturns(t *testing.T) {
 
 	require.Equal(t, want, stored)
 }
+
+// readAcksInOrder reads n PUBACKs for packet IDs 1..n, in that order, all
+// successful.
+func readAcksInOrder(t *testing.T, conn net.Conn, n int) {
+	t.Helper()
+
+	for id := uint16(1); id <= uint16(n); id++ {
+		cp := readLog(t, conn)
+		require.Equal(t, packets.PUBACK, cp.Type, "packet %d", id)
+		require.Equal(t, id, cp.Content.(*packets.Puback).PacketID, "acks out of order")
+		require.Equal(t, byte(0), cp.Content.(*packets.Puback).ReasonCode)
+	}
+}
+
+// storedOnce checks the tenant's log holds the payloads 1..n once each, in
+// order.
+func storedOnce(t *testing.T, b *Broker, tenantID string, n int) {
+	t.Helper()
+
+	var stored []string
+
+	require.NoError(t, b.cluster.Log.Replay(t.Context(), tenantID, 1, 1<<62, func(m cluster.LogMessage) error {
+		stored = append(stored, string(m.Payload))
+
+		return nil
+	}))
+
+	want := make([]string, n)
+	for i := range want {
+		want[i] = strconv.Itoa(i + 1)
+	}
+
+	require.Equal(t, want, stored)
+}
+
+// A log that commits slower than appendLate is waited out, not flooded
+// (review of CHAOS-1). With every commit taking about 1.2 s (the node's
+// NATS link delayed 600 ms each way), the head's first wait runs late and
+// it is sent once more; the pipe's late bound doubles, so the publishes
+// behind it are waited for, and none of them is sent again. A bound per
+// publish, with every late head resending the queue, made this a crawl of
+// one ack per 2.3 s and n(n+1)/2 + n attempts.
+func TestSlowLogWaitedOutNotFlooded(t *testing.T) {
+	const n = 10
+
+	c, proxy := startProxiedCell(t, 1, nil)
+	a := c.nodes[0]
+
+	conn, _ := rawConnectAck(t, c.addr(0), "slow")
+
+	proxy.SetDelay(chaos.Both, 600*time.Millisecond)
+	proxy.SetMode(chaos.Both, chaos.Delay)
+
+	base := a.cluster.appendAttempts.Load()
+	sent := time.Now()
+
+	for id := uint16(1); id <= n; id++ {
+		writePacket(t, conn, &packets.Publish{Topic: "slow/x", QoS: 1, PacketID: id, Payload: []byte(strconv.Itoa(int(id))), Properties: &packets.Properties{}})
+	}
+
+	readAcksInOrder(t, conn, n)
+
+	took := time.Since(sent)
+	attempts := a.cluster.appendAttempts.Load() - base
+
+	t.Logf("%d acks %s after the publishes, %d append attempts", n, took.Round(time.Millisecond), attempts)
+
+	require.Less(t, took, 6*time.Second, "acks crawled on a slow log")
+	require.LessOrEqual(t, attempts, uint64(n+3), "a slow log was flooded with resends")
+
+	proxy.SetMode(chaos.Both, chaos.Pass)
+	storedOnce(t, a, c.t1.ID.String(), n)
+}
+
+// A late ack is taken as lost and the publish sent again, deterministically:
+// the server-to-client half of the node's NATS link is held, so every append
+// commits but no ack comes back. The head runs late and is resent; once the
+// link heals every ack arrives, the head commits and the rest follow, with
+// nothing behind the head resent (their answers came, in order) and each
+// message stored once.
+func TestLateAckResentOnceAndAcked(t *testing.T) {
+	const n = 20
+
+	c, proxy := startProxiedCell(t, 1, nil)
+	a := c.nodes[0]
+
+	conn, _ := rawConnectAck(t, c.addr(0), "late")
+
+	proxy.SetMode(chaos.ServerToClient, chaos.Blackhole)
+
+	base := a.cluster.appendAttempts.Load()
+
+	for id := uint16(1); id <= n; id++ {
+		writePacket(t, conn, &packets.Publish{Topic: "late/x", QoS: 1, PacketID: id, Payload: []byte(strconv.Itoa(int(id))), Properties: &packets.Properties{}})
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+
+	require.Zero(t, a.cluster.acks.Load(), "acked with no ack from the log")
+	require.Greater(t, a.cluster.appendAttempts.Load()-base, uint64(n), "the late head was not sent again")
+
+	proxy.SetMode(chaos.ServerToClient, chaos.Pass)
+	healed := time.Now()
+
+	readAcksInOrder(t, conn, n)
+
+	took := time.Since(healed)
+	attempts := a.cluster.appendAttempts.Load() - base
+
+	t.Logf("%d acks %s after the heal, %d append attempts", n, took.Round(time.Millisecond), attempts)
+
+	require.Less(t, took, 4*time.Second)
+	require.LessOrEqual(t, attempts, uint64(n+4), "publishes behind the head were resent")
+
+	storedOnce(t, a, c.t1.ID.String(), n)
+}

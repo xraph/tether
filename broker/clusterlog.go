@@ -372,8 +372,14 @@ type pubPipe struct {
 	toAck     fifo[*pubItem]
 
 	// delay is the wait before the next retry while the log is down; 0 when
-	// the last append went through. The writer's own.
+	// the last append went through. late is how long the writer waits for a
+	// commit before it takes the ack as lost: appendLate, doubled after each
+	// late ack up to appendAttempt, and halved back towards appendLate after
+	// a commit that came within appendLate, so a log that commits slower
+	// than appendLate is waited out instead of flooded with resends. Both
+	// are the writer's own.
 	delay time.Duration
+	late  time.Duration
 
 	// pending counts publishes whose ack is not written yet, held the QoS 2
 	// packet IDs whose PUBREC is written and whose PUBREL has not come.
@@ -417,11 +423,6 @@ type pubItem struct {
 	// writer only.
 	sentAt    time.Time
 	persisted bool
-	// late is how long the writer waits for the next attempt's commit
-	// before it takes the ack as lost: appendLate, doubled after each late
-	// ack up to appendAttempt, so a slow but working log is waited out.
-	// The writer's own.
-	late time.Duration
 }
 
 func newPubPipe(b *Broker, srv *mqtt.Server, cl *mqtt.Client, st *clientState) *pubPipe {
@@ -645,6 +646,8 @@ func (p *pubPipe) runStarter() {
 func (p *pubPipe) start(it *pubItem) {
 	n := p.b.cluster
 
+	n.appendAttempts.Add(1)
+
 	it.sentAt = time.Now()
 	it.pend = nil
 
@@ -721,7 +724,7 @@ func (p *pubPipe) commit(it *pubItem) bool {
 				p.delay = 0
 
 				if retried {
-					p.resendQueued(it.sentAt)
+					p.resendQueued()
 				}
 
 				if it.qos == 2 && !p.committed(it) {
@@ -757,27 +760,42 @@ func (p *pubPipe) commit(it *pubItem) bool {
 	}
 }
 
-// errAckLate is a commit wait that ran past appendLate.
+// errAckLate is a commit wait that ran past the pipe's late bound.
 var errAckLate = fmt.Errorf("tether/broker: append ack is late: %w", cluster.ErrUnavailable)
 
-// wait waits for the commit of it's latest attempt, for appendLate at first.
-// An ack that has not come by then is taken as lost (errAckLate), and the
-// append is sent again; the next wait for this publish is twice as long, up
-// to appendAttempt, so on a link slower than appendLate an attempt still
-// gets the time it needs.
+// wait waits for the commit of it's latest attempt, for the pipe's late
+// bound (appendLate at first). An ack that has not come by then is taken as
+// lost (errAckLate) and the append is sent again, and the bound doubles for
+// the publishes after it too, up to appendAttempt: a leader that died took
+// the ack with it, or the log is slower than the bound, and in that case
+// every later publish would be late as well. A commit that came within
+// appendLate halves it back.
 func (p *pubPipe) wait(it *pubItem) error {
 	n := p.b.cluster
 
-	if it.late == 0 {
-		it.late = n.appendLate
+	if p.late == 0 {
+		p.late = n.appendLate
 	}
 
-	ctx, cancel := context.WithTimeout(p.ctx, it.late)
+	// A commit that was already in when the wait began says nothing about
+	// how long commits take.
+	before, earlyErr := it.pend.Settled()
+	if before && earlyErr != nil {
+		return earlyErr
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, p.late)
 	defer cancel()
 
 	_, _, err := it.pend.Wait(ctx)
-	if err != nil && p.ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
-		it.late = min(2*it.late, max(n.appendAttempt, n.appendLate))
+
+	switch {
+	case err == nil:
+		if !before && time.Since(it.sentAt) <= n.appendLate {
+			p.late = max(n.appendLate, p.late/2)
+		}
+	case p.ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
+		p.late = min(2*p.late, max(n.appendAttempt, n.appendLate))
 
 		return fmt.Errorf("%w: %w", errAckLate, err)
 	}
@@ -835,24 +853,50 @@ func (p *pubPipe) pace(it *pubItem) bool {
 	return true
 }
 
-// resendQueued sends again, in order and without waiting, every publish
-// queued behind the head whose latest attempt went out before the head's
-// committed one (before): those went out while the log was down and failed,
-// or wait for an ack that died with the old leader. What did commit is
-// stored once (same message IDs). A publish the starter has not reached yet
-// goes out fresh from there.
-func (p *pubPipe) resendQueued(before time.Time) {
-	sent := 0
+// resendQueued sends again, in order and without waiting, the publishes
+// queued behind the head whose latest attempt failed or lost its ack, once a
+// retried head has committed. Acks come back in the order the appends went
+// out, so an attempt still unanswered while a later one has its answer will
+// not get one: the stream leader that had it died. One that is merely slow
+// is left alone (nothing after it has an answer either), so a slow log is
+// not flooded with resends. Same message IDs, so whatever did commit is
+// stored once. A publish the starter has not reached yet goes out fresh
+// from there.
+func (p *pubPipe) resendQueued() {
+	var queued []*pubItem
 
 	for _, x := range p.toAck.snapshot() {
-		select {
-		case <-x.started:
-		default:
-			// The starter goes in order: nothing after this has started.
-			return
+		// The starter goes in order: nothing after this one has started.
+		if !isClosed(x.started) {
+			break
 		}
 
-		if x.code != 0 || !x.sentAt.Before(before) {
+		if x.code == 0 {
+			queued = append(queued, x)
+		}
+	}
+
+	resend := make([]bool, len(queued))
+	laterSettled := false
+
+	for i := len(queued) - 1; i >= 0; i-- {
+		x := queued[i]
+
+		if x.err != nil {
+			resend[i] = true
+
+			continue
+		}
+
+		done, err := x.pend.Settled()
+		resend[i] = (done && err != nil) || (!done && laterSettled)
+		laterSettled = laterSettled || done
+	}
+
+	sent := 0
+
+	for i, x := range queued {
+		if !resend[i] {
 			continue
 		}
 
@@ -866,7 +910,17 @@ func (p *pubPipe) resendQueued(before time.Time) {
 	}
 
 	if sent > 0 {
-		p.b.cluster.log.Info("tether: the log is back, sending the queued publishes again", slog.String("client", p.cl.ID), slog.Int("publishes", sent))
+		p.b.cluster.log.Info("tether: the log is back, sending the queued publishes that failed again", slog.String("client", p.cl.ID), slog.Int("publishes", sent))
+	}
+}
+
+// isClosed reports whether ch is closed, without waiting.
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
 	}
 }
 

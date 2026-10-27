@@ -145,8 +145,9 @@ type clusterNode struct {
 	logUp logHealth
 
 	// Counters for tests: appends committed (client and host publishes),
-	// acks written, log messages injected, readers restarted.
-	appends, acks, logDelivered, readerRestarts atomic.Uint64
+	// acks written, log messages injected, readers restarted, and attempts
+	// to append a client publish (every send, retries included).
+	appends, acks, logDelivered, readerRestarts, appendAttempts atomic.Uint64
 
 	// holdAppend, when a test sets it before Start, runs before every
 	// append of a client publish and may block until ctx ends. An error
