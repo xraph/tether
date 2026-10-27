@@ -708,8 +708,9 @@ func (p *pubPipe) runWriter() {
 // and retrying them one at a time behind a backoff acked about ten a second
 // for minutes. So the wait before a retry ends as soon as the log is seen
 // back (pace), and once a retried publish commits, the publishes queued
-// behind it that went out before it are all sent again at once
-// (resendQueued), so they commit together and their acks follow in order.
+// behind it whose attempt failed, or whose ack was lost when the head
+// committed promptly, are sent again at once (resendQueued), so they commit
+// together and their acks follow in order.
 func (p *pubPipe) commit(it *pubItem) bool {
 	n := p.b.cluster
 	retried := false
