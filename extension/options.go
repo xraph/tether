@@ -28,9 +28,29 @@ func WithBrokerConfig(cfg broker.Config) Option {
 // to the cell's NATS (or starts the embedded server), provisions its streams
 // and buckets, and joins; see cluster.Config for the keys and the README for
 // the embedded and external shapes. The "cluster" block of the config file
-// sets the same thing.
+// sets the same thing. Mode, Heartbeat, Lease and LogMaxAge left zero take
+// cluster.DefaultConfig's, so a literal with only the fields you need
+// passes Validate.
 func WithCluster(cfg cluster.Config) Option {
 	return func(e *Extension) {
+		def := cluster.DefaultConfig()
+
+		if cfg.Mode == "" {
+			cfg.Mode = def.Mode
+		}
+
+		if cfg.Heartbeat == 0 {
+			cfg.Heartbeat = def.Heartbeat
+		}
+
+		if cfg.Lease == 0 {
+			cfg.Lease = def.Lease
+		}
+
+		if cfg.LogMaxAge == 0 {
+			cfg.LogMaxAge = def.LogMaxAge
+		}
+
 		cfg.Enabled = true
 		e.config.Cluster = cfg
 	}
