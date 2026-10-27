@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -248,4 +249,48 @@ func TestKickRemoteWithDelayedWill(t *testing.T) {
 			require.False(t, ci.Connected, "a session waiting out its will delay is not connected")
 		}
 	}
+}
+
+// Ruling R51: a tenant change whose publish fails (a control stream
+// election, say) is applied on this node at once and sent again until the
+// bus takes it, so the other nodes apply it too once the bus is back (D-I1).
+// Kick and DeleteSession of a session another node serves send their event
+// again within their wait.
+func TestControlRepublishedAfterFailure(t *testing.T) {
+	c := startControlCell(t, 2)
+	a := c.nodes[0]
+	tid := c.t1.ID.String()
+
+	var fails atomic.Int32
+
+	a.cluster.publishFault = func(string) error {
+		if fails.Add(-1) >= 0 {
+			return errors.New("control stream has no leader")
+		}
+
+		return nil
+	}
+
+	far, _, err := connect5(t, c.addr(1), "far", "u1", false)
+	require.NoError(t, err)
+
+	fails.Store(2)
+	require.NoError(t, a.Kick(tid, "far"), "the kick's event went out on a later attempt")
+	requireKicked(t, far)
+
+	onA, _, err := connect5(t, c.addr(0), "a1", "u1", true)
+	require.NoError(t, err)
+
+	onB, _, err := connect5(t, c.addr(1), "b1", "u1", true)
+	require.NoError(t, err)
+
+	fails.Store(3)
+
+	disabled := *c.t1
+	disabled.Enabled = false
+	a.UpdateTenant(&disabled)
+
+	requireKicked(t, onA)
+	requireKicked(t, onB)
+	require.Positive(t, a.cluster.republished.Load())
 }

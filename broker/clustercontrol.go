@@ -62,6 +62,10 @@ type controlNode struct {
 	// control publish and fails it with its error.
 	publishFault func(kind string) error
 
+	// republished counts control events sent again after a failed publish
+	// and taken by the bus (republish).
+	republished atomic.Uint64
+
 	// Counters for tests: tenant changes this node applied (from the bus or,
 	// when a publish failed, its own), and kicks and deletes addressed to
 	// this node that it handled.
@@ -98,21 +102,29 @@ func (b *Broker) subscribeControl() error {
 // publishControl publishes v as an event of kind, bounded by controlWait and
 // by the broker's lifetime.
 func (n *clusterNode) publishControl(kind string, v any) error {
+	ctx, cancel := context.WithTimeout(n.ctx, controlWait)
+	defer cancel()
+
+	return n.publishControlCtx(ctx, kind, v)
+}
+
+// publishControlCtx is publishControl under ctx.
+func (n *clusterNode) publishControlCtx(ctx context.Context, kind string, v any) error {
 	if n.publishFault != nil {
 		if err := n.publishFault(kind); err != nil {
 			return err
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(n.ctx, controlWait)
-	defer cancel()
-
 	return n.Control.Publish(ctx, kind, v)
 }
 
 // publishTenant sends a tenant change to the cell, and reports whether it
 // did: false without a control bus, and when the publish failed (logged at
-// Warn), and then the caller applies it on this node (ruling R41).
+// Warn), and then the caller applies it on this node (ruling R41). A failed
+// publish is also sent again in the background until the bus takes it, the
+// broker stops, or an hour has passed (ruling R51, cluster.Republish), so
+// the other nodes get the change once the bus is back.
 func (b *Broker) publishTenant(snap *tenant.Tenant) bool {
 	n := b.cluster
 	if n == nil || n.Control == nil || n.ctx.Err() != nil {
@@ -125,13 +137,49 @@ func (b *Broker) publishTenant(snap *tenant.Tenant) bool {
 	ev := tenantEvent{TenantUpdated: cluster.TenantUpdated{TenantID: tenantID}, Tenant: snap}
 
 	if err := n.publishControl(cluster.KindTenantUpdated, ev); err != nil {
-		n.log.Warn("tether: could not send a tenant change to the cell, applying it on this node only",
+		n.log.Warn("tether: could not send a tenant change to the cell, applying it on this node and sending it again in the background",
 			slog.String("tenant", tenantID), slog.Any("error", err))
+
+		if !errors.Is(err, tether.ErrInvalidInput) {
+			go n.republish(cluster.KindTenantUpdated, ev)
+		}
 
 		return false
 	}
 
 	return true
+}
+
+// republish sends a control event whose publish failed again until the bus
+// takes it, the broker stops, or an hour has passed (cluster.Republish).
+func (n *clusterNode) republish(kind string, v any) {
+	err := cluster.Republish(n.ctx.Done(), func(ctx context.Context) error { return n.publishControlCtx(ctx, kind, v) })
+	if err != nil {
+		n.log.Warn("tether: gave up sending a control event to the cell", slog.String("kind", kind), slog.Any("error", err))
+
+		return
+	}
+
+	n.republished.Add(1)
+	n.log.Info("tether: control event sent to the cell after the bus came back", slog.String("kind", kind))
+}
+
+// publishSession publishes a session.kick or session.delete event for an
+// admin call that waits for its outcome: a publish that fails (a control
+// stream election, say) is sent again until the bus takes it or
+// remoteAdminWait passes.
+func (n *clusterNode) publishSession(kind string, ev sessionEvent) error {
+	err := n.publishControl(kind, ev)
+	if err == nil || errors.Is(err, tether.ErrInvalidInput) {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(n.ctx, remoteAdminWait)
+	defer cancel()
+
+	return cluster.Republish(ctx.Done(), func(actx context.Context) error {
+		return n.publishControlCtx(actx, kind, ev)
+	})
 }
 
 // onTenantUpdated applies a tenant.updated event on this node: the snapshot
@@ -277,7 +325,7 @@ func (b *Broker) kickRemote(tenantID, clientID string) error {
 	}
 
 	ev := sessionEvent{Tenant: tenantID, ClientID: clientID, Node: rec.Owner, Epoch: rec.Epoch}
-	if err := n.publishControl(cluster.KindSessionKick, ev); err != nil {
+	if err := n.publishSession(cluster.KindSessionKick, ev); err != nil {
 		return fmt.Errorf("tether/broker: kick %q on node %q: %w", clientID, rec.Owner, err)
 	}
 
@@ -293,7 +341,7 @@ func (b *Broker) deleteRemote(tenantID, clientID, owner string, epoch uint64) er
 	n := b.cluster
 
 	ev := sessionEvent{Tenant: tenantID, ClientID: clientID, Node: owner, Epoch: epoch}
-	if err := n.publishControl(cluster.KindSessionDelete, ev); err != nil {
+	if err := n.publishSession(cluster.KindSessionDelete, ev); err != nil {
 		return fmt.Errorf("tether/broker: delete session %q on node %q: %w", clientID, owner, err)
 	}
 

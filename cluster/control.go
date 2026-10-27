@@ -399,6 +399,55 @@ func (c *Control) Stop() {
 	}
 }
 
+// Done is closed once Stop has been called.
+func (c *Control) Done() <-chan struct{} { return c.quit }
+
+const (
+	// republishFirst is the wait before Republish's first attempt, doubling
+	// to republishMax; republishAttempt bounds each attempt.
+	republishFirst   = 250 * time.Millisecond
+	republishMax     = 5 * time.Second
+	republishAttempt = 5 * time.Second
+)
+
+// Republish calls publish, a control bus publish that has failed once, until
+// it succeeds, done closes (nil: never), or the control stream's MaxAge (an
+// hour) has passed since the call, waiting 250 ms before the first attempt
+// and doubling the wait up to 5 s. Each attempt gets a context bounded at
+// 5 s. An error wrapping tether.ErrInvalidInput ends it at once, since
+// sending it again cannot help. It returns nil once publish succeeded, else
+// the last error.
+//
+// Control events are idempotent, so a caller that applied a change on its
+// own node when the first publish failed (ruling R41) uses it to reach the
+// rest of the cell once the bus is back (ruling R51), and applies the event
+// a second time when it comes back.
+func Republish(done <-chan struct{}, publish func(ctx context.Context) error) error {
+	deadline := time.Now().Add(controlMaxAge)
+	delay := republishFirst
+
+	var last error
+
+	for {
+		select {
+		case <-done:
+			return last
+		case <-time.After(delay):
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), republishAttempt)
+		last = publish(ctx)
+
+		cancel()
+
+		if last == nil || errors.Is(last, tether.ErrInvalidInput) || time.Now().After(deadline) {
+			return last
+		}
+
+		delay = min(2*delay, republishMax)
+	}
+}
+
 // controlRun is the running consumer of a Control.
 type controlRun struct {
 	c     *Control

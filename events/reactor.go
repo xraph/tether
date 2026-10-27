@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -83,8 +84,11 @@ func NewReactor(evict func(keyID string), b BrokerControl) Handler {
 // The Handler methods publish the change as a cluster event (key.invalidated,
 // role.changed, subject.changed) and return once the bus has stored it,
 // within publishWait (5 s). If the publish fails, the change is applied on
-// this node as NewReactor would and logged at Warn on log (slog.Default when
-// nil): the other nodes' clients get it only when they reconnect.
+// this node as NewReactor would, logged at Warn on log (slog.Default when
+// nil), and sent again in the background until the bus takes it (ruling
+// R51; cluster.Republish: until it lands, the bus stops, or an hour has
+// passed), so the other nodes get it once the bus is back. This node then
+// applies it a second time, which is harmless.
 //
 // NewClusterReactor subscribes its handlers on bus, so call it before the
 // bus starts. An applied event evicts the key at once, on the bus's
@@ -206,6 +210,12 @@ func (r *reactor) SubjectChanged(ctx context.Context, subjectKind, subjectID str
 // reports false; on an error it logs at Warn and reports false, and the
 // caller applies the change here. ctx's cancellation does not stop the
 // publish: the change is stored already.
+//
+// Ruling R51: a publish that failed is also sent again in the background
+// (republish) until the bus takes it, so the rest of the cell gets the
+// change once the bus is back. A control stream election (4 to 9 s) outlasts
+// nats.go's own retries, and without this a revocation made during one
+// reached only this node.
 func (r *reactor) publish(ctx context.Context, kind string, v any) bool {
 	if r.bus == nil {
 		return false
@@ -219,10 +229,36 @@ func (r *reactor) publish(ctx context.Context, kind string, v any) bool {
 		return true
 	}
 
-	r.log.Warn("tether: could not send a change to the cell, applying it on this node only",
+	r.log.Warn("tether: could not send a change to the cell, applying it on this node and sending it again in the background",
 		slog.String("kind", kind), slog.Any("error", err))
 
+	if !errors.Is(err, tether.ErrInvalidInput) {
+		go r.republish(kind, v)
+	}
+
 	return false
+}
+
+// republish sends an event whose publish failed again until the bus takes
+// it (cluster.Republish): until it lands, the bus stops (a bus with a
+// Done channel, as *cluster.Control has), or the control stream's hour has
+// passed. This node applies the event a second time when it comes back;
+// events are idempotent.
+func (r *reactor) republish(kind string, v any) {
+	var done <-chan struct{}
+	if d, ok := r.bus.(interface{ Done() <-chan struct{} }); ok {
+		done = d.Done()
+	}
+
+	err := cluster.Republish(done, func(ctx context.Context) error { return r.bus.Publish(ctx, kind, v) })
+	if err != nil {
+		r.log.Warn("tether: gave up sending a change to the cell; other nodes' clients get it when they reconnect",
+			slog.String("kind", kind), slog.Any("error", err))
+
+		return
+	}
+
+	r.log.Info("tether: change sent to the cell after the bus came back", slog.String("kind", kind))
 }
 
 // decode decodes an event from the bus, logging one it cannot read.

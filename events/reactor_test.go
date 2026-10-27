@@ -479,3 +479,48 @@ func TestEvictTenantsOnUpdate(t *testing.T) {
 	assert.Equal(t, []string{"ttnt_1"}, got)
 	require.ErrorIs(t, events.EvictTenantsOnUpdate(nil, func(string) {}), tether.ErrInvalidInput)
 }
+
+// flakyBus is a fakeBus whose first fails publishes fail.
+type flakyBus struct {
+	fakeBus
+
+	fmu   sync.Mutex
+	fails int
+}
+
+func (f *flakyBus) Publish(ctx context.Context, kind string, v any) error {
+	f.fmu.Lock()
+	fail := f.fails > 0
+	if fail {
+		f.fails--
+	}
+	f.fmu.Unlock()
+
+	if fail {
+		return errors.New("control stream has no leader")
+	}
+
+	return f.fakeBus.Publish(ctx, kind, v)
+}
+
+// Ruling R51: a change whose publish fails (a control stream election, say)
+// is applied on this node at once and also sent to the cell once the bus
+// takes it again, so the other nodes get it too (D-I1).
+func TestClusterReactorRepublishesAfterFailure(t *testing.T) {
+	b := &recorder{}
+	bus := &flakyBus{fails: 3}
+
+	h, err := events.NewClusterReactor(func(keyID string) { b.add("Evict", keyID) }, b, bus, nil)
+	require.NoError(t, err)
+
+	h.KeyInvalidated(t.Context(), "akey_1", true)
+
+	assert.Equal(t, []call{
+		{"Evict", []any{"akey_1"}},
+		{"DisconnectPrincipal", []any{"akey_1", byte(0x98)}},
+	}, b.all(), "applied here at once")
+
+	require.Eventually(t, func() bool { return len(bus.kinds()) == 1 }, 10*time.Second, 20*time.Millisecond,
+		"the change never reached the bus")
+	assert.Equal(t, []string{"key.invalidated"}, bus.kinds())
+}
