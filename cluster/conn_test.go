@@ -572,6 +572,8 @@ func TestValidate(t *testing.T) {
 		{"user without password", good(func(c *cluster.Config) { c.Embedded.User = "u" }), "password"},
 		{"password without user", good(func(c *cluster.Config) { c.Embedded.Password = "p" }), "user"},
 		{"negative log age", good(func(c *cluster.Config) { c.LogMaxAge = -time.Second }), "log_max_age"},
+		{"log age under the duplicate window", good(func(c *cluster.Config) { c.LogMaxAge = time.Minute }), "duplicate window"},
+		{"log age at the duplicate window", good(func(c *cluster.Config) { c.LogMaxAge = 2 * time.Minute }), ""},
 		{"no node id", good(func(c *cluster.Config) { c.NodeID = "" }), "node_id"},
 		{"node id with dot", good(func(c *cluster.Config) { c.NodeID = "a.b" }), "node_id"},
 		{"node id with space", good(func(c *cluster.Config) { c.NodeID = "a b" }), "node_id"},

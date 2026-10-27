@@ -83,6 +83,8 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 
 	logger = logger.With("component", "cluster", "node", cfg.NodeID, "cell", cfg.Cell)
 
+	warnConfig(cfg, logger)
+
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 
@@ -299,6 +301,25 @@ func replicasFor(cfg Config, nc *nats.Conn) int {
 	}
 
 	return max(1, min(maxReplicas, n))
+}
+
+// minFenceAfter is the shortest Lease/2 that outlasts a JetStream election
+// on nats-server 2.15 (4 to 9 s, ruling R48).
+const minFenceAfter = 9 * time.Second
+
+// warnConfig logs a Warn for settings Validate accepts but that cost the cell
+// in production: a lease whose half is shorter than a JetStream election, so
+// losing one NATS server fences every node, and an embedded server that
+// takes anyone who reaches it.
+func warnConfig(cfg Config, logger *slog.Logger) {
+	if cfg.Lease/2 < minFenceAfter {
+		logger.Warn("cluster: half the lease is shorter than a jetstream election; losing one nats server can fence every node",
+			"lease", cfg.Lease, "fence_after", cfg.Lease/2, "election_up_to", minFenceAfter)
+	}
+
+	if cfg.Mode == ModeEmbedded && cfg.Embedded.Insecure {
+		logger.Warn("cluster: embedded.insecure is set; anyone who reaches the nats ports can read every tenant's traffic or join the cell")
+	}
 }
 
 // clustered reports whether the node's NATS is a cluster: an embedded

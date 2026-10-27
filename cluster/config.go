@@ -175,6 +175,13 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cluster: log_max_age %s must not be negative", c.LogMaxAge)
 	}
 
+	if c.LogMaxAge > 0 && c.LogMaxAge < logDuplicateWindow {
+		// JetStream refuses a stream whose MaxAge is under its duplicate
+		// window, and Provision would fail with its opaque error.
+		return fmt.Errorf("cluster: log_max_age %s must be at least the log's %s duplicate window (0 for the default)",
+			c.LogMaxAge, logDuplicateWindow)
+	}
+
 	return nil
 }
 
