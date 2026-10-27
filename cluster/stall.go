@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 )
@@ -51,17 +52,22 @@ func (w *stallWatch) progress() { w.last.Store(int64(time.Since(w.base))) }
 // quiet is how long the loop has not moved.
 func (w *stallWatch) quiet() time.Duration { return time.Since(w.base) - time.Duration(w.last.Load()) }
 
-// run looks every after/4 until stop or done closes. When the loop has been
-// quiet for after with no handler running, it asks behind for the newest
-// sequence the stream holds for the loop (want) and how far the loop got
-// (at). want above at is a stall: stalled is called once and run returns.
-// Otherwise the loop is idle and caught up, which counts as progress, so an
-// idle loop costs one behind call per after. An error from behind (NATS
-// unreachable, say) decides nothing: the consumer's own recovery is still
-// running.
+// run looks every after/4, jittered by up to a quarter so watches started
+// together do not ask together, until stop or done closes. When the loop has
+// been quiet for after with no handler running, it asks behind for the
+// newest sequence the stream holds for the loop (want) and how far the loop
+// got (at). want above at is a stall: stalled is called once and run
+// returns. Otherwise the loop is idle and caught up, which counts as
+// progress, so an idle loop costs one behind call per after. An error from
+// behind (NATS unreachable, say) decides nothing and also counts as
+// progress: the consumer's own recovery runs meanwhile, and a stall has to
+// last a whole after while the stream answers before the loop is ended, so a
+// long outage never ends a consumer that is catching up once it is over.
 func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context) (want, at uint64, err error), stalled func(want, at uint64)) {
-	tick := time.NewTicker(max(w.after/4, minStallCheck))
-	defer tick.Stop()
+	every := max(w.after/4, minStallCheck)
+	timer := time.NewTimer(jitter(every))
+
+	defer timer.Stop()
 
 	for {
 		select {
@@ -69,7 +75,8 @@ func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context
 			return
 		case <-done:
 			return
-		case <-tick.C:
+		case <-timer.C:
+			timer.Reset(jitter(every))
 		}
 
 		if w.busy.Load() || w.quiet() < w.after {
@@ -82,6 +89,8 @@ func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context
 		cancel()
 
 		if err != nil {
+			w.progress()
+
 			continue
 		}
 
@@ -106,4 +115,14 @@ func (w *stallWatch) run(stop, done <-chan struct{}, behind func(context.Context
 
 		return
 	}
+}
+
+// jitter is d plus or minus up to a quarter of it.
+func jitter(d time.Duration) time.Duration {
+	q := int64(d / 4)
+	if q <= 0 {
+		return d
+	}
+
+	return d - time.Duration(q) + time.Duration(rand.Int64N(2*q)) //nolint:gosec // spreads checks, nothing secret
 }

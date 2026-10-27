@@ -236,10 +236,16 @@ func (l *Log) Ping(ctx context.Context) error {
 }
 
 // PendingAppend is an append that has been sent and not yet acknowledged.
+// Wait and Settled are for one goroutine: do not call them concurrently.
 type PendingAppend struct {
 	l    *Log
 	fut  jetstream.PubAckFuture
 	sent time.Time
+
+	// The answer, once Wait or Settled has taken it from the future.
+	settled bool
+	ack     *jetstream.PubAck
+	err     error
 }
 
 // AppendAsync is Append in two steps: it sends msg and returns at once, and
@@ -277,22 +283,63 @@ func (l *Log) AppendAsync(ctx context.Context, msg LogMessage, msgID string) (*P
 // when the message ID was a repeat inside the duplicate window. A context
 // without a deadline gets 10 s. No ack in time, or a JetStream that cannot be
 // reached, gives an error wrapping ErrUnavailable; the message may still have
-// been committed, so send it again with the same message ID.
+// been committed, so send it again with the same message ID. A Wait that
+// ends on its context can be called again.
 func (p *PendingAppend) Wait(ctx context.Context) (seq uint64, dup bool, err error) {
-	ctx, cancel := opContext(ctx)
-	defer cancel()
+	if !p.settled {
+		wctx, cancel := opContext(ctx)
+		defer cancel()
 
-	select {
-	case ack := <-p.fut.Ok():
-		if fn := p.l.onAppend.Load(); fn != nil {
-			(*fn)(time.Since(p.sent))
+		select {
+		case ack := <-p.fut.Ok():
+			p.take(ack, nil)
+		case err := <-p.fut.Err():
+			p.take(nil, err)
+		case <-wctx.Done():
+			return 0, false, p.l.wrapErr("append", wctx.Err())
 		}
+	}
 
-		return ack.Sequence, ack.Duplicate, nil
-	case err := <-p.fut.Err():
-		return 0, false, p.l.wrapErr("append", err)
-	case <-ctx.Done():
-		return 0, false, p.l.wrapErr("append", ctx.Err())
+	if p.err != nil {
+		return 0, false, p.err
+	}
+
+	return p.ack.Sequence, p.ack.Duplicate, nil
+}
+
+// Settled reports, without waiting, whether the append has its answer, and
+// if so the error Wait will return (nil for a commit). An ack arrives in the
+// order the appends were sent, so an append that is not settled while a later
+// one is has lost its ack (the stream leader that had it died) and should be
+// sent again.
+func (p *PendingAppend) Settled() (bool, error) {
+	if !p.settled {
+		select {
+		case ack := <-p.fut.Ok():
+			p.take(ack, nil)
+		case err := <-p.fut.Err():
+			p.take(nil, err)
+		default:
+			return false, nil
+		}
+	}
+
+	return true, p.err
+}
+
+func (p *PendingAppend) take(ack *jetstream.PubAck, err error) {
+	p.settled = true
+
+	if err != nil {
+		p.err = p.l.wrapErr("append", err)
+
+		return
+	}
+
+	p.ack = ack
+
+	if fn := p.l.onAppend.Load(); fn != nil {
+		(*fn)(time.Since(p.sent))
 	}
 }
 
