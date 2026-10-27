@@ -715,12 +715,13 @@ func (p *pubPipe) commit(it *pubItem) bool {
 
 // retain writes the retained message of a committed publish to the cell's
 // store before its ack, so a PUBACK or PUBREC says the message is in the log
-// and retained in the cell (clusterretained.go). It retries while the
-// connection is open, for up to the retry window. When the connection ends
-// first the write goes on in the background queue (the message is in the
-// log, and a QoS 2 client will not send it again) and it reports false: no
-// ack. When the window runs out first it does the same and acks (in an
-// outage that long the node has fenced itself and closed the connection).
+// and retained in the cell (clusterretained.go). The write goes through its
+// topic's shard, whose writer retries for the retry window; this waits while
+// the connection is open. When the connection ends first the write goes on
+// (the message is in the log, and a QoS 2 client will not send it again) and
+// it reports false: no ack. When the writer gives up first the publish is
+// acked anyway (in an outage that long the node has fenced itself and closed
+// the connection).
 func (p *pubPipe) retain(it *pubItem) bool {
 	err := p.b.cluster.storeRetained(p.ctx, it.retained, true)
 	if err == nil {

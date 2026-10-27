@@ -485,13 +485,16 @@ func (r *Retained) stopWatcher(w jetstream.KeyWatcher) {
 // reports the puts fn missed and, as removed, the topics fn holds that are
 // gone.
 //
-// ctx is the watch's lifetime: it runs until ctx ends or stop is called. The
+// ctx is the watch's lifetime: it runs until ctx ends or Stop is called. The
 // start (the watcher, the leader's mark and the first pass) has a bound of its
 // own, 10 s, or ctx's deadline when that comes first; when it runs out Watch
-// fails with an error wrapping ErrUnavailable. stop is idempotent and returns
+// fails with an error wrapping ErrUnavailable. Stop is idempotent and returns
 // promptly even while NATS is unreachable: it waits only for an fn that is
-// running, and fn is never called after it returns. Do not call stop from fn.
-func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic string, msg *LogMessage, deleted bool)) (stop func(), err error) {
+// running, and fn is never called after it returns. Do not call Stop from fn.
+//
+// The returned handle's Sync catches the watch up with the store: see
+// RetainedWatch.Sync.
+func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic string, msg *LogMessage, deleted bool)) (*RetainedWatch, error) {
 	filters := retainedTenantFilters(tenant)
 	if filters == nil || fn == nil {
 		return nil, fmt.Errorf("cluster: watch retained: needs a tenant and a callback: %w", tether.ErrInvalidInput)
@@ -504,10 +507,10 @@ func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic strin
 
 	w := &retainedWatch{
 		r: r, tenant: tenant, filters: filters, fn: fn,
-		known: make(map[string]uint64), ready: make(chan struct{}),
+		known: make(map[string]uint64), ready: make(chan struct{}), seenCh: make(chan struct{}),
 	}
 
-	stop = func() {
+	stop := func() {
 		cancel()
 
 		w.stopped.Store(true)
@@ -528,11 +531,84 @@ func (r *Retained) Watch(ctx context.Context, tenant string, fn func(topic strin
 
 	select {
 	case <-w.ready:
-		return stop, nil
+		return &RetainedWatch{w: w, stop: stop, done: wctx.Done()}, nil
 	case <-startCtx.Done():
 		stop()
 
 		return nil, r.wrapErr("watch retained: first pass", startCtx.Err())
+	}
+}
+
+// RetainedWatch is a running Watch.
+type RetainedWatch struct {
+	w    *retainedWatch
+	stop func()
+	done <-chan struct{} // closed when the watch has ended
+}
+
+// Stop ends the watch. It is idempotent and returns promptly even while NATS
+// is unreachable: it waits only for a callback that is running, and the
+// callback is never called after it returns. Do not call it from the
+// callback.
+func (h *RetainedWatch) Stop() { h.stop() }
+
+// Sync returns once the watch has caught up with the store as of the call:
+// every write to the tenant's keys acknowledged before Sync was called has
+// been through the callback (or, for a removal of a topic the callback never
+// held, skipped). It reads the stream leader's newest revision under the
+// tenant's two key filters (the mark, as the first pass does) and waits until
+// the watch has seen an entry at or above it. It counts every entry the
+// watch read, whatever the callback was told, so a removal of a topic the
+// callback does not hold still moves it on. While it waits the mark is read
+// again every 250 ms and only lowered, for an entry at the mark that left
+// the stream before the watch read it (a TTL that ran out).
+//
+// It costs one or two requests to the stream leader. A context without a
+// deadline gets 10 s; when it runs out, or the leader cannot be read, the
+// error wraps ErrUnavailable. On a watch that has ended it fails with an
+// error wrapping ErrUnavailable.
+func (h *RetainedWatch) Sync(ctx context.Context) error {
+	w := h.w
+
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	hd, err := w.r.handles(ctx)
+	if err != nil {
+		return err
+	}
+
+	mark, err := w.r.leaderMark(ctx, hd, w.filters)
+	if err != nil {
+		return err
+	}
+
+	tick := time.NewTicker(catchUpRecheck)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-h.done:
+			return fmt.Errorf("cluster: sync retained: the watch has ended: %w", ErrUnavailable)
+		default:
+		}
+
+		seen, advanced := w.seenNow()
+		if seen >= mark {
+			return nil
+		}
+
+		select {
+		case <-advanced:
+		case <-h.done:
+			return fmt.Errorf("cluster: sync retained: the watch has ended: %w", ErrUnavailable)
+		case <-ctx.Done():
+			return w.r.wrapErr("sync retained", ctx.Err())
+		case <-tick.C:
+			if m, err := w.r.leaderMark(ctx, hd, w.filters); err == nil {
+				mark = min(mark, m)
+			}
+		}
 	}
 }
 
@@ -554,6 +630,34 @@ type retainedWatch struct {
 	// fnMu, so it waits for an fn that is running and none starts after it.
 	fnMu    sync.Mutex
 	stopped atomic.Bool
+
+	// seen is the highest revision of an entry the watch has read and handed
+	// to consume (whatever fn was told), for Sync; seenCh is closed and
+	// replaced each time it grows. A restarted watch's first pass counts only
+	// once it has ended, when its removals have been reported.
+	seenMu sync.Mutex
+	seen   uint64
+	seenCh chan struct{}
+}
+
+// advance records that the watch has read every entry up to rev.
+func (w *retainedWatch) advance(rev uint64) {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+
+	if rev > w.seen {
+		w.seen = rev
+		close(w.seenCh)
+		w.seenCh = make(chan struct{})
+	}
+}
+
+// seenNow returns seen and the channel that closes when it next grows.
+func (w *retainedWatch) seenNow() (seen uint64, advanced <-chan struct{}) {
+	w.seenMu.Lock()
+	defer w.seenMu.Unlock()
+
+	return w.seen, w.seenCh
 }
 
 // open starts a KV watcher on the tenant's keys and reads the leader's mark
@@ -638,6 +742,7 @@ func (w *retainedWatch) read(ctx context.Context, kw jetstream.KeyWatcher, pass 
 	for {
 		if !pass.done && pass.caughtUp() {
 			w.endFirstPass()
+			w.advance(pass.seen)
 			w.readyOnce.Do(func() { close(w.ready) })
 		}
 
@@ -659,6 +764,10 @@ func (w *retainedWatch) read(ctx context.Context, kw jetstream.KeyWatcher, pass 
 
 			pass.saw(e.Revision())
 			w.consume(e)
+
+			if w.resync == nil {
+				w.advance(e.Revision())
+			}
 		}
 	}
 }

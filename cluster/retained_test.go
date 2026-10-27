@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -133,12 +134,12 @@ func (w *retWatcher) quiet(t *testing.T, d time.Duration) {
 func mustWatch(t *testing.T, r *Retained, tenant string, w *retWatcher) {
 	t.Helper()
 
-	stop, err := r.Watch(tctx(t, 60*time.Second), tenant, w.fn)
+	h, err := r.Watch(tctx(t, 60*time.Second), tenant, w.fn)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	t.Cleanup(stop)
+	t.Cleanup(h.Stop)
 }
 
 func mustPut(t *testing.T, r *Retained, tenant, topic, payload string) {
@@ -657,13 +658,13 @@ func TestRetainedWatchStop(t *testing.T) {
 
 	w := newRetWatcher()
 
-	stop, err := r.Watch(tctx(t, 60*time.Second), testTenant, w.fn)
+	h, err := r.Watch(tctx(t, 60*time.Second), testTenant, w.fn)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	stop()
-	stop()
+	h.Stop()
+	h.Stop()
 
 	mustPut(t, r, testTenant, "after/stop", "x")
 	w.quiet(t, 500*time.Millisecond)
@@ -722,3 +723,82 @@ func TestRetainedInvalidInput(t *testing.T) {
 }
 
 func second2[T any](_ T, err error) error { return err }
+
+// Sync returns only once the watch has been through every write acknowledged
+// before it was called: a put on another node, even with the callback slow,
+// and removals of topics the callback never held (which it is never told
+// about) do not hold it up. On a stopped watch it fails.
+func TestRetainedWatchSync(t *testing.T) {
+	cell := startRetained(t, 2)
+	a, b := cell[0], cell[1]
+
+	var slow atomic.Bool
+
+	w := newRetWatcher()
+	h, err := b.Watch(tctx(t, 60*time.Second), testTenant, func(topic string, msg *LogMessage, deleted bool) {
+		if slow.Load() {
+			time.Sleep(300 * time.Millisecond)
+		}
+
+		w.fn(topic, msg, deleted)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(h.Stop)
+
+	for round := range 5 {
+		slow.Store(round%2 == 0)
+
+		name := fmt.Sprintf("sync/%d", round)
+		mustPut(t, a, testTenant, name, "v")
+
+		if err := h.Sync(tctx(t, 20*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+
+		if !slices.ContainsFunc(w.snapshot(), func(ev retEvent) bool { return ev.topic == name && !ev.deleted }) {
+			t.Fatalf("round %d: Sync returned before the watch reported %s", round, name)
+		}
+	}
+
+	slow.Store(false)
+
+	// The newest entries are removals of topics the callback never held:
+	// nothing is reported, and Sync still returns.
+	for i := range 3 {
+		if err := a.Delete(tctx(t, 20*time.Second), testTenant, fmt.Sprintf("never/%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	start := time.Now()
+
+	if err := h.Sync(tctx(t, 20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("Sync over unreported removals took %v", d)
+	}
+
+	// A delete of a held topic is through the callback once Sync returns.
+	if err := a.Delete(tctx(t, 20*time.Second), testTenant, "sync/0"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := h.Sync(tctx(t, 20*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.ContainsFunc(w.snapshot(), func(ev retEvent) bool { return ev.topic == "sync/0" && ev.deleted }) {
+		t.Fatal("Sync returned before the watch reported the delete of sync/0")
+	}
+
+	h.Stop()
+
+	if err := h.Sync(tctx(t, 5*time.Second)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Sync on a stopped watch = %v, want ErrUnavailable", err)
+	}
+}

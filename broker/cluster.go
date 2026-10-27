@@ -189,7 +189,7 @@ type routeRef struct {
 
 // newClusterNode checks c and returns the broker's cluster side. deliver
 // receives the messages a Router made here delivers.
-func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name string, payload []byte, props cluster.Props)) (*clusterNode, error) {
+func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name string, payload []byte, props cluster.Props, retain bool)) (*clusterNode, error) {
 	if c.Conn == nil {
 		return nil, invalid("deps.Cluster.Conn is required")
 	}
@@ -354,15 +354,18 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 }
 
 // DeliverRouted hands the broker a QoS 0 message that another node routed,
-// as tenantID's message on the tenant-relative topic name. A Router the
-// broker made calls it itself; a Router you set in Cluster must call it
-// from its deliver function. It does not block on clients.
+// as tenantID's message on the tenant-relative topic name, with its retain
+// flag. A Router the broker made calls it itself; a Router you set in
+// Cluster must call it from its deliver function. It does not block on
+// clients. The retain flag reaches only 5.0 subscriptions with Retain As
+// Published; the retained message itself comes from the cell's retained
+// store, never from here.
 //
 // The message comes off NATS, so it is checked like an admin publish: a
 // tenant ID that is not canonical, an invalid name and a name under $SYS
 // (in any casing) are dropped and logged. Before Start and after Stop it
 // drops everything.
-func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props cluster.Props) {
+func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props cluster.Props, retain bool) {
 	if b.cluster == nil {
 		return
 	}
@@ -373,18 +376,21 @@ func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props clus
 		return
 	}
 
-	if err := b.inject(tenantID, name, payload, 0, props, "", 0, false); err != nil && !errors.Is(err, errNotInjecting) {
+	if err := b.inject(tenantID, name, payload, 0, props, "", 0, retain); err != nil && !errors.Is(err, errNotInjecting) {
 		b.cluster.log.Warn("tether: routed message not injected", slog.String("tenant", tenantID), slog.String("topic", name), slog.Any("error", err))
 	}
 }
 
 // publish routes one QoS 0 message to the other nodes of the cell. QoS 0 is
 // best effort: a failure is logged and counted, and the local delivery goes
-// ahead regardless. The retain flag does not travel (the Router carries
-// none), so another node delivers a routed message with it clear; the
-// retained message itself reaches every node through the retained store.
+// ahead regardless. The retain flag travels (ruling R33b), whether pk still
+// has it or the hook already moved it to the tag, for the other nodes'
+// Retain As Published subscribers; the retained message itself reaches every
+// node through the retained store.
 func (n *clusterNode) publish(tenantID, rel string, pk *packets.Packet) {
-	if err := n.Router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties)); err != nil {
+	retain := pk.FixedHeader.Retain || retainedTag(*pk)
+
+	if err := n.Router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties), retain); err != nil {
 		n.routeErrors.Add(1)
 		n.log.Warn("tether: qos 0 message not routed", slog.String("tenant", tenantID), slog.String("topic", rel), slog.Any("error", err))
 

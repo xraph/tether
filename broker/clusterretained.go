@@ -76,7 +76,8 @@ const (
 // retainedNode is the retained side of a cluster node, embedded in
 // clusterNode.
 type retainedNode struct {
-	// retMu guards retCaches, retClosed and retWritersStopped.
+	// retMu guards retCaches, retClosed and retWritersStopped. It is taken
+	// before a cache's mu, never after.
 	retMu     sync.Mutex
 	retCaches map[string]*retainedCache
 	retClosed bool
@@ -86,7 +87,9 @@ type retainedNode struct {
 	retCancel context.CancelFunc
 	retLoads  sync.WaitGroup
 
-	// The queued writes: one fifo and one writer goroutine per shard.
+	// The writes to the cell's store: one fifo and one writer goroutine per
+	// shard. Every write of this node goes through its topic's shard, so one
+	// topic's writes reach the store in the order they were made here.
 	retQueues         [retainedShards]fifo[*retainWrite]
 	retQueued         [retainedShards]atomic.Int64
 	retQuit           chan struct{}
@@ -95,15 +98,25 @@ type retainedNode struct {
 	retWriters        sync.WaitGroup
 
 	// retainedWait and retainedRetryWindow default to the constants; tests
-	// may shorten them before Start. retainedLoadHook, when a test sets it before
-	// Start, runs first in every tenant's load (to hold it).
+	// may shorten them before Start. retainedLoadHook, when a test sets it
+	// before Start, runs first in every tenant's load (to hold it), and
+	// retainedAfterRetire between a cache leaving the map (already cleared)
+	// and its watch being stopped.
 	retainedWait, retainedRetryWindow time.Duration
 	retainedLoadHook                  func(tenantID string)
+	retainedAfterRetire               func(tenantID string)
+	// retainedApplyDelay, when a test sets it (nanoseconds), slows every
+	// watch report by that much before it is applied: a watch that lags.
+	retainedApplyDelay atomic.Int64
+	// retainedBeforeWrite, when a test sets it, runs as a writer takes a
+	// write from its queue (to hold the shard).
+	retainedBeforeWrite atomic.Pointer[func(w *retainWrite)]
 
 	// Counters for tests: loads finished, watch reports applied, writes
-	// stored, repairs, writes given up on, SUBSCRIBEs that stopped waiting
-	// for a load.
+	// stored, repairs, writes given up on, SUBSCRIBEs that went on without a
+	// finished load or catch-up, catch-ups run.
 	retainedLoads, retainedApplied, retainedWrites, retainedRepairs, retainedDropped, retainedWaitTimeouts atomic.Uint64
+	retainedSyncs                                                                                          atomic.Uint64
 }
 
 func newRetainedNode() retainedNode {
@@ -142,12 +155,26 @@ type retainedCache struct {
 
 	// mu serializes every change of the tenant's entries in mochi's store:
 	// the watch's reports, local applies, repairs and the clear at stop.
-	mu        sync.Mutex
-	view      map[string]packets.Packet // namespaced topic: what the watch last applied
-	stopped   bool
-	stopWatch func()
+	mu      sync.Mutex
+	view    map[string]packets.Packet // namespaced topic: what the watch last applied
+	stopped bool
+	watch   *cluster.RetainedWatch // nil until the load finished
+
+	// syncMu guards the catch-ups of SUBSCRIBEs (syncCache): pending is the
+	// batch that has not read its leader mark yet, running whether a
+	// goroutine is working through batches.
+	syncMu      sync.Mutex
+	syncPending *syncBatch
+	syncRunning bool
 
 	lastActive time.Time // retMu
+}
+
+// syncBatch is one catch-up shared by the SUBSCRIBEs that joined it before
+// it started.
+type syncBatch struct {
+	done chan struct{}
+	err  error
 }
 
 func (c *retainedCache) markReady() { c.readyOnce.Do(func() { close(c.ready) }) }
@@ -204,17 +231,20 @@ func (n *clusterNode) loadRetained(ctx context.Context, c *retainedCache) {
 	delay := retainedRetry
 
 	for {
-		stop, err := n.Retained.Watch(ctx, c.tenant, func(name string, msg *cluster.LogMessage, deleted bool) {
+		h, err := n.Retained.Watch(ctx, c.tenant, func(name string, msg *cluster.LogMessage, deleted bool) {
 			n.applyWatched(c, name, msg, deleted)
 		})
 		if err == nil {
 			c.mu.Lock()
 			stopped := c.stopped
-			c.stopWatch = stop
+
+			if !stopped {
+				c.watch = h
+			}
 			c.mu.Unlock()
 
 			if stopped {
-				stop()
+				h.Stop()
 
 				return
 			}
@@ -249,6 +279,10 @@ func (n *clusterNode) applyWatched(c *retainedCache, name string, msg *cluster.L
 		return
 	}
 
+	if d := n.retainedApplyDelay.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
+
 	ns := topic.Namespace(c.tenant, name)
 
 	c.mu.Lock()
@@ -270,10 +304,14 @@ func (n *clusterNode) applyWatched(c *retainedCache, name string, msg *cluster.L
 	n.retainedApplied.Add(1)
 }
 
-// awaitRetained holds a SUBSCRIBE of cl, for up to retainedWait, until its
-// tenant's retained messages are loaded, when one of its filters can get
-// retained messages (not shared, Retain Handling not 2). It runs in
-// OnSubscribe, on the client's read loop, and holds no lock.
+// awaitRetained holds a SUBSCRIBE of cl, when one of its filters can get
+// retained messages (not shared, Retain Handling not 2), until this node's
+// cache of its tenant is current: first loaded, then caught up with the
+// cell's store as of the SUBSCRIBE (syncCache), so a write any node
+// acknowledged before the SUBSCRIBE arrived is in it (Review Focus 5). Both
+// share one retainedWait bound; past it the SUBSCRIBE goes on with the cache
+// as it is. It runs in OnSubscribe, on the client's read loop, and holds no
+// lock.
 func (n *clusterNode) awaitRetained(cl *mqtt.Client, filters packets.Subscriptions) {
 	want := false
 
@@ -304,12 +342,6 @@ func (n *clusterNode) awaitRetained(cl *mqtt.Client, filters packets.Subscriptio
 		}
 	}
 
-	select {
-	case <-c.ready:
-		return
-	default:
-	}
-
 	timer := time.NewTimer(n.retainedWait)
 	defer timer.Stop()
 
@@ -318,92 +350,168 @@ func (n *clusterNode) awaitRetained(cl *mqtt.Client, filters packets.Subscriptio
 	case <-timer.C:
 		n.retainedWaitTimeouts.Add(1)
 		n.log.Info("tether: retained messages not loaded in time, subscribing without them", slog.String("client", cl.ID))
-	}
-}
-
-// stopCache stops c: its watch ends and the tenant's entries leave mochi's
-// store. Idempotent.
-func (n *clusterNode) stopCache(c *retainedCache) {
-	c.mu.Lock()
-
-	if c.stopped {
-		c.mu.Unlock()
 
 		return
 	}
 
-	c.stopped = true
-	stop := c.stopWatch
-	c.view = nil
+	if err := n.syncCache(c, timer.C); err != nil {
+		n.retainedWaitTimeouts.Add(1)
+		n.log.Info("tether: retained messages not caught up with the cell, subscribing with what this node has",
+			slog.String("client", cl.ID), slog.Any("error", err))
+	}
+}
 
-	if n.mochi != nil {
-		clearTenantRetained(n.mochi, c.tenant)
+// errSyncBound is what syncCache returns when the SUBSCRIBE's bound ran out.
+var errSyncBound = errors.New("tether/broker: retained catch-up: bound reached")
+
+// syncCache catches c's watch up with the cell's store (RetainedWatch.Sync)
+// for a SUBSCRIBE, waiting at most until bound fires. SUBSCRIBEs that arrive
+// while a catch-up runs join the next one, which starts, and reads the
+// store's mark, only after the running one is done, so every joiner arrived
+// before the mark it waits for was read. One goroutine per cache works
+// through the batches, each bounded by retainedWait.
+func (n *clusterNode) syncCache(c *retainedCache, bound <-chan time.Time) error {
+	c.syncMu.Lock()
+
+	b := c.syncPending
+	if b == nil {
+		b = &syncBatch{done: make(chan struct{})}
+		c.syncPending = b
 	}
 
-	c.mu.Unlock()
+	if !c.syncRunning {
+		c.syncRunning = true
 
-	// Outside mu: stop waits for a report being applied, which takes mu.
-	c.cancel()
-
-	if stop != nil {
-		stop()
+		go n.runSyncs(c)
 	}
 
-	c.markReady()
+	c.syncMu.Unlock()
+
+	select {
+	case <-b.done:
+		return b.err
+	case <-bound:
+		return errSyncBound
+	}
+}
+
+// runSyncs runs c's pending catch-ups one batch at a time until none is
+// pending.
+func (n *clusterNode) runSyncs(c *retainedCache) {
+	for {
+		c.syncMu.Lock()
+
+		b := c.syncPending
+		c.syncPending = nil
+
+		if b == nil {
+			c.syncRunning = false
+			c.syncMu.Unlock()
+
+			return
+		}
+
+		c.syncMu.Unlock()
+
+		c.mu.Lock()
+		h, stopped := c.watch, c.stopped
+		c.mu.Unlock()
+
+		switch {
+		case stopped || h == nil:
+			b.err = fmt.Errorf("tether/broker: retained catch-up: %w: no watch", tether.ErrNotFound)
+		default:
+			ctx, cancel := context.WithTimeout(context.Background(), n.retainedWait)
+			b.err = h.Sync(ctx)
+
+			cancel()
+			n.retainedSyncs.Add(1)
+		}
+
+		close(b.done)
+	}
+}
+
+// retire removes the caches pick chooses (pick runs under retMu) and stops
+// them. Each one is marked stopped and its tenant's entries leave mochi's
+// store under retMu, before it leaves the map: a CONNECT that makes the
+// tenant a new cache can only do so after that, so the clear never touches
+// what the new cache applies. The watches stop afterwards, outside the
+// locks (stopping waits for a report being applied, which takes the
+// cache's mu).
+func (n *clusterNode) retire(pick func(tenantID string, c *retainedCache) bool) {
+	type gone struct {
+		c *retainedCache
+		h *cluster.RetainedWatch
+	}
+
+	var out []gone
+
+	n.retMu.Lock()
+
+	for tenantID, c := range n.retCaches {
+		if !pick(tenantID, c) {
+			continue
+		}
+
+		c.mu.Lock()
+		c.stopped = true
+		h := c.watch
+		c.view = nil
+
+		if n.mochi != nil {
+			clearTenantRetained(n.mochi, c.tenant)
+		}
+
+		c.mu.Unlock()
+
+		delete(n.retCaches, tenantID)
+		out = append(out, gone{c: c, h: h})
+	}
+
+	n.retMu.Unlock()
+
+	for _, g := range out {
+		if hook := n.retainedAfterRetire; hook != nil {
+			hook(g.c.tenant)
+		}
+
+		g.c.cancel()
+
+		if g.h != nil {
+			g.h.Stop()
+		}
+
+		g.c.markReady()
+	}
 }
 
 // sweepRetained stops the caches of tenants with no live connection on this
 // node for readerIdle, with the readers (sweepReaders).
 func (n *clusterNode) sweepRetained(live map[string]int, now time.Time) {
-	var idle []*retainedCache
-
-	n.retMu.Lock()
-
-	for tenantID, c := range n.retCaches {
+	n.retire(func(tenantID string, c *retainedCache) bool {
 		if live[tenantID] > 0 {
 			c.lastActive = now
 
-			continue
+			return false
 		}
 
-		if now.Sub(c.lastActive) < n.readerIdle {
-			continue
-		}
-
-		delete(n.retCaches, tenantID)
-		idle = append(idle, c)
-	}
-
-	n.retMu.Unlock()
-
-	for _, c := range idle {
-		n.stopCache(c)
-	}
+		return now.Sub(c.lastActive) >= n.readerIdle
+	})
 }
 
 // closeRetainedCaches stops every cache, for Stop. None starts after it.
 func (n *clusterNode) closeRetainedCaches() {
 	n.retMu.Lock()
+	closed := n.retClosed
+	n.retClosed = true
+	n.retMu.Unlock()
 
-	if n.retClosed {
-		n.retMu.Unlock()
-
+	if closed {
 		return
 	}
 
-	n.retClosed = true
-
-	all := make([]*retainedCache, 0, len(n.retCaches))
-	for tenantID, c := range n.retCaches {
-		delete(n.retCaches, tenantID)
-		all = append(all, c)
-	}
-
-	n.retMu.Unlock()
-
-	for _, c := range all {
-		n.stopCache(c)
-	}
+	n.retire(func(string, *retainedCache) bool { return true })
 
 	n.retCancel()
 	n.retLoads.Wait()
@@ -415,21 +523,29 @@ func (n *clusterNode) closeRetainedCaches() {
 type retainWrite struct {
 	tenant string
 	msg    cluster.LogMessage
-	at     time.Time // when the write started, for the retry window
+
+	// done, when a caller waits (storeRetained), gets the outcome once;
+	// cancelled makes the writer skip a write that has not started.
+	done      chan error
+	cancelled atomic.Bool
+}
+
+// report hands the outcome to a waiting caller, if any.
+func (w *retainWrite) report(err error) {
+	if w.done != nil {
+		w.done <- err
+	}
 }
 
 // newRetainWrite is the write of a retained publish of tenantID on the
 // tenant-relative name. payload is not copied.
 func (n *clusterNode) newRetainWrite(tenantID, name string, payload []byte, qos byte, props cluster.Props, clientID string) *retainWrite {
-	now := time.Now()
-
 	return &retainWrite{
 		tenant: tenantID,
 		msg: cluster.LogMessage{
 			Tenant: tenantID, Topic: name, Payload: payload, QoS: qos, Retain: true, Props: props,
-			Origin: n.Config.NodeID, ClientID: clientID, PublishedAt: now,
+			Origin: n.Config.NodeID, ClientID: clientID, PublishedAt: time.Now(),
 		},
-		at: now,
 	}
 }
 
@@ -440,7 +556,10 @@ func (n *clusterNode) newRetainWrite(tenantID, name string, payload []byte, qos 
 func (n *clusterNode) retainPublish(st *clientState, rel string, pk *packets.Packet) {
 	w := n.newRetainWrite(st.tenantID, rel, slices.Clone(pk.Payload), pk.FixedHeader.Qos, clusterProps(pk.Properties), st.rawID)
 	n.applyLocal(w)
-	n.enqueueRetained(w)
+	if err := n.enqueueRetained(w); err != nil {
+		// Logged, counted and repaired there; QoS 0 owes nobody an answer.
+		n.log.Debug("tether: qos 0 retained write refused", slog.Any("error", err))
+	}
 
 	pk.FixedHeader.Retain = false
 	tagRetained(pk)
@@ -514,68 +633,40 @@ func (n *clusterNode) putRetained(ctx context.Context, w *retainWrite) error {
 	return n.Retained.Put(ctx, w.tenant, w.msg.Topic, w.msg, ttl)
 }
 
-// storeRetained applies w to this node's cache and writes it to the cell's
-// store, retrying with backoff until it is stored, ctx ends or the retry
-// window has passed. A write given up on goes to the queue when handoff is
-// set (it keeps trying there; the publish it belongs to is already in the
-// cell), and is otherwise repaired. The error is the last write's.
+// storeRetained applies w to this node's cache and has its topic's shard
+// write it to the cell's store (enqueueRetained), behind every earlier write
+// of the topic from this node, then waits for the outcome under ctx. When
+// ctx ends first it stops waiting: with handoff (the QoS 1 and 2 pipe,
+// wills: the publish is in the cell already) the write goes on; without (the
+// host's Publish and DeleteRetained, which return the error) a write that
+// has not started is skipped and repaired, and one that has started finishes
+// regardless. The error is the write's, or ctx's.
 func (n *clusterNode) storeRetained(ctx context.Context, w *retainWrite, handoff bool) error {
 	n.applyLocal(w)
 
-	delay := retainedRetry
+	w.done = make(chan error, 1)
 
-	for {
-		actx, cancel := context.WithTimeout(ctx, retainedWriteTimeout)
-		err := n.putRetained(actx, w)
+	if err := n.enqueueRetained(w); err != nil {
+		return err
+	}
 
-		cancel()
-
-		if err == nil {
-			n.retainedWrites.Add(1)
-
-			return nil
+	select {
+	case err := <-w.done:
+		return err
+	case <-ctx.Done():
+		if !handoff {
+			w.cancelled.Store(true)
 		}
 
-		if errors.Is(err, tether.ErrInvalidInput) {
-			n.retainedDropped.Add(1)
-			n.log.Error("tether: retained message refused by the cell", slog.String("tenant", w.tenant),
-				slog.String("topic", w.msg.Topic), slog.Any("error", err))
-			n.repairRetained(w)
-
-			return err
-		}
-
-		giveUp := ctx.Err() != nil || time.Since(w.at) > n.retainedRetryWindow
-		if !giveUp {
-			n.log.Warn("tether: storing a retained message failed, retrying", slog.String("tenant", w.tenant),
-				slog.String("topic", w.msg.Topic), slog.Duration("in", delay), slog.Any("error", err))
-
-			select {
-			case <-ctx.Done():
-				giveUp = true
-			case <-time.After(delay):
-			}
-		}
-
-		if giveUp {
-			if handoff {
-				n.enqueueRetained(w)
-			} else {
-				n.retainedDropped.Add(1)
-				n.repairRetained(w)
-			}
-
-			return fmt.Errorf("tether/broker: store retained %q: %w", w.msg.Topic, err)
-		}
-
-		delay = min(2*delay, retainedRetryMax)
+		return fmt.Errorf("tether/broker: store retained %q: %w", w.msg.Topic, ctx.Err())
 	}
 }
 
-// enqueueRetained queues w for its shard's writer, which writes the writes
-// of one topic in the order they came. A full queue, or one whose writer has
-// stopped, drops w.
-func (n *clusterNode) enqueueRetained(w *retainWrite) {
+// enqueueRetained queues w for its topic's shard (by tenant and topic), whose
+// writer stores the writes of one topic in the order they were queued. A full
+// queue, or one whose writer has stopped, drops w: it is counted, logged and
+// repaired, and the error is returned (and reported to a waiter).
+func (n *clusterNode) enqueueRetained(w *retainWrite) error {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(w.tenant))
 	_, _ = h.Write([]byte{0})
@@ -591,12 +682,14 @@ func (n *clusterNode) enqueueRetained(w *retainWrite) {
 			slog.String("tenant", w.tenant), slog.String("topic", w.msg.Topic))
 		n.repairRetained(w)
 
-		return
+		return fmt.Errorf("tether/broker: store retained %q: %w: queue full or closed", w.msg.Topic, cluster.ErrUnavailable)
 	}
 
 	n.retQueued[i].Add(1)
 	n.retQueues[i].push(w)
 	n.retMu.Unlock()
+
+	return nil
 }
 
 // stopRetainedWriters stops taking writes and lets the writers finish what
@@ -629,15 +722,28 @@ func (n *clusterNode) runRetainedWriter(i int) {
 			return
 		}
 
-		n.writeQueued(w)
+		w.report(n.writeQueued(w))
 		n.retQueued[i].Add(-1)
 	}
 }
 
-// writeQueued writes one queued write, retrying with backoff until the
-// retry window has passed; once the writers are stopping, one attempt within
-// the drain bound. A write given up on is logged, counted and repaired.
-func (n *clusterNode) writeQueued(w *retainWrite) {
+// writeQueued stores one write, retrying with backoff for retainedRetryWindow
+// from when it starts here; once the writers are stopping, one attempt within
+// the drain bound. A write given up on, or cancelled before it started, is
+// logged, counted and repaired. It returns the outcome.
+func (n *clusterNode) writeQueued(w *retainWrite) error {
+	if hook := n.retainedBeforeWrite.Load(); hook != nil {
+		(*hook)(w)
+	}
+
+	if w.cancelled.Load() {
+		n.retainedDropped.Add(1)
+		n.repairRetained(w)
+
+		return fmt.Errorf("tether/broker: store retained %q: %w", w.msg.Topic, context.Canceled)
+	}
+
+	start := time.Now()
 	delay := retainedRetry
 
 	for {
@@ -667,17 +773,20 @@ func (n *clusterNode) writeQueued(w *retainWrite) {
 		if err == nil {
 			n.retainedWrites.Add(1)
 
-			return
+			return nil
 		}
 
-		if draining || errors.Is(err, tether.ErrInvalidInput) || time.Since(w.at) > n.retainedRetryWindow {
+		if draining || errors.Is(err, tether.ErrInvalidInput) || time.Since(start) > n.retainedRetryWindow {
 			n.retainedDropped.Add(1)
 			n.log.Warn("tether: retained message not stored in the cell, giving up", slog.String("tenant", w.tenant),
 				slog.String("topic", w.msg.Topic), slog.Any("error", err))
 			n.repairRetained(w)
 
-			return
+			return fmt.Errorf("tether/broker: store retained %q: %w", w.msg.Topic, err)
 		}
+
+		n.log.Warn("tether: storing a retained message failed, retrying", slog.String("tenant", w.tenant),
+			slog.String("topic", w.msg.Topic), slog.Duration("in", delay), slog.Any("error", err))
 
 		select {
 		case <-n.retQuit:

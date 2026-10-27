@@ -3,8 +3,10 @@ package broker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -132,13 +134,21 @@ func (c *retClient) next(t *testing.T) retMsg {
 func (c *retClient) nextFull(t *testing.T) retMsg {
 	t.Helper()
 
-	select {
-	case m := <-c.msgs:
-		return m
-	case <-time.After(logWait):
-		t.Fatal("no message received")
+	deadline := time.After(logWait)
 
-		return retMsg{}
+	for {
+		select {
+		case m := <-c.msgs:
+			if strings.HasPrefix(m.Topic, probePrefix) {
+				continue // a late interest probe
+			}
+
+			return m
+		case <-deadline:
+			t.Fatal("no message received")
+
+			return retMsg{}
+		}
 	}
 }
 
@@ -151,6 +161,62 @@ func (c *retClient) none(t *testing.T) {
 		t.Fatalf("unexpected message %q on %q", m.Payload, m.Topic)
 	case <-time.After(settle):
 	}
+}
+
+// retained waits for c's retained copy of name (retain flag set), skipping
+// live copies of it, and returns its payload.
+func (c *retClient) retained(t *testing.T, name string) string {
+	t.Helper()
+
+	deadline := time.After(logWait)
+
+	for {
+		select {
+		case m := <-c.msgs:
+			if m.Topic == name && m.Retain {
+				return m.Payload
+			}
+
+			if m.Topic != name {
+				t.Fatalf("unexpected message %q on %q", m.Payload, m.Topic)
+			}
+		case <-deadline:
+			t.Fatalf("no retained message on %q", name)
+
+			return ""
+		}
+	}
+}
+
+// retainedN collects c's next n retained copies (retain flag set), by topic,
+// skipping live copies.
+func (c *retClient) retainedN(t *testing.T, n int) map[string]string {
+	t.Helper()
+
+	out := make(map[string]string, n)
+	deadline := time.After(logWait)
+
+	for len(out) < n {
+		select {
+		case m := <-c.msgs:
+			if m.Retain {
+				out[m.Topic] = m.Payload
+			}
+		case <-deadline:
+			t.Fatalf("%d of %d retained messages: %v", len(out), n, out)
+		}
+	}
+
+	return out
+}
+
+// lag makes b's retained watch apply every report d late, as a watch that
+// lags behind the store would.
+func lag(t *testing.T, b *Broker, d time.Duration) {
+	t.Helper()
+
+	b.cluster.retainedApplyDelay.Store(int64(d))
+	t.Cleanup(func() { b.cluster.retainedApplyDelay.Store(0) })
 }
 
 // cached reports whether node b's cache of tenantID holds the retained
@@ -204,11 +270,12 @@ func kvTopics(t *testing.T, b *Broker, tenantID string) map[string]string {
 }
 
 // Review Focus 5: a retained message set on node A is delivered to a
-// SUBSCRIBE on node B right after, through the SUBACK flow: B's first
-// connection of the tenant starts the load and the SUBSCRIBE waits for it.
-// The retained flag and the user properties come through. On a node that
-// has loaded the tenant already the watch brings later messages in, and a
-// client gets its own retained publish back on its node at once.
+// SUBSCRIBE on node B right after, through the SUBACK flow. When B's first
+// connection of the tenant starts the load, the SUBSCRIBE waits for it; when
+// B has the tenant loaded already, with its watch lagging 300 ms, the
+// SUBSCRIBE waits for the watch to catch up with the store (Sync). The
+// retained flag and the user properties come through, and a client gets its
+// own retained publish back on its node at once.
 func TestRetainedAcrossNodes(t *testing.T) {
 	c := startCluster(t, 2)
 	tid := c.t1.ID.String()
@@ -222,39 +289,42 @@ func TestRetainedAcrossNodes(t *testing.T) {
 	require.Equal(t, retMsg{Topic: "r/x", Payload: "v1", Retain: true, User: "a"}, sub.next(t))
 	require.Zero(t, c.nodes[1].cluster.retainedWaitTimeouts.Load())
 
-	// Warm B: the watch brings the next one in.
-	pub.pub(t, "r/y", "v2", 1, "", 0)
-	eventually(t, "B's cache to hold r/y", func() bool { return cached(c.nodes[1], tid, "r/y") })
-
+	// Warm B, its watch lagging: a SUBSCRIBE right after the PUBACK still
+	// gets it.
 	late := dialRet(t, c.addr(1), "late", "u1")
+	h := dialRet(t, c.addr(1), "h", "u1")
+
+	lag(t, c.nodes[1], 300*time.Millisecond)
+
+	syncs := c.nodes[1].cluster.retainedSyncs.Load()
+
+	pub.pub(t, "r/y", "v2", 1, "", 0)
 	late.sub(t, "r/y", false)
-	require.Equal(t, retMsg{Topic: "r/y", Payload: "v2", Retain: true}, late.next(t))
+	require.Equal(t, "v2", late.retained(t, "r/y"))
+	require.Greater(t, c.nodes[1].cluster.retainedSyncs.Load(), syncs)
+	require.Zero(t, c.nodes[1].cluster.retainedWaitTimeouts.Load())
 
 	// QoS 0 too, and the publisher's own node has it at once.
 	pub.pub(t, "r/z", "v3", 0, "", 0)
 	pub.sub(t, "r/z", false)
 	require.Equal(t, retMsg{Topic: "r/z", Payload: "v3", Retain: true}, pub.next(t))
 
-	eventually(t, "B's cache to hold r/z", func() bool { return cached(c.nodes[1], tid, "r/z") })
+	// A QoS 0 publish has no ack to order a SUBSCRIBE after, so wait for
+	// the store.
+	eventually(t, "r/z to reach B's cache", func() bool { return cached(c.nodes[1], tid, "r/z") })
 	require.Equal(t, map[string]string{"r/x": "v1", "r/y": "v2", "r/z": "v3"}, kvTopics(t, c.nodes[0], tid))
 
 	z := dialRet(t, c.addr(1), "z", "u1")
 	z.sub(t, "r/z", false)
 	require.Equal(t, retMsg{Topic: "r/z", Payload: "v3", Retain: true}, z.next(t))
 
-	// The host's retained publishes go to the cell too.
+	// The host's retained publishes go to the cell too, and a Publish that
+	// returned is in every node's cache for the next SUBSCRIBE.
 	require.NoError(t, c.nodes[0].Publish(t.Context(), tid, "h/q0", []byte("h0"), 0, true))
 	require.NoError(t, c.nodes[0].Publish(t.Context(), tid, "h/q1", []byte("h1"), 1, true))
-	eventually(t, "B's cache to hold the host's", func() bool {
-		return cached(c.nodes[1], tid, "h/q0") && cached(c.nodes[1], tid, "h/q1")
-	})
 
-	h := dialRet(t, c.addr(1), "h", "u1")
 	h.sub(t, "h/#", false)
-
-	got := []retMsg{h.next(t), h.next(t)}
-	slices.SortFunc(got, func(a, b retMsg) int { return strings.Compare(a.Topic, b.Topic) })
-	require.Equal(t, []retMsg{{Topic: "h/q0", Payload: "h0", Retain: true}, {Topic: "h/q1", Payload: "h1", Retain: true}}, got)
+	require.Equal(t, map[string]string{"h/q0": "h0", "h/q1": "h1"}, h.retainedN(t, 2))
 
 	require.Equal(t, []RetainedInfo{{Topic: "h/q0", Size: 2}, {Topic: "h/q1", Size: 2, QoS: 1}}, c.nodes[1].Retained(tid, "h/#"))
 }
@@ -281,11 +351,8 @@ func TestRetainedSubscribeWaitsForLoad(t *testing.T) {
 		<-release
 	}
 
-	n.retMu.Lock()
-	cache := n.retCaches[tid]
-	delete(n.retCaches, tid)
-	n.retMu.Unlock()
-	n.stopCache(cache)
+	drop := func(id string, _ *retainedCache) bool { return id == tid }
+	n.retire(drop)
 
 	_, ok := inMochi(b, tid, "w/x")
 	require.False(t, ok, "a stopped cache leaves mochi's store")
@@ -331,11 +398,7 @@ func TestRetainedSubscribeWaitsForLoad(t *testing.T) {
 		}
 	})
 
-	n.retMu.Lock()
-	cache = n.retCaches[tid]
-	delete(n.retCaches, tid)
-	n.retMu.Unlock()
-	n.stopCache(cache)
+	n.retire(drop)
 
 	other := dialRet(t, c.addr(0), "other", "u1")
 	<-held2
@@ -351,45 +414,43 @@ func TestRetainedSubscribeWaitsForLoad(t *testing.T) {
 }
 
 // An empty retained publish on A, or DeleteRetained on either node, clears
-// the message on every node: B's cache drops it and a new SUBSCRIBE there
-// gets nothing.
+// the message on every node: a SUBSCRIBE on the other node right after gets
+// nothing, with that node's watch lagging 300 ms, and its cache has dropped
+// it by the SUBACK.
 func TestRetainedDeleteAcrossNodes(t *testing.T) {
 	c := startCluster(t, 2)
 	tid := c.t1.ID.String()
 
 	pub := dialRet(t, c.addr(0), "pub", "u1")
-	watcher := dialRet(t, c.addr(1), "watcher", "u1")
-	_ = watcher
+	first := dialRet(t, c.addr(1), "first", "u1")
+	s := dialRet(t, c.addr(1), "s", "u1")
+	onA := dialRet(t, c.addr(0), "onA", "u1")
+
+	lag(t, c.nodes[1], 300*time.Millisecond)
 
 	pub.pub(t, "d/x", "v", 1, "", 0)
-	eventually(t, "B's cache to hold d/x", func() bool { return cached(c.nodes[1], tid, "d/x") })
+	first.sub(t, "d/x", false)
+	require.Equal(t, "v", first.retained(t, "d/x"))
 
 	pub.pub(t, "d/x", "", 1, "", 0)
-	eventually(t, "B's cache to drop d/x", func() bool {
-		_, ok := inMochi(c.nodes[1], tid, "d/x")
-
-		return !cached(c.nodes[1], tid, "d/x") && !ok
-	})
-	require.Empty(t, kvTopics(t, c.nodes[0], tid))
-
-	s := dialRet(t, c.addr(1), "s", "u1")
 	s.sub(t, "d/#", false)
 	s.none(t)
+	require.False(t, cached(c.nodes[1], tid, "d/x"))
 
-	// DeleteRetained on B for a message set on A.
+	_, ok := inMochi(c.nodes[1], tid, "d/x")
+	require.False(t, ok)
+	require.Empty(t, kvTopics(t, c.nodes[0], tid))
+
+	// DeleteRetained on B for a message the host set on A: s gets the
+	// message live, then the live empty message, and a SUBSCRIBE on A right
+	// after gets nothing.
 	require.NoError(t, c.nodes[0].Publish(t.Context(), tid, "d/y", []byte("w"), 0, true))
-	eventually(t, "B's cache to hold d/y", func() bool { return cached(c.nodes[1], tid, "d/y") })
-
-	// s got the message live; then the live empty message, and the delete
-	// reaches A's cache.
 	require.Equal(t, retMsg{Topic: "d/y", Payload: "w"}, s.next(t))
 	require.NoError(t, c.nodes[1].DeleteRetained(tid, "d/y"))
 	require.Equal(t, retMsg{Topic: "d/y"}, s.next(t))
-	eventually(t, "A's cache to drop d/y", func() bool {
-		_, ok := inMochi(c.nodes[0], tid, "d/y")
 
-		return !ok
-	})
+	onA.sub(t, "d/#", false)
+	onA.none(t)
 	require.Empty(t, c.nodes[0].Retained(tid, "#"))
 	require.True(t, errors.Is(c.nodes[0].DeleteRetained(tid, "d/y"), tether.ErrNotFound))
 
@@ -410,12 +471,11 @@ func TestRetainedExpiry(t *testing.T) {
 	pub := dialRet(t, c.addr(0), "pub", "u1")
 	_ = dialRet(t, c.addr(1), "watcher", "u1")
 
+	s := dialRet(t, c.addr(1), "s", "u1")
+
 	pub.pub(t, "e/x", "short", 1, "", 2)
 	set := time.Now()
 
-	eventually(t, "B's cache to hold e/x", func() bool { return cached(c.nodes[1], tid, "e/x") })
-
-	s := dialRet(t, c.addr(1), "s", "u1")
 	s.sub(t, "e/#", false)
 
 	m := s.nextFull(t)
@@ -612,4 +672,157 @@ func TestRetainAsPublishedLive(t *testing.T) {
 	_, err := pub5.Publish(ctx, &paho.Publish{Topic: "live/plain", QoS: 1, Payload: []byte("p")})
 	require.NoError(t, err)
 	require.Equal(t, retMsg{Topic: "live/plain", Payload: "p"}, rapB.next(t))
+}
+
+// A sweep that retires a tenant's cache while a CONNECT of the tenant makes
+// it a new one leaves the new cache whole: the old one's entries left
+// mochi's store before it left the map, so its stop cannot clear what the new
+// cache loaded.
+func TestRetainedSweepRacingConnect(t *testing.T) {
+	c := startCluster(t, 1)
+	tid := c.t1.ID.String()
+	b := c.nodes[0]
+	n := b.cluster
+
+	pub := dialRet(t, c.addr(0), "pub", "u1")
+	pub.pub(t, "s/x", "v", 1, "", 0)
+	waitRetainedLoaded(t, b, tid)
+
+	var second *retClient
+
+	// Between the old cache leaving the map and its watch stopping, a new
+	// CONNECT makes and loads a new cache.
+	n.retainedAfterRetire = func(string) {
+		second = dialRet(t, c.addr(0), "second", "u1")
+		waitRetainedLoaded(t, b, tid)
+	}
+
+	n.sweepRetained(map[string]int{}, time.Now().Add(time.Hour))
+	n.retainedAfterRetire = nil
+
+	require.NotNil(t, second)
+
+	v, ok := inMochi(b, tid, "s/x")
+	require.True(t, ok, "the old cache's stop cleared the new cache's entries")
+	require.Equal(t, "v", v)
+	require.Equal(t, []string{topic.Namespace(tid, "s/x")}, n.retainedView(tid))
+
+	second.sub(t, "s/#", false)
+	require.Equal(t, "v", second.retained(t, "s/x"))
+}
+
+// probe makes sure QoS 0 published on pub's node reaches sub's node for
+// everything sub subscribed to so far (awaitInterest for retClients).
+func probe(t *testing.T, pub, sub *retClient) {
+	t.Helper()
+
+	name := fmt.Sprintf("%s%d", probePrefix, probeSeq.Add(1))
+	sub.sub(t, name, false)
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+		_, err := pub.Publish(ctx, &paho.Publish{Topic: name, QoS: 0, Payload: []byte("probe")})
+
+		cancel()
+		require.NoError(t, err)
+
+		select {
+		case m := <-sub.msgs:
+			if m.Topic == name {
+				return
+			}
+
+			if !strings.HasPrefix(m.Topic, probePrefix) {
+				t.Fatalf("message %q on %q before the probe", m.Payload, m.Topic)
+			}
+		case <-time.After(20 * time.Millisecond):
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatal("interest did not reach the publisher's node")
+		}
+	}
+}
+
+// A routed QoS 0 retained publish carries the retain flag to a Retain As
+// Published subscription on another node (the Router's Tether-Retain header,
+// ruling R33b) and not to one without.
+func TestRetainAsPublishedRouted(t *testing.T) {
+	c := startCluster(t, 2)
+
+	pub := dialRet(t, c.addr(0), "pub", "u1")
+	plainB := dialRet(t, c.addr(1), "plainB", "u1")
+	rapB := dialRet(t, c.addr(1), "rapB", "u1")
+
+	plainB.sub(t, "rq/#", false)
+	rapB.sub(t, "rq/#", true)
+	probe(t, pub, rapB)
+
+	pub.pub(t, "rq/x", "zero", 0, "", 0)
+	require.Equal(t, retMsg{Topic: "rq/x", Payload: "zero", Retain: true}, rapB.next(t))
+	require.Equal(t, retMsg{Topic: "rq/x", Payload: "zero"}, plainB.next(t))
+
+	// Not retained: no flag.
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	defer cancel()
+
+	_, err := pub.Publish(ctx, &paho.Publish{Topic: "rq/plain", QoS: 0, Payload: []byte("p")})
+	require.NoError(t, err)
+	require.Equal(t, retMsg{Topic: "rq/plain", Payload: "p"}, rapB.next(t))
+}
+
+// One topic's writes from one node reach the store in the order they were
+// made, whatever path they take: a QoS 0 retained publish whose write is
+// held in its queue, then a host retained publish of the same topic. The
+// host's Publish returns only after its write, behind the held one, and the
+// store and both caches keep the later message.
+func TestRetainedWritesKeepTopicOrder(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+	n := c.nodes[0].cluster
+
+	pub := dialRet(t, c.addr(0), "pub", "u1")
+	_ = dialRet(t, c.addr(1), "watcher", "u1")
+
+	held := make(chan struct{})
+	release := make(chan struct{})
+
+	var once sync.Once
+
+	hook := func(w *retainWrite) {
+		if w.msg.Topic == "o/x" {
+			once.Do(func() {
+				close(held)
+				<-release
+			})
+		}
+	}
+	n.retainedBeforeWrite.Store(&hook)
+	t.Cleanup(func() { n.retainedBeforeWrite.Store(nil) })
+
+	pub.pub(t, "o/x", "first", 0, "", 0)
+	<-held
+
+	done := make(chan error, 1)
+
+	go func() { done <- c.nodes[0].Publish(context.Background(), tid, "o/x", []byte("second"), 1, true) }()
+
+	select {
+	case err := <-done:
+		t.Fatalf("the later write did not wait behind the held one: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(release)
+	require.NoError(t, <-done)
+
+	require.Equal(t, map[string]string{"o/x": "second"}, kvTopics(t, c.nodes[0], tid))
+
+	for i := range c.nodes {
+		s := dialRet(t, c.addr(i), fmt.Sprintf("s%d", i), "u1")
+		s.sub(t, "o/x", false)
+		require.Equal(t, "second", s.retained(t, "o/x"))
+	}
 }

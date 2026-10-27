@@ -610,7 +610,7 @@ func (b *Broker) sendWill(ctx context.Context, tenantID, rawID string, w *cluste
 	}
 
 	if w.QoS == 0 {
-		if err := n.Router.Publish(tenantID, w.Topic, w.Payload, w.Props); err != nil {
+		if err := n.Router.Publish(tenantID, w.Topic, w.Payload, w.Props, w.Retain); err != nil {
 			n.routeErrors.Add(1)
 
 			return err

@@ -56,7 +56,7 @@ type route struct {
 type Router struct {
 	c       *Conn
 	nodeID  string
-	deliver func(tenant, topic string, payload []byte, props Props)
+	deliver func(tenant, topic string, payload []byte, props Props, retain bool)
 	dedup   *dedup
 	counter atomic.Uint64
 
@@ -86,8 +86,8 @@ type Router struct {
 // other subjects in its stripe (a subscription whose backlog passes the
 // nats.go pending limits drops messages: QoS 0 allows that). Keep deliver
 // short: hand the message to the broker's own queues and return. payload and
-// props belong to deliver.
-func NewRouter(c *Conn, nodeID string, deliver func(tenant, topic string, payload []byte, props Props)) *Router {
+// props belong to deliver. retain is the publish's retain flag.
+func NewRouter(c *Conn, nodeID string, deliver func(tenant, topic string, payload []byte, props Props, retain bool)) *Router {
 	r := &Router{
 		c:       c,
 		nodeID:  nodeID,
@@ -334,11 +334,13 @@ func (r *Router) Close() {
 }
 
 // Publish sends one QoS 0 message to the cell: one core NATS publish on
-// subject.QoS0(tenant, topic), with a Tether-Id header and props in headers. It
-// does not wait for anyone; a message nobody has interest in is dropped by NATS.
+// subject.QoS0(tenant, topic), with a Tether-Id header, props in headers and,
+// for a retained publish, Tether-Retain: 1 (receivers hand it to deliver, so
+// a Retain As Published subscription can see the flag). It does not wait for
+// anyone; a message nobody has interest in is dropped by NATS.
 // topic must be a topic name (no wildcards) within the size limit and tenant
 // non-empty, or the error wraps tether.ErrInvalidInput.
-func (r *Router) Publish(tenant, topic string, payload []byte, props Props) error {
+func (r *Router) Publish(tenant, topic string, payload []byte, props Props, retain bool) error {
 	if tenant == "" {
 		return invalidInput("empty tenant")
 	}
@@ -367,6 +369,10 @@ func (r *Router) Publish(tenant, topic string, payload []byte, props Props) erro
 	h := make(nats.Header, 2)
 	h.Set(hdrID, r.nodeID+":"+strconv.FormatUint(r.counter.Add(1), 10))
 	props.encode(h)
+
+	if retain {
+		h.Set(hdrRetain, "1")
+	}
 
 	if err := r.c.nc.PublishMsg(&nats.Msg{Subject: subj, Header: h, Data: payload}); err != nil {
 		return wrapNATS("publish", err)
@@ -412,7 +418,7 @@ func (r *Router) onMessage(m *nats.Msg) {
 		props = Props{}
 	}
 
-	r.deliver(tenant, topic, m.Data, props)
+	r.deliver(tenant, topic, m.Data, props, m.Header.Get(hdrRetain) == "1")
 }
 
 // stripe picks the order lock of a subject (FNV-1a).

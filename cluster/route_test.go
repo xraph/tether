@@ -21,6 +21,7 @@ type routed struct {
 	tenant, topic string
 	payload       string
 	props         Props
+	retain        bool
 }
 
 // sink collects what a Router's deliver callback is given.
@@ -33,13 +34,13 @@ type sink struct {
 	pause atomic.Pointer[func(payload string)]
 }
 
-func (s *sink) deliver(tenant, topic string, payload []byte, props Props) {
+func (s *sink) deliver(tenant, topic string, payload []byte, props Props, retain bool) {
 	if p := s.pause.Load(); p != nil {
 		(*p)(string(payload))
 	}
 
 	s.mu.Lock()
-	s.msgs = append(s.msgs, routed{tenant, topic, string(payload), props})
+	s.msgs = append(s.msgs, routed{tenant, topic, string(payload), props, retain})
 	s.mu.Unlock()
 }
 
@@ -149,7 +150,7 @@ func ready(t *testing.T, a, b *routeNode) {
 			t.Fatal("interest did not reach the publisher's server")
 		}
 
-		if err := a.r.Publish(tenant, "p", nil, Props{}); err != nil {
+		if err := a.r.Publish(tenant, "p", nil, Props{}, false); err != nil {
 			t.Fatal(err)
 		}
 
@@ -168,7 +169,7 @@ func mustSub(t *testing.T, n *routeNode, tenant, filter string) {
 func mustPub(t *testing.T, n *routeNode, tenant, topic, payload string) {
 	t.Helper()
 
-	if err := n.r.Publish(tenant, topic, []byte(payload), Props{}); err != nil {
+	if err := n.r.Publish(tenant, topic, []byte(payload), Props{}, false); err != nil {
 		t.Fatalf("publish %s %q: %v", tenant, topic, err)
 	}
 }
@@ -203,7 +204,7 @@ func TestRouteAcrossNodes(t *testing.T) {
 		}
 	}
 
-	want := []routed{{"t1", "sensors/1/temp", "21.5", Props{}}, {"t1", "sensors/1/temp", "again", Props{}}}
+	want := []routed{{"t1", "sensors/1/temp", "21.5", Props{}, false}, {"t1", "sensors/1/temp", "again", Props{}, false}}
 	if !reflect.DeepEqual(seen, want) {
 		t.Fatalf("deliveries = %+v, want %+v", seen, want)
 	}
@@ -459,7 +460,7 @@ func TestRouteProps(t *testing.T) {
 		PayloadFormat:   &format,
 	}
 
-	if err := a.r.Publish("t1", "p/1", []byte("body"), props); err != nil {
+	if err := a.r.Publish("t1", "p/1", []byte("body"), props, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -470,8 +471,21 @@ func TestRouteProps(t *testing.T) {
 			continue
 		}
 
-		if !reflect.DeepEqual(m.props, props) || m.payload != "body" {
-			t.Fatalf("delivered %+v, want props %+v", m, props)
+		if !reflect.DeepEqual(m.props, props) || m.payload != "body" || m.retain {
+			t.Fatalf("delivered %+v, want props %+v and no retain flag", m, props)
+		}
+	}
+
+	// The retain flag travels too.
+	if err := a.r.Publish("t1", "p/2", []byte("kept"), Props{}, true); err != nil {
+		t.Fatal(err)
+	}
+
+	b.sink.waitCount(t, "t1", "p/2", 1)
+
+	for _, m := range b.sink.all() {
+		if m.topic == "p/2" && !m.retain {
+			t.Fatalf("delivered %+v, want the retain flag", m)
 		}
 	}
 }
@@ -562,7 +576,7 @@ func TestRouterInvalidInput(t *testing.T) {
 		{"over the size limit", "t1", long},
 	} {
 		t.Run("publish "+tc.name, func(t *testing.T) {
-			if err := n.r.Publish(tc.tenant, tc.topic, nil, Props{}); !errors.Is(err, tether.ErrInvalidInput) {
+			if err := n.r.Publish(tc.tenant, tc.topic, nil, Props{}, false); !errors.Is(err, tether.ErrInvalidInput) {
 				t.Errorf("Publish = %v, want ErrInvalidInput", err)
 			}
 		})
@@ -587,7 +601,7 @@ func TestRouterClose(t *testing.T) {
 		t.Fatalf("Subscribe after Close = %v, want ErrUnavailable", err)
 	}
 
-	if err := b.r.Publish("t1", "c/1", nil, Props{}); !errors.Is(err, ErrUnavailable) {
+	if err := b.r.Publish("t1", "c/1", nil, Props{}, false); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Publish after Close = %v, want ErrUnavailable", err)
 	}
 
