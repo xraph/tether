@@ -111,11 +111,18 @@ type Control struct {
 	handlers map[string][]func([]byte)
 	started  bool
 	closed   bool
-	run      *controlRun // the running consumer, nil before Start
+	run      *controlRun   // the running consumer, nil before Start
+	quit     chan struct{} // closed by Stop
+	quitOnce sync.Once
 
 	// heartbeat is the idle heartbeat of the consumer's pull requests, 0 for
 	// the nats.go default (5 s). Tests shorten it.
 	heartbeat time.Duration
+	// resetAttempts is the consumer's MaxResetAttempts, 0 for
+	// consumerResetAttempts; stallAfter is how long it may deliver nothing
+	// while the stream holds more, 0 for defaultStallAfter. Tests set them.
+	resetAttempts int
+	stallAfter    time.Duration
 }
 
 // NewControl returns the control bus of the cell cfg describes, over c. The
@@ -127,6 +134,7 @@ func NewControl(c *Conn, cfg Config) *Control {
 		stream:   cfg.ControlStream(),
 		logger:   c.logger.With("control", cfg.ControlStream()),
 		handlers: make(map[string][]func([]byte)),
+		quit:     make(chan struct{}),
 	}
 }
 
@@ -201,6 +209,10 @@ func (c *Control) wrapErr(op string, err error) error {
 // Start creates the node's consumer, at the end of the control stream, and
 // starts handing events to the handlers. The consumer exists on the server
 // when Start returns, so an event published after that reaches this node.
+// When the consumer fails for good (it cannot be recreated, or it delivers
+// nothing for a while although the stream holds more) the bus logs it at
+// Error and starts a new consumer from the event after the last one handled,
+// retrying with backoff until Stop, so no event is skipped.
 // ctx bounds the start only (10 s when it has no deadline). Once only: a
 // second call is an error, unless the first one failed. After Stop it fails
 // with an error wrapping ErrUnavailable.
@@ -224,7 +236,7 @@ func (c *Control) Start(ctx context.Context) error {
 	ctx, cancel := opContext(ctx)
 	defer cancel()
 
-	r, err := c.open(ctx)
+	r, err := c.open(ctx, 0)
 	if err != nil {
 		c.mu.Lock()
 		c.started = false
@@ -248,32 +260,100 @@ func (c *Control) Start(ctx context.Context) error {
 	c.run = r
 	c.mu.Unlock()
 
-	go r.loop(context.WithoutCancel(ctx))
+	go c.serve(r)
 
 	return nil
 }
 
-func (c *Control) open(ctx context.Context) (*controlRun, error) {
+// serve runs r and, each time its consumer ends without a Stop, starts a new
+// one from the event after the last handled.
+func (c *Control) serve(r *controlRun) {
+	for {
+		err := r.loop()
+
+		if r.stopped.Load() && !r.stalled.Load() {
+			return
+		}
+
+		c.logger.Error("control bus: consumer ended by itself, restarting it", "after", r.last.Load(), "error", err)
+
+		if r = c.reopen(r.last.Load() + 1); r == nil {
+			return
+		}
+	}
+}
+
+// reopen makes the consumer that goes on from start, retrying with backoff,
+// and installs it. nil after Stop.
+func (c *Control) reopen(start uint64) *controlRun {
+	delay := consumerRetry
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), opTimeout)
+		r, err := c.open(ctx, start)
+
+		cancel()
+
+		if err == nil {
+			c.mu.Lock()
+
+			if c.closed {
+				c.mu.Unlock()
+				r.halt()
+				r.cleanup(context.Background())
+
+				return nil
+			}
+
+			c.run = r
+			c.mu.Unlock()
+
+			return r
+		}
+
+		c.logger.Error("control bus: restarting the consumer failed", "from", start, "error", err)
+
+		select {
+		case <-c.quit:
+			return nil
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, watchRetryMax)
+	}
+}
+
+// open makes a consumer that reads from start, or from the end of the stream
+// when start is 0.
+func (c *Control) open(ctx context.Context, start uint64) (*controlRun, error) {
 	st, err := c.c.js.Stream(ctx, c.stream)
 	if err != nil {
 		return nil, c.wrapErr("control bus: open stream", err)
 	}
 
-	info, err := st.Info(ctx)
-	if err != nil {
-		return nil, c.wrapErr("control bus: stream info", err)
+	if start == 0 {
+		info, ierr := st.Info(ctx)
+		if ierr != nil {
+			return nil, c.wrapErr("control bus: stream info", ierr)
+		}
+
+		// An explicit start sequence and not "new": the ordered consumer may
+		// be recreated before its first message, and "new" would then mean
+		// new as of the recreation.
+		start = info.State.LastSeq + 1
 	}
 
-	// An explicit start sequence and not "new": the ordered consumer may be
-	// recreated before its first message, and "new" would then mean new as of
-	// the recreation.
-	start := info.State.LastSeq + 1
+	resets := c.resetAttempts
+	if resets == 0 {
+		resets = consumerResetAttempts
+	}
 
 	cons, err := st.OrderedConsumer(ctx, jetstream.OrderedConsumerConfig{
 		FilterSubjects:    []string{ctlPrefix + ">"},
 		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:       start,
 		InactiveThreshold: readerInactive,
+		MaxResetAttempts:  resets,
 	})
 	if err != nil {
 		return nil, c.wrapErr("control bus: create consumer", err)
@@ -286,7 +366,8 @@ func (c *Control) open(ctx context.Context) (*controlRun, error) {
 		msgs, err = cons.Messages()
 	}
 
-	r := &controlRun{c: c, st: st, cons: cons, msgs: msgs, last: start - 1, stop: make(chan struct{})}
+	r := &controlRun{c: c, st: st, cons: cons, msgs: msgs, stop: make(chan struct{}), stall: newStallWatch(c.stallAfter)}
+	r.last.Store(start - 1)
 
 	if err != nil {
 		go r.cleanup(context.WithoutCancel(ctx))
@@ -311,6 +392,8 @@ func (c *Control) Stop() {
 	c.run = nil
 	c.mu.Unlock()
 
+	c.quitOnce.Do(func() { close(c.quit) })
+
 	if r != nil {
 		r.halt()
 	}
@@ -318,19 +401,22 @@ func (c *Control) Stop() {
 
 // controlRun is the running consumer of a Control.
 type controlRun struct {
-	c    *Control
-	st   jetstream.Stream
-	cons jetstream.Consumer
-	msgs jetstream.MessagesContext
-	last uint64 // the stream sequence of the last event handled, run goroutine only
-	stop chan struct{}
-	once sync.Once
+	c     *Control
+	st    jetstream.Stream
+	cons  jetstream.Consumer
+	msgs  jetstream.MessagesContext
+	last  atomic.Uint64 // the stream sequence of the last event handled; moves under fnMu
+	stop  chan struct{}
+	once  sync.Once
+	stall *stallWatch
 
 	// fnMu is held while handlers run. halt sets stopped first and then
 	// takes fnMu, so it waits for handlers that are running and none start
-	// after it.
+	// after it, and last is final. stalled says the stall watch halted it,
+	// not Stop.
 	fnMu    sync.Mutex
 	stopped atomic.Bool
+	stalled atomic.Bool
 }
 
 // halt stops handing events to handlers and shuts the iterator down in the
@@ -349,10 +435,18 @@ func (r *controlRun) halt() {
 	})
 }
 
-// loop reads events until the iterator stops, then deletes the consumer with
-// ctx (which must not end with Start).
-func (r *controlRun) loop(ctx context.Context) {
-	defer r.cleanup(ctx)
+// loop reads events until the run is halted, which returns nil, or the
+// iterator fails, which returns the error (see Log.pump), then deletes the
+// consumer.
+func (r *controlRun) loop() error {
+	defer r.cleanup(context.Background())
+
+	ended := make(chan struct{})
+	defer close(ended)
+
+	r.stall.progress()
+
+	go r.stall.run(r.stop, ended, r.behind, r.onStall)
 
 	for {
 		msg, err := r.msgs.Next()
@@ -362,24 +456,39 @@ func (r *controlRun) loop(ctx context.Context) {
 			continue
 		}
 
-		if errors.Is(err, jetstream.ErrMsgIteratorClosed) {
-			return
-		}
-
 		select {
 		case <-r.stop:
-			return
+			return nil
 		default:
 		}
 
-		r.c.logger.Warn("control bus consumer error", "error", err)
+		// The iterator is finished; release it. No handler runs after this
+		// loop, so last is final.
+		go r.msgs.Stop()
 
-		select {
-		case <-r.stop:
-			return
-		case <-time.After(consumerRetry):
-		}
+		return err
 	}
+}
+
+// behind is the stall watch's question: the stream's last sequence (every
+// message of the control stream is an event) and the last event handled.
+func (r *controlRun) behind(ctx context.Context) (want, at uint64, err error) {
+	info, err := r.st.Info(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return info.State.LastSeq, r.last.Load(), nil
+}
+
+// onStall halts a run whose consumer has delivered nothing for stallAfter
+// while the stream holds events up to want, past the last one handled; serve
+// then starts a new consumer from there.
+func (r *controlRun) onStall(want, at uint64) {
+	r.c.logger.Error("control bus stalled: its consumer delivered nothing while the stream holds more; replacing it",
+		"last_handled", at, "stream_last", want, "quiet", r.stall.quiet().Round(time.Millisecond))
+	r.stalled.Store(true)
+	r.halt()
 }
 
 // cleanup deletes the consumer on the server, best effort: the server would
@@ -399,6 +508,9 @@ func (r *controlRun) cleanup(ctx context.Context) {
 }
 
 func (r *controlRun) handle(msg jetstream.Msg) {
+	r.stall.progress()
+	defer r.stall.progress()
+
 	md, err := msg.Metadata()
 	if err != nil {
 		r.c.logger.Warn("control bus: event without metadata", "error", err)
@@ -406,20 +518,31 @@ func (r *controlRun) handle(msg jetstream.Msg) {
 		return
 	}
 
-	// The ordered consumer never hands an event out twice, but a sequence at
-	// or below the last one would be a repeat, and each event runs once.
 	seq := md.Sequence.Stream
-	if seq <= r.last {
-		return
-	}
-
-	r.last = seq
-
 	kind := strings.TrimPrefix(msg.Subject(), ctlPrefix)
 
 	r.c.mu.Lock()
 	fns := slices.Clone(r.c.handlers[kind])
 	r.c.mu.Unlock()
+
+	data := msg.Data()
+
+	r.fnMu.Lock()
+	defer r.fnMu.Unlock()
+
+	// After a halt nothing runs and last stays where it is, so a new run
+	// starts at the first event this one did not handle.
+	if r.stopped.Load() {
+		return
+	}
+
+	// The ordered consumer never hands an event out twice, but a sequence at
+	// or below the last one would be a repeat, and each event runs once.
+	if seq <= r.last.Load() {
+		return
+	}
+
+	r.last.Store(seq)
 
 	if len(fns) == 0 {
 		r.c.logger.Debug("control bus: no handler for event", "kind", kind, "seq", seq)
@@ -427,14 +550,8 @@ func (r *controlRun) handle(msg jetstream.Msg) {
 		return
 	}
 
-	data := msg.Data()
-
-	r.fnMu.Lock()
-	defer r.fnMu.Unlock()
-
-	if r.stopped.Load() {
-		return
-	}
+	r.stall.busy.Store(true)
+	defer r.stall.busy.Store(false)
 
 	for _, fn := range fns {
 		fn(data)

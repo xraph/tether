@@ -7,6 +7,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
 
@@ -115,7 +116,10 @@ func (l *Log) join(tenant string, w *waiter) (r *replayer, created bool) {
 		}
 	}
 
-	r = &replayer{l: l, tenant: tenant, start: w.from, pos: w.from - 1, waiters: []*waiter{w}, stop: make(chan struct{})}
+	r = &replayer{
+		l: l, tenant: tenant, start: w.from, pos: w.from - 1, waiters: []*waiter{w}, stop: make(chan struct{}),
+		stall: newStallWatch(l.stallAfter),
+	}
 	l.replayers[tenant] = append(l.replayers[tenant], r)
 
 	return r, true
@@ -201,6 +205,8 @@ type replayer struct {
 	waiters []*waiter
 	closed  bool
 	msgs    jetstream.MessagesContext
+
+	stall *stallWatch
 }
 
 // tryJoin adds w if the consumer will still read every message of w's range.
@@ -244,10 +250,49 @@ func (r *replayer) run() {
 	// tell it so.
 	r.checkEmpty(cons)
 
-	r.l.pump(msgs, r.stop, r.handle)
+	ended := make(chan struct{})
+	defer close(ended)
 
-	// If the iterator ended with calls still waiting, the connection is gone.
-	r.shutdown(fmt.Errorf("cluster: replay: %w: log consumer ended", ErrUnavailable))
+	r.stall.progress()
+
+	go r.stall.run(r.stop, ended, r.behind, r.stalled)
+
+	if err := r.l.pump(msgs, r.stop, r.handle); err != nil {
+		// The consumer failed and will not mend itself (a closed connection,
+		// a recreate that did not work): the calls still waiting get the
+		// error and try again on a new consumer.
+		r.l.logger.Warn("log replay ended: its consumer failed", "tenant", r.tenant, "error", err)
+		r.shutdown(fmt.Errorf("cluster: replay: %w: log consumer failed: %w", ErrUnavailable, err))
+	}
+
+	// Otherwise stop closed, which only closeLocked does: the calls are
+	// settled already.
+}
+
+// behind is the stall watch's question: the furthest sequence a waiting call
+// still needs, and the last one handed out. Every call's range ends at or
+// below the tenant's last message when the call started, so a sequence still
+// needed is in the log (unless it aged out, and then the calls are better
+// ended too).
+func (r *replayer) behind(context.Context) (want, at uint64, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, w := range r.waiters {
+		if !w.fin.Load() {
+			want = max(want, w.to)
+		}
+	}
+
+	return want, r.pos, nil
+}
+
+// stalled ends the calls of a consumer that has handed out nothing for
+// stallAfter while they still need messages up to want.
+func (r *replayer) stalled(want, at uint64) {
+	r.l.logger.Error("log replay stalled: its consumer delivered nothing while calls wait for more; ending them",
+		"tenant", r.tenant, "position", at, "wanted", want, "quiet", r.stall.quiet().Round(time.Millisecond))
+	r.shutdown(fmt.Errorf("cluster: replay: %w: log consumer stalled at seq %d of %d", ErrUnavailable, at, want))
 }
 
 func (r *replayer) open() (jetstream.Consumer, jetstream.MessagesContext, error) {
@@ -337,6 +382,12 @@ func (r *replayer) settle() {
 }
 
 func (r *replayer) handle(m jetstream.Msg) {
+	r.stall.progress()
+	defer r.stall.progress()
+
+	r.stall.busy.Store(true)
+	defer r.stall.busy.Store(false)
+
 	md, err := m.Metadata()
 	if err != nil {
 		r.l.logger.Warn("log replay: message without metadata", "tenant", r.tenant, "error", err)

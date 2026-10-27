@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/xraph/tether"
@@ -21,8 +23,8 @@ const (
 	// replayInactive is the same for a replay's consumer, which is short
 	// lived and deleted explicitly when it finishes.
 	replayInactive = 30 * time.Second
-	// consumerRetry is how long a read loop waits after an error that the
-	// ordered consumer did not recover from by itself.
+	// consumerRetry is how long a watch or pull loop first waits before it
+	// tries again after an error.
 	consumerRetry = 200 * time.Millisecond
 	// cleanupWait bounds the delete of a finished consumer.
 	cleanupWait = 5 * time.Second
@@ -35,18 +37,21 @@ const (
 // drops or a message is missed, the consumer recreates itself from the last
 // sequence it saw, so fn still sees every message once and in order.
 type Reader struct {
-	l      *Log
-	tenant string
-	cons   jetstream.Consumer
-	msgs   jetstream.MessagesContext
-	fn     func(LogMessage) error
-	pos    atomic.Uint64
-	stop   chan struct{}
-	done   chan struct{}
-	once   sync.Once
+	l        *Log
+	tenant   string
+	cons     jetstream.Consumer
+	msgs     jetstream.MessagesContext
+	fn       func(LogMessage) error
+	pos      atomic.Uint64
+	stop     chan struct{}
+	done     chan struct{}
+	once     sync.Once
+	doneOnce sync.Once
+	stall    *stallWatch
 
-	// fnMu is held while fn runs. Stop takes it to set stopped, which is how
-	// it knows fn is not running and will not run again.
+	// fnMu is held while fn runs and while Position moves. Stop takes it to
+	// set stopped, which is how it knows fn is not running and will not run
+	// again, and that Position is final.
 	fnMu    sync.Mutex
 	stopped bool
 }
@@ -56,6 +61,13 @@ type Reader struct {
 // of the tenant's with a sequence of fromSeq or more. The consumer exists on
 // the server when Reader returns, so a message appended after that is not
 // missed.
+//
+// A reader never stalls silently. When its consumer cannot be recreated
+// (nats.go gets one attempt per recovery, consumerResetAttempts) the reader
+// ends, logging the cause at Error, and so it does when it has delivered
+// nothing for a while (Log.stallAfter, 30 s) although the log holds messages
+// of the tenant past its Position. Either way Done closes and the owner starts
+// a new reader from Position()+1, on a new consumer.
 //
 // fn runs on the reader's one goroutine, one message at a time, so a slow fn
 // slows the reader and nothing else. When fn returns an error the reader logs
@@ -111,10 +123,12 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 	r := &Reader{
 		l: l, tenant: tenant, cons: cons, msgs: msgs, fn: fn,
 		stop: make(chan struct{}), done: make(chan struct{}),
+		stall: newStallWatch(l.stallAfter),
 	}
 	r.pos.Store(start - 1)
 
 	go r.run()
+	go r.stall.run(r.stop, r.done, r.behind, r.stalled)
 
 	return r, nil
 }
@@ -147,21 +161,58 @@ func (r *Reader) Stop() {
 	})
 }
 
-// Done is closed when the reader's loop has exited, for any reason: Stop, a
-// closed connection, or an iterator that ended by itself. A reader whose Done
-// closed without a Stop delivers nothing more; start a new one from
-// Position()+1 to go on where it left off. The consumer's cleanup may still be
-// running when Done closes.
+// Done is closed when the reader delivers nothing more and Position is final:
+// after Stop, once the loop has exited, and by itself when the reader ended
+// because its consumer failed (a closed connection, a recreate that did not
+// work) or stalled. A reader whose Done closed without a Stop delivers nothing
+// more; start a new one from Position()+1 to go on where it left off. The
+// consumer's cleanup may still be running when Done closes.
 func (r *Reader) Done() <-chan struct{} { return r.done }
+
+func (r *Reader) closeDone() { r.doneOnce.Do(func() { close(r.done) }) }
 
 func (r *Reader) run() {
 	defer r.l.dropConsumer(r.cons)
-	defer close(r.done)
+	defer r.closeDone()
 
-	r.l.pump(r.msgs, r.stop, r.handle)
+	err := r.l.pump(r.msgs, r.stop, r.handle)
+	if err == nil {
+		return
+	}
+
+	// The consumer failed and will not mend itself. End the reader, so its
+	// owner starts a new one on a new consumer.
+	level := slog.LevelError
+	if errors.Is(err, nats.ErrConnectionClosed) {
+		level = slog.LevelWarn
+	}
+
+	r.l.logger.Log(context.Background(), level, "log reader ended: its consumer failed",
+		"tenant", r.tenant, "position", r.Position(), "error", err)
+	r.Stop()
+}
+
+// behind is the stall watch's question: the tenant's last sequence in the log
+// and the reader's position.
+func (r *Reader) behind(ctx context.Context) (want, at uint64, err error) {
+	want, err = r.l.lastTenantSeq(ctx, r.tenant)
+
+	return want, r.Position(), err
+}
+
+// stalled ends a reader whose consumer has delivered nothing for stallAfter
+// while the log holds the tenant's messages up to want, past its position at.
+func (r *Reader) stalled(want, at uint64) {
+	r.l.logger.Error("log reader stalled: its consumer delivered nothing while the log holds more of the tenant; ending it",
+		"tenant", r.tenant, "position", at, "log_last", want, "quiet", r.stall.quiet().Round(time.Millisecond))
+	r.Stop()
+	r.closeDone()
 }
 
 func (r *Reader) handle(msg jetstream.Msg) {
+	r.stall.progress()
+	defer r.stall.progress()
+
 	md, err := msg.Metadata()
 	if err != nil {
 		r.l.logger.Warn("log reader: message without metadata", "tenant", r.tenant, "error", err)
@@ -174,34 +225,38 @@ func (r *Reader) handle(msg jetstream.Msg) {
 	lm, err := decodeLogMessage(msg.Subject(), msg.Headers(), msg.Data())
 	if err != nil {
 		r.l.logger.Warn("log reader: skipping an entry that does not decode", "tenant", r.tenant, "seq", seq, "error", err)
-		r.advance(seq)
+		r.call(nil, seq)
 
 		return
 	}
 
 	lm.Seq = seq
 
-	if !r.call(lm) {
-		return
-	}
-
-	r.advance(seq)
+	r.call(&lm, seq)
 }
 
-// call runs fn for lm unless the reader has been stopped, which it reports.
-func (r *Reader) call(lm LogMessage) bool {
+// call runs fn for lm (nil for an entry that is skipped) and moves the
+// position to seq, unless the reader has been stopped. Both happen under
+// fnMu, so the position is final once Stop holds it.
+func (r *Reader) call(lm *LogMessage, seq uint64) {
 	r.fnMu.Lock()
 	defer r.fnMu.Unlock()
 
 	if r.stopped {
-		return false
+		return
 	}
 
-	if err := r.fn(lm); err != nil {
-		r.l.logger.Warn("log reader: handler failed, going on to the next entry", "tenant", r.tenant, "seq", lm.Seq, "error", err)
+	if lm != nil {
+		r.stall.busy.Store(true)
+
+		if err := r.fn(*lm); err != nil {
+			r.l.logger.Warn("log reader: handler failed, going on to the next entry", "tenant", r.tenant, "seq", lm.Seq, "error", err)
+		}
+
+		r.stall.busy.Store(false)
 	}
 
-	return true
+	r.advance(seq)
 }
 
 func (r *Reader) advance(seq uint64) {
@@ -226,6 +281,7 @@ func (l *Log) consumer(ctx context.Context, tenant string, start uint64, inactiv
 		DeliverPolicy:     jetstream.DeliverByStartSequencePolicy,
 		OptStartSeq:       start,
 		InactiveThreshold: inactive,
+		MaxResetAttempts:  l.maxResets(),
 	})
 	if err != nil {
 		return nil, l.wrapErr("create log consumer", err)
@@ -266,10 +322,22 @@ func (l *Log) dropConsumer(cons jetstream.Consumer) {
 	}
 }
 
-// pump hands every message of msgs to handle until msgs is stopped or stop is
-// closed. An error from the iterator that the ordered consumer did not mend
-// itself is logged and retried.
-func (l *Log) pump(msgs jetstream.MessagesContext, stop <-chan struct{}, handle func(jetstream.Msg)) {
+// maxResets is the MaxResetAttempts of the log's ordered consumers.
+func (l *Log) maxResets() int {
+	if l.resetAttempts != 0 {
+		return l.resetAttempts
+	}
+
+	return consumerResetAttempts
+}
+
+// pump hands every message of msgs to handle until stop is closed, which
+// returns nil, or the iterator fails, which returns the error. The ordered
+// consumer mends what it can inside Next (a missed heartbeat, a gap, a
+// reconnect) by recreating itself; an error that reaches pump means that
+// failed, and the iterator is finished: retrying Next would only report it
+// closed. The caller ends and makes a new consumer.
+func (l *Log) pump(msgs jetstream.MessagesContext, stop <-chan struct{}, handle func(jetstream.Msg)) error {
 	for {
 		msg, err := msgs.Next()
 		if err == nil {
@@ -278,22 +346,12 @@ func (l *Log) pump(msgs jetstream.MessagesContext, stop <-chan struct{}, handle 
 			continue
 		}
 
-		if errors.Is(err, jetstream.ErrMsgIteratorClosed) {
-			return
-		}
-
 		select {
 		case <-stop:
-			return
+			return nil
 		default:
 		}
 
-		l.logger.Warn("log consumer error", "error", err)
-
-		select {
-		case <-stop:
-			return
-		case <-time.After(consumerRetry):
-		}
+		return err
 	}
 }

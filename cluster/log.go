@@ -94,6 +94,14 @@ type Log struct {
 	// replays, 0 for the nats.go default (5 s, so a dead server is noticed
 	// after about 10 s). Tests shorten it.
 	heartbeat time.Duration
+	// resetAttempts is the MaxResetAttempts of the ordered consumers of
+	// readers and replays, 0 for consumerResetAttempts. Tests set -1, nats.go's
+	// endless loop, to reproduce a stall.
+	resetAttempts int
+	// stallAfter is how long a reader or replay consumer may deliver nothing
+	// while the log holds more for it before it is ended, 0 for
+	// defaultStallAfter. Tests shorten it.
+	stallAfter time.Duration
 
 	// onAppend is the OnAppend observer, nil for none.
 	onAppend atomic.Pointer[func(time.Duration)]
@@ -197,6 +205,34 @@ func (l *Log) Append(ctx context.Context, msg LogMessage, msgID string) (seq uin
 	}
 
 	return p.Wait(ctx)
+}
+
+// Ping reports whether the log stream has a leader that answers, which is
+// what an append needs to commit: it asks for the stream's info, which only
+// the leader answers (or, while the stream has none, a member that says so).
+// nil means yes. No answer, or no leader, is an error wrapping
+// ErrUnavailable. A context without a deadline gets 10 s. The broker uses it
+// to learn that the log is back after an outage without sending appends into
+// it.
+func (l *Log) Ping(ctx context.Context) error {
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	st, err := l.stream(ctx)
+	if err != nil {
+		return err
+	}
+
+	info, err := st.Info(ctx)
+	if err != nil {
+		return l.wrapErr("ping", err)
+	}
+
+	if info.Cluster != nil && info.Cluster.Leader == "" {
+		return fmt.Errorf("cluster: ping: %w: the log stream has no leader", ErrUnavailable)
+	}
+
+	return nil
 }
 
 // PendingAppend is an append that has been sent and not yet acknowledged.

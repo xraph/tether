@@ -574,18 +574,42 @@ func (m *Members) watchLoop(w jetstream.KeyWatcher, ready chan<- struct{}) {
 	signalled := false
 
 	for {
+		if !m.readWatch(w, ready, &signalled) {
+			return
+		}
+
+		// nats.go ended the watch's subscription (a consumer it could not
+		// recreate). Without a watch this node would hear nobody, including
+		// itself, and never declare a peer dead, so start a new one. Its first
+		// pass replays every key, which observe takes as replays.
+		m.logger.Error("members watch ended by itself, restarting it")
+
+		if err := w.Stop(); err != nil {
+			m.logger.Debug("stopping the ended members watcher", "error", err)
+		}
+
+		if w = m.rewatch(); w == nil {
+			return
+		}
+	}
+}
+
+// readWatch applies w's updates until its channel closes, which returns true,
+// or Members stops, which returns false.
+func (m *Members) readWatch(w jetstream.KeyWatcher, ready chan<- struct{}, signalled *bool) bool {
+	for {
 		select {
 		case <-m.ctx.Done():
-			return
+			return false
 		case e, ok := <-w.Updates():
 			if !ok {
-				return
+				return m.ctx.Err() == nil
 			}
 
 			if e == nil {
 				// nil marks the end of the entries that existed at the start.
-				if !signalled {
-					signalled = true
+				if !*signalled {
+					*signalled = true
 
 					close(ready)
 				}
@@ -595,6 +619,33 @@ func (m *Members) watchLoop(w jetstream.KeyWatcher, ready chan<- struct{}) {
 
 			m.observe(e)
 		}
+	}
+}
+
+// rewatch opens a new watch of the bucket, retrying with backoff until it
+// works or Members stops (nil).
+func (m *Members) rewatch() jetstream.KeyWatcher {
+	delay := consumerRetry
+
+	for {
+		w, err := m.kv.WatchAll(m.ctx)
+		if err == nil {
+			m.mu.Lock()
+			m.watcher = w
+			m.mu.Unlock()
+
+			return w
+		}
+
+		m.logger.Error("restarting the members watch failed", "error", err)
+
+		select {
+		case <-m.ctx.Done():
+			return nil
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, watchRetryMax)
 	}
 }
 

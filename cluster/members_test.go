@@ -531,3 +531,37 @@ func TestFenceOnClosedConnection(t *testing.T) {
 		t.Fatalf("fenced after %v", got)
 	}
 }
+
+// A members watch whose subscription closes under it (nats.go ends a KV
+// watcher whose consumer it cannot recreate) is started again. Before, the
+// loop returned silently: the node never heard a peer join and, with its own
+// heartbeat unseen, never declared one dead.
+func TestMembersWatchRestarts(t *testing.T) {
+	cell := startMemberCell(t)
+	a := cell.nodeOn(t, "n1", 0)
+	b := cell.nodeOn(t, "n2", 1)
+
+	eventually(t, 5*time.Second, "A to see B", liveIs(a.m, "n1", "n2"))
+
+	a.m.mu.Lock()
+	w := a.m.watcher
+	a.m.mu.Unlock()
+
+	if err := w.Stop(); err != nil {
+		t.Fatal(err)
+	}
+
+	cell.nodeOn(t, "n3", 2)
+
+	eventually(t, 10*time.Second, "A to see C join after its watch ended", liveIs(a.m, "n1", "n2", "n3"))
+
+	b.m.Stop()
+
+	eventually(t, testDeadAfter+5*time.Second, "OnPeerDead(n2) on A", func() bool {
+		return len(a.ev.deadEvents("n2")) > 0
+	})
+
+	if len(a.ev.fenceTimes()) != 0 {
+		t.Fatal("A was fenced")
+	}
+}
