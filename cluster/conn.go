@@ -146,6 +146,15 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 
 	logger.Info("cluster connected", "mode", cfg.Mode, "replicas", c.replicas, "url", nc.ConnectedUrlRedacted())
 
+	if cfg.Replicas == 0 && c.replicas < maxReplicas && clustered(cfg, nc) {
+		// A NATS cluster that advertises nothing (no_advertise, or one URL
+		// in front of a load balancer), or a seed-only route list, counts
+		// fewer servers than it has. Provision never lowers what a stream
+		// already has, but a fresh cell would get this count.
+		logger.Warn("cluster: automatic replica count is below 3 on a clustered nats; set cluster.replicas if the cluster has more servers",
+			"replicas", c.replicas, "discovered", len(nc.DiscoveredServers()))
+	}
+
 	return c, nil
 }
 
@@ -258,10 +267,14 @@ func (c *Conn) waitJetStream(ctx context.Context) error {
 //
 // An explicit Config.Replicas wins. Otherwise the answer is min(3, servers):
 // in embedded mode the servers are this one plus its routes, and in external
-// mode they are the servers the client knows about (the ones it connected to
-// plus the ones the cluster advertised), or one when the server reports no
-// cluster name. A deployment that advertises nothing and runs fewer than three
-// servers should set Replicas.
+// mode they are the servers the client knows about (the URLs it was given,
+// or the one it connected to plus the ones the cluster advertised), or one
+// when the server reports no cluster name. Both can count too few: a server
+// that advertises nothing (no_advertise, or one URL in front of a load
+// balancer) makes a cluster of any size count as one, and an embedded node
+// given only a seed route counts two. Connect warns when a clustered NATS
+// counts under three; set Replicas then. Provision never lowers the count of
+// a stream that already has more.
 func replicasFor(cfg Config, nc *nats.Conn) int {
 	if cfg.Replicas > 0 {
 		return cfg.Replicas
@@ -277,6 +290,16 @@ func replicasFor(cfg Config, nc *nats.Conn) int {
 	}
 
 	return max(1, min(maxReplicas, n))
+}
+
+// clustered reports whether the node's NATS is a cluster: an embedded
+// server with a cluster name, or a server that reports one.
+func clustered(cfg Config, nc *nats.Conn) bool {
+	if cfg.Mode == ModeEmbedded {
+		return cfg.Embedded.ClusterName != ""
+	}
+
+	return nc.ConnectedClusterName() != ""
 }
 
 // remaining is the time left on ctx, or connectWait without a deadline.

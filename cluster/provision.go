@@ -52,8 +52,11 @@ const (
 //   - tether-retained-<cell>: limit markers, LimitMarkerTTL 1 minute.
 //   - tether-members-<cell>: history 1.
 //
-// Every one gets c.Replicas() replicas. The subjects are not namespaced by
-// cell, so two cells cannot share a NATS account.
+// Every one gets c.Replicas() replicas, except that with automatic replicas
+// (Config.Replicas 0) one that exists with more keeps them: a node that
+// counted fewer servers (a seed-only route list, a server that advertises
+// nothing) never scales the cell's streams down. The subjects are not
+// namespaced by cell, so two cells cannot share a NATS account.
 func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.Duration) error {
 	if c == nil {
 		return errors.New("cluster: provision: nil connection")
@@ -89,6 +92,10 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 			Replicas:    replicas,
 			MaxAge:      controlMaxAge,
 		},
+	}
+
+	for i := range streams {
+		streams[i].Replicas = keepReplicas(ctx, c, cfg, streams[i].Name, replicas)
 	}
 
 	for _, sc := range streams {
@@ -128,6 +135,10 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 		},
 	}
 
+	for i := range buckets {
+		buckets[i].Replicas = keepReplicas(ctx, c, cfg, kvStreamPrefix+buckets[i].Bucket, replicas)
+	}
+
 	for _, bc := range buckets {
 		err := retryPlacement(ctx, func(ctx context.Context) error {
 			_, err := c.js.CreateOrUpdateKeyValue(ctx, bc)
@@ -140,6 +151,34 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	}
 
 	return nil
+}
+
+// kvStreamPrefix names the stream behind a KV bucket.
+const kvStreamPrefix = "KV_"
+
+// keepReplicas is the replica count Provision gives the stream named name:
+// want, or with automatic replicas the stream's own count when it exists
+// with more. A stream that cannot be read is given want.
+func keepReplicas(ctx context.Context, c *Conn, cfg Config, name string, want int) int {
+	if cfg.Replicas > 0 {
+		return want
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*placementAttempt)
+	defer cancel()
+
+	st, err := c.js.Stream(ctx, name)
+	if err != nil {
+		return want
+	}
+
+	if have := st.CachedInfo().Config.Replicas; have > want {
+		c.logger.Info("cluster: keeping the replica count a stream already has", "stream", name, "replicas", have, "counted", want)
+
+		return have
+	}
+
+	return want
 }
 
 // retryPlacement runs fn until it stops failing with a placement error or an

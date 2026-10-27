@@ -625,3 +625,58 @@ func TestValidate(t *testing.T) {
 		})
 	}
 }
+
+// A node that counts fewer servers than the cell has (here: pinned to one
+// URL, so it discovers nothing and its automatic count is 1) never scales
+// the cell's existing streams and buckets down when it provisions (A-I3).
+func TestProvisionAutoNeverLowersReplicas(t *testing.T) {
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
+
+	firstCfg := externalConfig(urls)
+	firstCfg.Replicas = 3
+
+	first, err := cluster.Connect(ctxT(t, 20*time.Second), firstCfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(first.Close)
+
+	if err := cluster.Provision(ctxT(t, 30*time.Second), first, firstCfg, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	lateCfg := externalConfig(urls[:1])
+	lateCfg.NodeID = "n2"
+	lateCfg.NoDiscovery = true
+
+	late, err := cluster.Connect(ctxT(t, 20*time.Second), lateCfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(late.Close)
+
+	if late.Replicas() != 1 {
+		t.Fatalf("late node counts %d replicas, want 1 for this test", late.Replicas())
+	}
+
+	if err := cluster.Provision(ctxT(t, 30*time.Second), late, lateCfg, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{
+		firstCfg.LogStream(), firstCfg.ControlStream(),
+		"KV_" + firstCfg.SessionsBucket(), "KV_" + firstCfg.RetainedBucket(), "KV_" + firstCfg.MembersBucket(),
+	} {
+		st, err := first.JS().Stream(ctxT(t, 10*time.Second), name)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got := st.CachedInfo().Config.Replicas; got != 3 {
+			t.Fatalf("%s has %d replicas after the late node provisioned, want 3", name, got)
+		}
+	}
+}
