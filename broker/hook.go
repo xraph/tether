@@ -228,6 +228,15 @@ func (h *hook) authorize(ctx context.Context, cl *mqtt.Client, pk packets.Packet
 			return nil, nil, h.refuse(cl, log, packets.ErrTopicNameInvalid, "invalid will topic", nil)
 		}
 
+		// Ruling R13: in a cell the will goes through the log or the
+		// router, which cap topics at 1024 bytes whatever MaxTopicLength
+		// says.
+		if h.b.cluster != nil {
+			if err := subject.CheckTopic(will); err != nil {
+				return nil, nil, h.refuse(cl, log, packets.ErrTopicNameInvalid, "will topic the cell cannot carry", err)
+			}
+		}
+
 		if !canPublish(g.acl, will) {
 			return nil, nil, h.refuse(cl, log, packets.ErrNotAuthorized, "will topic not granted", nil)
 		}

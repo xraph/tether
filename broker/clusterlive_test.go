@@ -1012,3 +1012,33 @@ func TestClusterHealthAlone(t *testing.T) {
 	require.NoError(t, b.ClusterHealth(t.Context()))
 	require.False(t, errors.Is(b.ClusterHealth(t.Context()), cluster.ErrFenced))
 }
+
+// Ruling R13 at CONNECT: in a cell a will topic over the cell's 1024 byte
+// cap is refused with 0x90, even when the broker's MaxTopicLength allows it
+// (M11).
+func TestClusterWillTopicCapped(t *testing.T) {
+	cfg := testConfig()
+	cfg.MaxTopicLength = 4096
+
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+	c := startClusterWith(t, 1, cfg, map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, nil)
+
+	conn, err := dial(t, c.addr(0))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	cp := &packets.Connect{
+		ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: "long-will", CleanStart: true, KeepAlive: 30,
+		Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+		Properties: &packets.Properties{}, WillProperties: &packets.Properties{},
+		WillFlag: true, WillTopic: strings.Repeat("w", 2000), WillMessage: []byte("gone"),
+	}
+	_, err = cp.WriteTo(conn)
+	require.NoError(t, err)
+
+	ack := readPacket(t, conn)
+	require.Equal(t, packets.CONNACK, ack.Type)
+	require.Equal(t, byte(0x90), ack.Content.(*packets.Connack).ReasonCode)
+}
