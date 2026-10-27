@@ -42,7 +42,7 @@ Most scenarios run the brokers on short timings so a run takes minutes. `TestKil
 | Lease | 3 s | A node fences after 1.5 s without an acknowledged heartbeat, and the cell calls a peer dead after 5 s of silence (lease + 2 s) |
 | Heartbeat and lease in `TestKill9NATSServer` | the defaults, 2 s and 24 s | A node fences after 12 s without a renew, longer than the 4 to 9 s a JetStream election takes |
 | NATS ping interval | 1 s, 3 outstanding | |
-| Slow node delay | 200 ms each way | A heartbeat round trip stays under the 750 ms write timeout (lease / 4), so the slow node never fences |
+| Slow node delay | 200 ms each way | A heartbeat write takes about 400 ms there, and a write may take up to a quarter of the lease (750 ms) and still renew. Retries go out every 250 ms alongside a write that hasn't been acknowledged yet, at most two at a time, and whichever lands first renews, so the slow node never fences (the scenario checks it) |
 | Resume bound | 10 s | From the spec |
 | Election slack | 1 s | Publishing has to resume within this long of the observer seeing the log's new leader |
 

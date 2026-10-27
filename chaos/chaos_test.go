@@ -902,6 +902,10 @@ func TestSlowConsumerNoSkips(t *testing.T) {
 	assertNoLoss(t, 120*time.Second, []*publisher{pub}, subs)
 	assertNoCursorSkips(t, c, from, subs)
 
+	if f := fences(c); slices.ContainsFunc(f, func(n int) bool { return n > 0 }) {
+		t.Errorf("brokers fenced %v times on a slow link whose heartbeat writes all land", f)
+	}
+
 	st := pub.stats()
 
 	result(t, "node 2 delayed %s each way; at the moves: %s; published %d, acknowledged %d; fences %v",
