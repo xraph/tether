@@ -2031,6 +2031,12 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 		}
 
 		if st != nil && !waitEnded(st, b.endWait) && !live.Closed() {
+			// Not deleted after all: the session ends as any other would,
+			// its will's delay and last record included.
+			n.sessMu.Lock()
+			s.deleting = false
+			n.sessMu.Unlock()
+
 			return deleteConflict(clientID, "the connection is still open")
 		}
 
