@@ -1,0 +1,196 @@
+{
+  "machine": {
+    "cpu": "Apple M3 Max",
+    "cores": 16,
+    "load_average": "9.18 9.65 9.02",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "go": "go1.26.9",
+    "taken_at": "2026-10-27T07:58:23-05:00",
+    "ram_bytes": 137438953472
+  },
+  "targets": [
+    "127.0.0.1:62090",
+    "127.0.0.1:62091",
+    "127.0.0.1:62092"
+  ],
+  "options": {
+    "qos": 0,
+    "measured_clients": 200,
+    "rate_per_s": 2000,
+    "placement": "cross",
+    "payload_bytes": 64,
+    "background_clients": 2800,
+    "connect_rate_per_s": 1000,
+    "storm_clients": 0,
+    "storm_external": true
+  },
+  "duration_s": 40,
+  "warmup_s": 5,
+  "background": {
+    "ok": 2800,
+    "failed": 0,
+    "connect_latency": {
+      "count": 2800,
+      "p50_ms": 0.634167,
+      "p90_ms": 1.093958,
+      "p99_ms": 3.883792,
+      "p999_ms": 9.319375,
+      "max_ms": 11.614,
+      "mean_ms": 0.806865
+    },
+    "elapsed_s": 2.799658458,
+    "achieved_per_s": 1000.1219941664755,
+    "ok_per_node": [
+      934,
+      933,
+      933
+    ]
+  },
+  "measured_connect": {
+    "ok": 200,
+    "failed": 0,
+    "connect_latency": {
+      "count": 200,
+      "p50_ms": 0.616542,
+      "p90_ms": 0.986084,
+      "p99_ms": 2.010584,
+      "p999_ms": 2.473875,
+      "max_ms": 2.473875,
+      "mean_ms": 0.699099
+    },
+    "elapsed_s": 0.19941383299999998,
+    "achieved_per_s": 1002.939450043067,
+    "ok_per_node": [
+      67,
+      67,
+      66
+    ]
+  },
+  "phases": [
+    {
+      "name": "baseline",
+      "from_s": 0,
+      "to_s": 15,
+      "publish_to_deliver": {
+        "count": 30000,
+        "p50_ms": 0.2705,
+        "p90_ms": 0.457,
+        "p99_ms": 3.5025,
+        "p999_ms": 7.121417,
+        "max_ms": 12.059458,
+        "mean_ms": 0.417585
+      }
+    },
+    {
+      "name": "storm",
+      "from_s": 15,
+      "to_s": 23,
+      "publish_to_deliver": {
+        "count": 16000,
+        "p50_ms": 0.261083,
+        "p90_ms": 0.482458,
+        "p99_ms": 7.461833,
+        "p999_ms": 55.136084,
+        "max_ms": 66.81975,
+        "mean_ms": 0.67151
+      }
+    },
+    {
+      "name": "after",
+      "from_s": 23,
+      "to_s": 40,
+      "publish_to_deliver": {
+        "count": 34000,
+        "p50_ms": 0.270542,
+        "p90_ms": 1.025958,
+        "p99_ms": 2.866541,
+        "p999_ms": 4.292459,
+        "max_ms": 6.639958,
+        "mean_ms": 0.448911
+      }
+    }
+  ],
+  "overall": {
+    "count": 80000,
+    "p50_ms": 0.268917,
+    "p90_ms": 0.682041,
+    "p99_ms": 3.298084,
+    "p999_ms": 29.779417,
+    "max_ms": 66.81975,
+    "mean_ms": 0.481684
+  },
+  "publish_to_ack": {
+    "count": 0,
+    "p50_ms": 0,
+    "p90_ms": 0,
+    "p99_ms": 0,
+    "p999_ms": 0,
+    "max_ms": 0,
+    "mean_ms": 0
+  },
+  "sent": 90000,
+  "acked": 0,
+  "publish_failed": 0,
+  "publish_skipped_window_full": 0,
+  "received_unique": 90000,
+  "duplicates": 0,
+  "lost": 0,
+  "received_but_not_acked": 0,
+  "send_lateness": {
+    "count": 90000,
+    "p50_ms": 0.079625,
+    "p90_ms": 0.110792,
+    "p99_ms": 0.277167,
+    "p999_ms": 2.479042,
+    "max_ms": 11.514375,
+    "mean_ms": 0.089472
+  },
+  "cpu_cores": [
+    {
+      "name": "baseline",
+      "brokers": 0.3246666666666667,
+      "nats_servers": 0.22133333333333324
+    },
+    {
+      "name": "storm",
+      "brokers": 1.2912499999999998,
+      "nats_servers": 1.44
+    },
+    {
+      "name": "after",
+      "brokers": 0.30588235294117666,
+      "nats_servers": 0.22117647058823517
+    }
+  ],
+  "storm_p99_ratio": 2.1304305496074236,
+  "memory": {
+    "before_mib": [
+      60.625,
+      56.34375,
+      56.890625
+    ],
+    "after_mib": [
+      304.96875,
+      307.125,
+      356.890625
+    ],
+    "total_delta_mib": 795.125
+  },
+  "connected_total": 3000,
+  "node_side": [
+    {
+      "connected": 4335,
+      "sessions": 4335
+    },
+    {
+      "connected": 4333,
+      "sessions": 4333
+    },
+    {
+      "connected": 4332,
+      "sessions": 4332
+    }
+  ],
+  "measured_connections_lost": 0
+}

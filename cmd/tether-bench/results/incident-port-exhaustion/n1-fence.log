@@ -1,0 +1,5 @@
+{"level":"WARN","ts":"2026-10-27T03:23:50.203832-05:00","logger":"tether","caller":"extension/logger.go:43","msg":"heartbeat write failed","component":"cluster","node":"n1","cell":"bench","component":"members","error":"context deadline exceeded"}
+{"level":"WARN","ts":"2026-10-27T03:24:00.025687-05:00","logger":"tether","caller":"extension/logger.go:43","msg":"fenced: no heartbeat write acknowledged","component":"cluster","node":"n1","cell":"bench","component":"members","since":"12.324s"}
+{"level":"WARN","ts":"2026-10-27T03:24:00.025751-05:00","logger":"tether","caller":"extension/logger.go:43","msg":"tether: fenced from the cell, dropping every client and refusing new ones","node":"n1"}
+{"level":"INFO","ts":"2026-10-27T03:24:41.272816-05:00","logger":"tether","caller":"extension/logger.go:45","msg":"unfenced","component":"cluster","node":"n1","cell":"bench","component":"members"}
+{"level":"INFO","ts":"2026-10-27T03:24:41.272869-05:00","logger":"tether","caller":"extension/logger.go:45","msg":"tether: unfenced, accepting connections again","node":"n1"}

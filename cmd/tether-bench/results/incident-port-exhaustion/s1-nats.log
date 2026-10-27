@@ -1,0 +1,12 @@
+[82525] 2026/10/27 03:23:59.340424 [WRN] JetStream cluster stream '$G > TETHER_LOG_BENCH' has NO quorum, stalled
+[82525] 2026/10/27 03:23:59.829916 [INF] JetStream cluster no metadata leader
+[82525] 2026/10/27 03:24:00.104233 [WRN] JetStream cluster stream '$G > KV_tether-retained-bench' has NO quorum, stalled
+[82525] 2026/10/27 03:24:01.686401 [WRN] JetStream cluster stream '$G > TETHER_CTL_BENCH' has NO quorum, stalled
+[82525] 2026/10/27 03:24:03.283430 [WRN] JetStream cluster stream '$G > KV_tether-sessions-bench' has NO quorum, stalled
+[82525] 2026/10/27 03:24:04.670753 [WRN] JetStream cluster stream '$G > KV_tether-members-bench' has NO quorum, stalled
+[82525] 2026/10/27 03:24:09.643726 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61381: connect: can't assign requested address
+[82525] 2026/10/27 03:24:09.817947 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61382: connect: can't assign requested address
+[82525] 2026/10/27 03:24:10.089310 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61381: connect: can't assign requested address
+[82525] 2026/10/27 03:24:10.235409 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61381: connect: can't assign requested address
+[82525] 2026/10/27 03:24:10.237615 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61382: connect: can't assign requested address
+[82525] 2026/10/27 03:24:10.282717 [ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:61382: connect: can't assign requested address

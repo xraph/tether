@@ -1,0 +1,170 @@
+{
+  "machine": {
+    "cpu": "Apple M3 Max",
+    "cores": 16,
+    "load_average": "6.64 7.92 7.72",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "go": "go1.26.9",
+    "taken_at": "2026-10-27T04:08:27-05:00",
+    "ram_bytes": 137438953472
+  },
+  "targets": [
+    "127.0.0.1:60707",
+    "127.0.0.1:60708",
+    "127.0.0.1:60709"
+  ],
+  "options": {
+    "qos": 1,
+    "measured_clients": 200,
+    "rate_per_s": 2000,
+    "placement": "cross",
+    "payload_bytes": 64,
+    "background_clients": 5000,
+    "connect_rate_per_s": 1000,
+    "storm_clients": 0,
+    "storm_external": true
+  },
+  "duration_s": 55,
+  "warmup_s": 5,
+  "background": {
+    "ok": 5000,
+    "failed": 0,
+    "connect_latency": {
+      "count": 5000,
+      "p50_ms": 0.729084,
+      "p90_ms": 1.26375,
+      "p99_ms": 2.832708,
+      "p999_ms": 4.018833,
+      "max_ms": 5.736084,
+      "mean_ms": 0.892117
+    },
+    "elapsed_s": 4.999753958,
+    "achieved_per_s": 1000.0492108215857,
+    "ok_per_node": [
+      1667,
+      1667,
+      1666
+    ]
+  },
+  "measured_connect": {
+    "ok": 200,
+    "failed": 0,
+    "connect_latency": {
+      "count": 100,
+      "p50_ms": 0.733833,
+      "p90_ms": 1.516917,
+      "p99_ms": 3.051875,
+      "p999_ms": 3.086166,
+      "max_ms": 3.086166,
+      "mean_ms": 0.966144
+    },
+    "elapsed_s": 0.099791958,
+    "achieved_per_s": 0,
+    "ok_per_node": [
+      67,
+      67,
+      66
+    ]
+  },
+  "phases": [
+    {
+      "name": "baseline",
+      "from_s": 0,
+      "to_s": 15,
+      "publish_to_deliver": {
+        "count": 30000,
+        "p50_ms": 0.312958,
+        "p90_ms": 0.543333,
+        "p99_ms": 3.099541,
+        "p999_ms": 4.569167,
+        "max_ms": 9.563917,
+        "mean_ms": 0.436886
+      }
+    },
+    {
+      "name": "storm",
+      "from_s": 15,
+      "to_s": 37,
+      "publish_to_deliver": {
+        "count": 44000,
+        "p50_ms": 0.348542,
+        "p90_ms": 0.953541,
+        "p99_ms": 4.509792,
+        "p999_ms": 41.08625,
+        "max_ms": 72.385125,
+        "mean_ms": 0.683432
+      }
+    },
+    {
+      "name": "after",
+      "from_s": 37,
+      "to_s": 55,
+      "publish_to_deliver": {
+        "count": 36000,
+        "p50_ms": 0.310958,
+        "p90_ms": 0.504875,
+        "p99_ms": 1.510875,
+        "p999_ms": 4.465,
+        "max_ms": 10.305959,
+        "mean_ms": 0.370157
+      }
+    }
+  ],
+  "overall": {
+    "count": 110000,
+    "p50_ms": 0.324333,
+    "p90_ms": 0.611625,
+    "p99_ms": 2.997708,
+    "p999_ms": 25.685666,
+    "max_ms": 72.385125,
+    "mean_ms": 0.513666
+  },
+  "publish_to_ack": {
+    "count": 120001,
+    "p50_ms": 0.294916,
+    "p90_ms": 0.551209,
+    "p99_ms": 2.882792,
+    "p999_ms": 22.117417,
+    "max_ms": 70.81025,
+    "mean_ms": 0.467542
+  },
+  "sent": 120001,
+  "acked": 120001,
+  "publish_failed": 0,
+  "publish_skipped_window_full": 0,
+  "received_unique": 120001,
+  "duplicates": 0,
+  "lost": 0,
+  "storm_p99_ratio": 1.4549870448559965,
+  "memory": {
+    "before_mib": [
+      58.9375,
+      55.578125,
+      55.859375
+    ],
+    "after_mib": [
+      465.984375,
+      441.09375,
+      453.03125
+    ],
+    "per_connection_kib": 234.28615384615384,
+    "total_delta_mib": 1189.734375
+  },
+  "connected_total": 5200,
+  "node_side": [
+    {
+      "connected": 1734,
+      "sessions": 1734
+    },
+    {
+      "connected": 1734,
+      "sessions": 1734
+    },
+    {
+      "connected": 1732,
+      "sessions": 1732
+    }
+  ],
+  "measured_connections_lost": 0
+}

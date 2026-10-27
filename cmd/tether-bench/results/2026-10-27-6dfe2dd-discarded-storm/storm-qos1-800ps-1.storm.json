@@ -1,0 +1,63 @@
+{
+  "machine": {
+    "cpu": "Apple M3 Max",
+    "cores": 16,
+    "load_average": "8.60 7.81 7.37",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "go": "go1.26.9",
+    "taken_at": "2026-10-27T03:58:53-05:00",
+    "ram_bytes": 137438953472
+  },
+  "targets": [
+    "127.0.0.1:61936",
+    "127.0.0.1:61937",
+    "127.0.0.1:61938"
+  ],
+  "setup": {
+    "ok": 8000,
+    "failed": 0,
+    "connect_latency": {
+      "count": 8000,
+      "p50_ms": 0.6895,
+      "p90_ms": 1.210167,
+      "p99_ms": 3.383042,
+      "p999_ms": 5.312875,
+      "max_ms": 9.972958,
+      "mean_ms": 0.870442
+    },
+    "elapsed_s": 7.999740084,
+    "achieved_per_s": 1000.032490555602,
+    "ok_per_node": [
+      2667,
+      2667,
+      2666
+    ]
+  },
+  "storm": {
+    "clients": 8000,
+    "window_s": 10,
+    "reconnects_per_s": 800,
+    "reconnect": {
+      "ok": 8000,
+      "failed": 0,
+      "connect_latency": {
+        "count": 8000,
+        "p50_ms": 0.926667,
+        "p90_ms": 1.472541,
+        "p99_ms": 4.395375,
+        "p999_ms": 41.675375,
+        "max_ms": 55.176666,
+        "mean_ms": 1.233985
+      },
+      "elapsed_s": 10.000675833,
+      "achieved_per_s": 799.9459370137549,
+      "ok_per_node": [
+        2667,
+        2667,
+        2666
+      ]
+    }
+  },
+  "dropped_at": "2026-10-27T04:00:13.000362-05:00"
+}

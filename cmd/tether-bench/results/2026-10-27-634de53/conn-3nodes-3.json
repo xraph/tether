@@ -1,0 +1,69 @@
+{
+  "machine": {
+    "cpu": "Apple M3 Max",
+    "cores": 16,
+    "load_average": "7.42 9.00 9.37",
+    "goos": "darwin",
+    "goarch": "arm64",
+    "go": "go1.26.9",
+    "taken_at": "2026-10-27T08:28:17-05:00",
+    "ram_bytes": 137438953472
+  },
+  "targets": [
+    "127.0.0.1:55413",
+    "127.0.0.1:55414",
+    "127.0.0.1:55415"
+  ],
+  "clients_wanted": 15000,
+  "rate_per_s": 500,
+  "connect": {
+    "ok": 15000,
+    "failed": 0,
+    "connect_latency": {
+      "count": 15000,
+      "p50_ms": 0.884708,
+      "p90_ms": 1.591292,
+      "p99_ms": 3.668209,
+      "p999_ms": 6.83,
+      "max_ms": 12.679667,
+      "mean_ms": 1.072945
+    },
+    "elapsed_s": 29.999257875,
+    "achieved_per_s": 500.0123690559795,
+    "ok_per_node": [
+      5000,
+      5000,
+      5000
+    ]
+  },
+  "held_s": 20,
+  "lost_while_held": 0,
+  "memory": {
+    "before_mib": [
+      58.828125,
+      53.390625,
+      53.546875
+    ],
+    "after_mib": [
+      575.78125,
+      672.140625,
+      558.296875
+    ],
+    "per_connection_kib": 111.98826666666666,
+    "total_delta_mib": 1640.453125
+  },
+  "node_side": [
+    {
+      "connected": 5000,
+      "sessions": 5000
+    },
+    {
+      "connected": 5000,
+      "sessions": 5000
+    },
+    {
+      "connected": 5000,
+      "sessions": 5000
+    }
+  ]
+}
