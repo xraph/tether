@@ -45,8 +45,8 @@ func TestWritesOverMaxPayloadRefused(t *testing.T) {
 	requireTooLarge(t, "check retained", ret.Check(msg))
 	requireTooLarge(t, "put retained", ret.Put(tctx(t, 10*time.Second), testTenant, "a/b", msg, 0))
 
-	if err := ret.Check(LogMessage{Payload: []byte("small")}); err != nil {
-		t.Fatalf("check small: %v", err)
+	if cerr := ret.Check(LogMessage{Payload: []byte("small")}); cerr != nil {
+		t.Fatalf("check small: %v", cerr)
 	}
 
 	s := startCell(t, 1)[0]

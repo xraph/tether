@@ -645,8 +645,8 @@ func TestProvisionAutoNeverLowersReplicas(t *testing.T) {
 
 	t.Cleanup(first.Close)
 
-	if err := cluster.Provision(ctxT(t, 30*time.Second), first, firstCfg, time.Hour); err != nil {
-		t.Fatal(err)
+	if perr := cluster.Provision(ctxT(t, 30*time.Second), first, firstCfg, time.Hour); perr != nil {
+		t.Fatal(perr)
 	}
 
 	lateCfg := externalConfig(urls[:1])

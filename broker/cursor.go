@@ -1224,7 +1224,7 @@ func tooLarge(pk packets.Packet) bool {
 		return false
 	}
 
-	if uint64(len(pk.Payload)) >= uint64(limit) {
+	if int64(len(pk.Payload)) >= int64(limit) {
 		return true
 	}
 
@@ -1233,7 +1233,7 @@ func tooLarge(pk packets.Packet) bool {
 		return false
 	}
 
-	return uint64(buf.Len()) > uint64(limit)
+	return int64(buf.Len()) > int64(limit)
 }
 
 // discardOversized deals with an outbound PUBLISH over the client's Maximum

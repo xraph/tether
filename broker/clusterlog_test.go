@@ -1541,8 +1541,8 @@ func TestPublishTooLargeForCellRefused(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), logWait)
 		defer cancel()
 
-		resp, err := pub.Publish(ctx, p)
-		require.NotNil(t, resp, "no PUBACK or PUBREC: %v", err)
+		resp, perr := pub.Publish(ctx, p)
+		require.NotNil(t, resp, "no PUBACK or PUBREC: %v", perr)
 
 		return resp.ReasonCode
 	}
