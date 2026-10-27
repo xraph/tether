@@ -789,7 +789,9 @@ const sessionEndWait = 2 * time.Second
 // fails) is deleted once the wait runs out.
 //
 // It returns tether.ErrNotFound when there is no such session. A delayed
-// will (5.0 Will Delay Interval) already queued by mochi is still sent.
+// will (5.0 Will Delay Interval) already queued by mochi is still sent; in
+// cluster mode a will the session's record still holds goes out at once,
+// since the session has ended (ruling R42).
 //
 // In cluster mode the session lives in the cell (ruling R7). One this node
 // serves is disconnected as above and its key deleted; an offline one is

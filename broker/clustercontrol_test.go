@@ -2,6 +2,7 @@ package broker
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -188,5 +189,37 @@ func TestControlEventOnce(t *testing.T) {
 	for i, n := range c.nodes {
 		requireKicked(t, clients[i])
 		require.Equal(t, want, n.cluster.tenantApplied.Load(), "node %d", i)
+	}
+}
+
+// Ruling R42: deleting a session whose delayed will is still held publishes
+// the will at once, as MQTT 5 does at the end of the session, both on the
+// node that holds it and through the bus from another node (C-I1).
+func TestDeleteSessionPublishesHeldWill(t *testing.T) {
+	c := startControlCell(t, 2)
+	tid := c.t1.ID.String()
+
+	watcher, _, err := connect5(t, c.addr(1), "will-watch", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, watcher, "wills/#", 1, false)
+
+	for i, from := range []int{0, 1} {
+		id := fmt.Sprintf("held%d", i)
+
+		conn := rawConnectWill(t, c.addr(0), willSpec{id: id, topic: "wills/" + id, qos: 1, expiry: 3600, delay: 60})
+		_ = conn.Close() // abnormal: the will is owed, after its delay
+
+		eventually(t, id+"'s will held", func() bool {
+			rec, err := sessionKey(t, c.nodes[0], tid, id)
+
+			return err == nil && rec.Will != nil && !rec.DisconnectedAt.IsZero()
+		})
+
+		require.NoError(t, c.nodes[from].DeleteSession(tid, id))
+
+		m := recvLive(t, watcher)
+		require.Equal(t, "wills/"+id, m.Topic)
+		require.Equal(t, "gone "+id, m.Payload)
+		require.Empty(t, c.nodes[0].cluster.pendingWills(), "the delay timer still runs")
 	}
 }

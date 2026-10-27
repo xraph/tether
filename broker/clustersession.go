@@ -2098,7 +2098,33 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 	n.dropQoS2(nsID)
 	log.Info("tether: session deleted")
 
+	// Ruling R42: a will the record still held (a delayed will waiting out
+	// its delay, this node's own or one it took over from a dead node) goes
+	// out now, since the session ended: MQTT sends it at the end of the
+	// delay or of the session, whichever comes first. The delete won, so
+	// this node holds its only copy.
+	if w := rec.Will; w != nil && !n.willBarred(nsID, rec.Epoch) {
+		n.cancelWill(nsID)
+
+		if validWill(tenantID, w) {
+			log.Info("tether: session deleted with its will held, publishing the will")
+			n.goLive(func() { b.publishHeld(tenantID, clientID, w, "") })
+		}
+	}
+
 	return nil
+}
+
+// cancelWill stops the timer of a delayed will this node holds for nsID,
+// if any: its record is gone, so the timer would find nothing.
+func (n *clusterNode) cancelWill(nsID string) {
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	if pw := n.wills[nsID]; pw != nil {
+		pw.timer.Stop()
+		delete(n.wills, nsID)
+	}
 }
 
 // clusterClients is Clients in cluster mode: the tenant's sessions in the
