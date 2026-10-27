@@ -1437,3 +1437,45 @@ func TestStaleStartReplayLeavesCurrentReplay(t *testing.T) {
 		return true
 	})
 }
+
+// A session write that loses its CAS to this node's own earlier write (one
+// whose wait ran out and that landed later, as during a JetStream election)
+// is not a takeover: the node adopts the revision and writes again, and the
+// client stays connected (A-I4). The landed write is simulated by writing the
+// record as it is, under the same owner and epoch, behind the node's back.
+func TestOwnLateWriteNotTakeover(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+	a := c.nodes[0]
+
+	cl, _, err := connect5(t, c.addr(0), "late-write", "u1", false)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	defer cancel()
+
+	rec, rev, err := a.cluster.Sessions.Get(ctx, tid, "late-write")
+	require.NoError(t, err)
+	require.Equal(t, a.cluster.Config.NodeID, rec.Owner)
+
+	_, err = a.cluster.Sessions.Update(ctx, tid, "late-write", rev, rec)
+	require.NoError(t, err)
+
+	// A subscription changes the record, so the flusher writes it.
+	subscribeQoS(t, cl, "late/#", 1, false)
+
+	eventually(t, "the subscription in the record", func() bool {
+		got, err := sessionKey(t, a, tid, "late-write")
+
+		return err == nil && len(got.Subscriptions) == 1
+	})
+
+	select {
+	case d := <-cl.disconnects:
+		t.Fatalf("disconnected with %#x: the node took its own write for a takeover", d.ReasonCode)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	require.Positive(t, a.cluster.ownWrites.Load())
+	require.Zero(t, a.cluster.takeovers.Load())
+}

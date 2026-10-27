@@ -151,6 +151,10 @@ type clusterNode struct {
 	// outbound messages discarded over a client's Maximum Packet Size.
 	appends, acks, logDelivered, readerRestarts, appendAttempts, oversized atomic.Uint64
 
+	// ownWrites counts session writes that lost their CAS to this node's own
+	// earlier write and went again on its revision (persist).
+	ownWrites atomic.Uint64
+
 	// holdAppend, when a test sets it before Start, runs before every
 	// append of a client publish and may block until ctx ends. An error
 	// fails that attempt, as a log that refuses appends would.

@@ -1560,19 +1560,33 @@ func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration
 		err error
 	)
 
-	if ttl > 0 {
-		rev, err = n.Sessions.Expire(ctx, s.tenantID, s.rawID, s.rev, rec, ttl)
-	} else {
-		rev, err = n.Sessions.Update(ctx, s.tenantID, s.rawID, s.rev, rec)
-	}
+	for attempt := 0; ; attempt++ {
+		if ttl > 0 {
+			rev, err = n.Sessions.Expire(ctx, s.tenantID, s.rawID, s.rev, rec, ttl)
+		} else {
+			rev, err = n.Sessions.Update(ctx, s.tenantID, s.rawID, s.rev, rec)
+		}
 
-	if err != nil {
-		if errors.Is(err, cluster.ErrLostCAS) {
+		if err == nil || !errors.Is(err, cluster.ErrLostCAS) {
+			break
+		}
+
+		// A lost CAS can be this node's own earlier write: one whose wait
+		// ran out (sessionWriteWait, shorter than a JetStream election)
+		// can still land, and moves the revision. Only a record that names
+		// another owner or epoch means the session moved.
+		cur, ok := n.ownWrite(ctx, s)
+		if !ok || attempt >= ownWriteRetries {
 			n.lose(s, false)
 
 			return errSessionLost
 		}
 
+		n.ownWrites.Add(1)
+		s.rev = cur
+	}
+
+	if err != nil {
 		return fmt.Errorf("tether/broker: session write: %w", err)
 	}
 
@@ -1591,6 +1605,23 @@ func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration
 	s.mu.Unlock()
 
 	return nil
+}
+
+// ownWriteRetries bounds how often persist adopts a revision its own
+// earlier write left and writes again.
+const ownWriteRetries = 3
+
+// ownWrite reads s's key from the stream leader after a lost CAS and reports
+// whether the record is still this node's at s's epoch, with its revision:
+// the CAS lost to a write of this node that landed after its wait ran out.
+// A read that fails, or a record of another owner or epoch, reports false.
+func (n *clusterNode) ownWrite(ctx context.Context, s *session) (uint64, bool) {
+	rec, rev, err := n.Sessions.Get(ctx, s.tenantID, s.rawID)
+	if err != nil || rec.Owner != n.Config.NodeID || rec.Epoch != s.epoch.Load() {
+		return 0, false
+	}
+
+	return rev, true
 }
 
 // lose marks s lost and disconnects its connection: 0x8E when another node

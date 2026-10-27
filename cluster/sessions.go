@@ -120,6 +120,12 @@ type OutRecord struct {
 // when the expected value is right, so Sessions serializes the writes of one
 // key with a per-key lock. Different keys run in parallel.
 //
+// A write whose context ends gives the key's lock back without knowing
+// whether its publish landed: the publish may still be in flight and commit
+// later, moving the revision. The next write of the key then loses its CAS to
+// the caller's own earlier write. A caller that treats a lost CAS as a
+// takeover should read the key first (Get) and look at Owner and Epoch.
+//
 // Reads go to the stream leader, so a node sees its own writes.
 //
 // It is safe for concurrent use.
