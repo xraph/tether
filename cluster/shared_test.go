@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -629,5 +630,75 @@ func TestSharedFetchOnDeletedConsumer(t *testing.T) {
 
 	if !consumerGone(err) {
 		t.Fatalf("fetch on a deleted consumer: %v, not taken as gone", err)
+	}
+}
+
+// lossyMsg loses its acks on the wire: Ack sends nothing and reports
+// success, and the first lost DoubleAcks fail without sending.
+type lossyMsg struct {
+	jetstream.Msg
+
+	mu   *sync.Mutex
+	lost *int
+}
+
+func (m lossyMsg) Ack() error { return nil }
+
+func (m lossyMsg) DoubleAck(ctx context.Context) error {
+	m.mu.Lock()
+	lose := *m.lost > 0
+	if lose {
+		*m.lost--
+	}
+	m.mu.Unlock()
+
+	if lose {
+		return errors.New("ack lost")
+	}
+
+	return m.Msg.DoubleAck(ctx)
+}
+
+// A QoS 2 message a member is through with is acked only once JetStream
+// confirms it: an ack lost on the way is sent again, and the message is kept
+// alive meanwhile, so it never reaches another member after the ack wait
+// [MQTT-4.8.2-5] (A-I2).
+func TestSharedQoS2AckLostNotRedelivered(t *testing.T) {
+	nodes := startShared(t, 2, time.Second)
+
+	var mu sync.Mutex
+
+	lost := 3
+	nodes[0].sh.wrapMsg = func(m jetstream.Msg) jetstream.Msg { return lossyMsg{Msg: m, mu: &mu, lost: &lost} }
+
+	a, b := &member{}, &member{}
+	mustJoin(t, nodes[0].sh, "t1", "g", "s/#", a)
+
+	for i := range 3 {
+		if _, _, err := nodes[0].log.Append(tctx(t, 10*time.Second), LogMessage{
+			Tenant: "t1", Topic: "s/x", Payload: fmt.Appendf(nil, "m%d", i), QoS: 2,
+		}, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	waitFor(t, "3 at A", 10*time.Second, func() bool { return a.count() >= 3 })
+
+	mustJoin(t, nodes[1].sh, "t1", "g", "s/#", b)
+
+	time.Sleep(4 * time.Second)
+
+	if n := b.count(); n != 0 {
+		t.Fatalf("b got %d QoS 2 messages a already had", n)
+	}
+
+	if n := a.count(); n != 3 {
+		t.Fatalf("a got %d deliveries of 3 messages", n)
+	}
+
+	waitFor(t, "acks confirmed", 5*time.Second, func() bool { return nodes[0].sh.acked.Load() >= 3 })
+
+	if nodes[0].sh.ackRetries.Load() == 0 {
+		t.Fatal("no ack was sent again")
 	}
 }

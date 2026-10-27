@@ -108,11 +108,23 @@ type Shared struct {
 	fetchWait time.Duration
 	heartbeat time.Duration
 
+	// quit closes on Close: QoS 2 acks still being retried (ackPinned)
+	// stop.
+	quit chan struct{}
+
+	// wrapMsg, when a test sets it before the first Join, wraps every
+	// message a fetch brings (to lose its acks, say).
+	wrapMsg func(jetstream.Msg) jetstream.Msg
+
 	// Counters for tests: messages handed to a member (both halves), log
 	// messages acked after a member was through, naked for redelivery,
 	// acked at once because they did not match, QoS 0 messages no member on
 	// the node took, consumers made again by a pull loop.
 	delivered, acked, naked, skipped, dropped, recreated atomic.Uint64
+
+	// ackRetries counts QoS 2 acks sent again because JetStream did not
+	// confirm one (ackPinned).
+	ackRetries atomic.Uint64
 }
 
 // NewShared returns this node's shared subscriptions over c, on the log l
@@ -127,6 +139,7 @@ func NewShared(c *Conn, cfg Config, l *Log) *Shared {
 		pend:      make(map[*sharedPending]struct{}),
 		ackWait:   defaultSharedAckWait,
 		fetchWait: defaultSharedFetchWait,
+		quit:      make(chan struct{}),
 	}
 }
 
@@ -611,6 +624,10 @@ func (p *sharedPull) fetch() error {
 	}
 
 	for msg := range batch.Messages() {
+		if w := p.g.s.wrapMsg; w != nil {
+			msg = w(msg)
+		}
+
 		p.handle(msg)
 	}
 
@@ -662,7 +679,7 @@ func (p *sharedPull) handle(msg jetstream.Msg) {
 		return
 	}
 
-	pd := &sharedPending{msg: msg}
+	pd := &sharedPending{msg: msg, qos: lm.QoS}
 	s.track(pd)
 
 	taken, busy, members := g.offer(lm, pd.done(s))
@@ -688,23 +705,84 @@ func (p *sharedPull) handle(msg jetstream.Msg) {
 // sharedPending is a message handed to a member and not yet done.
 type sharedPending struct {
 	msg  jetstream.Msg
+	qos  byte
 	once sync.Once
 }
 
 // done returns the function a member calls when it is through with the
 // message (nil, acked) or lost it (an error, naked for another member).
 // Only the first call counts.
+//
+// A QoS 2 message is the member's once done(nil) is called (the broker pins
+// it to the session first), so an ack JetStream never gets would let it
+// redeliver the message to another member after the ack wait: two deliveries
+// of one QoS 2 message [MQTT-4.8.2-5]. So its ack waits for the server's
+// answer (ackPinned), and the message stays pending, kept alive with
+// InProgress, until the ack is in. QoS 1 may arrive twice, so its ack is
+// fire and forget.
 func (pd *sharedPending) done(s *Shared) func(error) {
 	return func(err error) {
 		pd.once.Do(func() {
-			s.untrack(pd)
-
-			if err == nil {
-				s.ack(pd.msg)
-			} else {
+			switch {
+			case err != nil:
+				s.untrack(pd)
 				s.nak(pd.msg, 0)
+			case pd.qos == 2:
+				go s.ackPinned(pd)
+			default:
+				s.untrack(pd)
+				s.ack(pd.msg)
 			}
 		})
+	}
+}
+
+// sharedAckRetry is the first wait before a QoS 2 ack is sent again;
+// sharedAckRetryMax caps the doubling, sharedAckRetryFor bounds the whole.
+const (
+	sharedAckRetry    = 100 * time.Millisecond
+	sharedAckRetryMax = 2 * time.Second
+	sharedAckRetryFor = 10 * time.Minute
+)
+
+// ackPinned acks a QoS 2 message and waits for JetStream to confirm it
+// (DoubleAck), sending it again with backoff until it does, Close, or
+// sharedAckRetryFor passes. The message stays pending meanwhile, so the
+// ticker keeps it from being redelivered.
+func (s *Shared) ackPinned(pd *sharedPending) {
+	defer s.untrack(pd)
+
+	start := time.Now()
+	delay := sharedAckRetry
+
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), max(s.ackWait/3, sharedAckRetryMax))
+		err := pd.msg.DoubleAck(ctx)
+
+		cancel()
+
+		if err == nil || errors.Is(err, jetstream.ErrMsgAlreadyAckd) {
+			s.acked.Add(1)
+
+			return
+		}
+
+		if time.Since(start) > sharedAckRetryFor {
+			s.logger.Warn("shared: qos 2 ack not confirmed, giving up; the message may be redelivered", "err", err)
+
+			return
+		}
+
+		s.ackRetries.Add(1)
+		s.logger.Debug("shared: qos 2 ack not confirmed, sending it again", "err", err)
+
+		select {
+		case <-s.quit:
+			return
+		case <-time.After(delay):
+		}
+
+		delay = min(2*delay, sharedAckRetryMax)
 	}
 }
 
@@ -809,6 +887,7 @@ func (s *Shared) Close() {
 	}
 
 	s.closed = true
+	close(s.quit)
 
 	all := make([]*sharedGroup, 0, len(s.groups))
 	for _, g := range s.groups {
