@@ -136,16 +136,22 @@ type clusterNode struct {
 	persistQoS2 func(tenantID, rawID string, packetID uint16, msgID string) error
 
 	// Timings, defaults in clusterlog.go; tests shorten them before Start.
-	readerIdle, readerSweep                    time.Duration
-	appendAttempt, appendRetry, appendRetryMax time.Duration
+	readerIdle, readerSweep                                time.Duration
+	appendAttempt, appendLate, appendRetry, appendRetryMax time.Duration
+	logProbe                                               time.Duration
+
+	// logUp is what the node's pipes know about the log's health, for the
+	// pacing of their retries (clusterlog.go).
+	logUp logHealth
 
 	// Counters for tests: appends committed (client and host publishes),
 	// acks written, log messages injected, readers restarted.
 	appends, acks, logDelivered, readerRestarts atomic.Uint64
 
 	// holdAppend, when a test sets it before Start, runs before every
-	// append of a client publish and may block until ctx ends.
-	holdAppend func(ctx context.Context)
+	// append of a client publish and may block until ctx ends. An error
+	// fails that attempt, as a log that refuses appends would.
+	holdAppend func(ctx context.Context) error
 
 	// The session side (clustersession.go, cursor.go). mochi is the server,
 	// kept after detach so the sessions that end during Stop can still be
@@ -247,8 +253,10 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 		readerIdle:     defaultReaderIdle,
 		readerSweep:    defaultReaderSweep,
 		appendAttempt:  defaultAppendAttempt,
+		appendLate:     defaultAppendLate,
 		appendRetry:    defaultAppendRetry,
 		appendRetryMax: defaultAppendRetryMax,
+		logProbe:       defaultLogProbe,
 		liveness:       newLiveness(),
 		retainedNode:   newRetainedNode(),
 		sharedNode:     newSharedNode(),

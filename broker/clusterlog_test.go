@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -813,10 +814,18 @@ func TestQoS2AbandonedLeavesNoPubrec(t *testing.T) {
 
 // appendGate holds the appends of client publishes back while closed, the
 // way an unreachable log would, while the session store stays reachable.
+// While failing it refuses them at once instead, the way a log whose stream
+// has no leader does ("no response from stream").
 type appendGate struct {
-	mu sync.Mutex
-	ch chan struct{} // closed while the gate is open
+	mu      sync.Mutex
+	ch      chan struct{} // closed while the gate is open
+	failing atomic.Bool
+	refused atomic.Int64
 }
+
+// errLogDown is what a failing appendGate answers: the log cannot be
+// reached, as the real "no response from stream" is.
+var errLogDown = fmt.Errorf("test: no response from stream: %w", cluster.ErrUnavailable)
 
 func newAppendGate() *appendGate {
 	g := &appendGate{ch: make(chan struct{})}
@@ -826,7 +835,13 @@ func newAppendGate() *appendGate {
 }
 
 // hold is clusterNode.holdAppend.
-func (g *appendGate) hold(ctx context.Context) {
+func (g *appendGate) hold(ctx context.Context) error {
+	if g.failing.Load() {
+		g.refused.Add(1)
+
+		return errLogDown
+	}
+
 	g.mu.Lock()
 	ch := g.ch
 	g.mu.Unlock()
@@ -835,6 +850,8 @@ func (g *appendGate) hold(ctx context.Context) {
 	case <-ch:
 	case <-ctx.Done():
 	}
+
+	return nil
 }
 
 func (g *appendGate) close() {
@@ -1033,4 +1050,82 @@ func disconnectWindow(t *testing.T, holdRemoved bool, limits tenant.Limits) {
 
 	writePacket(t, conn, &packets.Pubrel{PacketID: 3, Properties: &packets.Properties{}})
 	require.Equal(t, packets.PUBCOMP, readLog(t, conn).Type)
+}
+
+// CHAOS-1: after a log outage, the acks of the publishes that were held come
+// back promptly and in order. Every one of them has a failed attempt behind
+// it; the writer used to retry them one at a time with a 100 ms backoff each
+// (about ten acks a second, 15 s for these 150), behind a head whose backoff
+// had grown towards 5 s. Now the first retry that commits sends every queued
+// publish again at once, so they commit together.
+func TestAcksPromptAfterLogReturns(t *testing.T) {
+	const n = 150
+
+	t1 := newTenant(tenant.Limits{})
+	gate := newAppendGate()
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": {Publish: []string{"#"}, Subscribe: []string{"#"}}}},
+		func(b *Broker) { b.cluster.holdAppend = gate.hold })
+	a := c.nodes[0]
+
+	conn, _ := rawConnectAck(t, c.addr(0), "crawl")
+
+	gate.failing.Store(true)
+
+	// Odd packet IDs QoS 1, even QoS 2: a QoS 2 retry keeps its message ID.
+	qosOf := func(id uint16) byte { return byte(2 - id%2) }
+
+	for id := uint16(1); id <= n; id++ {
+		writePacket(t, conn, &packets.Publish{
+			Topic: "crawl/x", QoS: qosOf(id), PacketID: id, Payload: []byte(strconv.Itoa(int(id))), Properties: &packets.Properties{},
+		})
+	}
+
+	// Long enough for every publish to fail its first attempt and for the
+	// head's backoff to reach its cap.
+	require.Eventually(t, func() bool { return gate.refused.Load() >= n+4 }, logWait, 10*time.Millisecond)
+	time.Sleep(2 * time.Second)
+
+	require.Zero(t, a.cluster.acks.Load(), "acked while the log refused every append")
+
+	gate.failing.Store(false)
+	healed := time.Now()
+
+	for id := uint16(1); id <= n; id++ {
+		cp := readLog(t, conn)
+
+		if qosOf(id) == 1 {
+			require.Equal(t, packets.PUBACK, cp.Type, "packet %d", id)
+			require.Equal(t, id, cp.Content.(*packets.Puback).PacketID, "acks out of order")
+			require.Equal(t, byte(0), cp.Content.(*packets.Puback).ReasonCode)
+		} else {
+			require.Equal(t, packets.PUBREC, cp.Type, "packet %d", id)
+			require.Equal(t, id, cp.Content.(*packets.Pubrec).PacketID, "acks out of order")
+			require.Equal(t, byte(0), cp.Content.(*packets.Pubrec).ReasonCode)
+		}
+	}
+
+	took := time.Since(healed)
+	t.Logf("%d acks %s after the log came back", n, took.Round(time.Millisecond))
+
+	// The head waits out at most the capped backoff (1 s), then everything
+	// commits in one pipelined pass.
+	require.Less(t, took, 3*time.Second, "acks crawled after the log came back")
+	require.Equal(t, uint64(n), a.cluster.appends.Load())
+
+	// Once each in the log, in order, whatever the retries.
+	var stored []string
+
+	require.NoError(t, a.cluster.Log.Replay(t.Context(), t1.ID.String(), 1, 1<<62, func(m cluster.LogMessage) error {
+		stored = append(stored, string(m.Payload))
+
+		return nil
+	}))
+
+	want := make([]string, n)
+	for i := range want {
+		want[i] = strconv.Itoa(i + 1)
+	}
+
+	require.Equal(t, want, stored)
 }

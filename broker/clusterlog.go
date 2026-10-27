@@ -35,13 +35,26 @@ const (
 	defaultReaderIdle = time.Minute
 	// defaultReaderSweep is how often idle readers are looked for.
 	defaultReaderSweep = 10 * time.Second
-	// defaultAppendAttempt bounds one wait for a commit before the append
-	// is sent again (with the same message ID, so it is stored once).
+	// defaultAppendAttempt bounds the send of one append (the publisher
+	// holds a send back while too many acks are outstanding) and a QoS 2
+	// publish's session write before it.
 	defaultAppendAttempt = 10 * time.Second
+	// defaultAppendLate is how long the writer waits for the commit of an
+	// append before it takes the ack as lost and sends the append again,
+	// with the same message ID, so it is stored once. A stream leader that
+	// dies takes the acks of the appends it had with it, and those never
+	// come; a commit normally takes milliseconds.
+	defaultAppendLate = time.Second
 	// defaultAppendRetry and defaultAppendRetryMax pace the retries of a
-	// failed append, doubling, while the connection is open (ruling R23).
+	// failed append while the log is down, doubling, while the connection is
+	// open (ruling R23). The pace is per connection and starts over once an
+	// append commits; any commit on the node cuts a wait short.
 	defaultAppendRetry    = 100 * time.Millisecond
-	defaultAppendRetryMax = 5 * time.Second
+	defaultAppendRetryMax = time.Second
+	// defaultLogProbe is how often a node whose pipes wait for an
+	// unreachable log asks the log stream whether it has a leader again
+	// (cluster.Log.Ping), and twice that bounds one ask.
+	defaultLogProbe = 200 * time.Millisecond
 	// closedPoll is how often a 3.1.1 publish waiting for a receive slot
 	// checks that its connection is still open.
 	closedPoll = 250 * time.Millisecond
@@ -358,6 +371,10 @@ type pubPipe struct {
 	toStart   fifo[*pubItem]
 	toAck     fifo[*pubItem]
 
+	// delay is the wait before the next retry while the log is down; 0 when
+	// the last append went through. The writer's own.
+	delay time.Duration
+
 	// pending counts publishes whose ack is not written yet, held the QoS 2
 	// packet IDs whose PUBREC is written and whose PUBREL has not come.
 	// Together they are what counts against a 5.0 client's receive maximum.
@@ -393,6 +410,18 @@ type pubItem struct {
 	started chan struct{} // closed when the starter is done with it
 	pend    *cluster.PendingAppend
 	err     error
+
+	// sentAt is when the latest attempt was started; persisted says the
+	// QoS 2 pending entry is in the session's record, so a retry does not
+	// write it again. Set by the starter before started closes, then by the
+	// writer only.
+	sentAt    time.Time
+	persisted bool
+	// late is how long the writer waits for the next attempt's commit
+	// before it takes the ack as lost: appendLate, doubled after each late
+	// ack up to appendAttempt, so a slow but working log is waited out.
+	// The writer's own.
+	late time.Duration
 }
 
 func newPubPipe(b *Broker, srv *mqtt.Server, cl *mqtt.Client, st *clientState) *pubPipe {
@@ -616,16 +645,25 @@ func (p *pubPipe) runStarter() {
 func (p *pubPipe) start(it *pubItem) {
 	n := p.b.cluster
 
-	if it.qos == 2 && n.persistQoS2 != nil {
+	it.sentAt = time.Now()
+	it.pend = nil
+
+	if it.qos == 2 && n.persistQoS2 != nil && !it.persisted {
 		if err := n.persistQoS2(p.st.tenantID, p.st.rawID, it.id, it.msgID); err != nil {
 			it.err = err
 
 			return
 		}
+
+		it.persisted = true
 	}
 
 	if hold := n.holdAppend; hold != nil {
-		hold(p.ctx)
+		if err := hold(p.ctx); err != nil {
+			it.err = err
+
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(p.ctx, n.appendAttempt)
@@ -658,22 +696,33 @@ func (p *pubPipe) runWriter() {
 }
 
 // commit waits until it is in the log, sending it again (same message ID,
-// so JetStream stores it once) after a failure or a wait that ran out, with
-// backoff, for as long as the connection is open. It reports false when the
-// connection ended first: the publish is abandoned with no ack.
+// so JetStream stores it once) after a failure or an ack that is late, for as
+// long as the connection is open. It reports false when the connection ended
+// first: the publish is abandoned with no ack.
+//
+// Recovery after an outage must be prompt (chaos finding CHAOS-1): every
+// publish that was in flight while the log was down has a failed attempt,
+// and retrying them one at a time behind a backoff acked about ten a second
+// for minutes. So the wait before a retry ends as soon as the log is seen
+// back (pace), and once a retried publish commits, the publishes queued
+// behind it that went out before it are all sent again at once
+// (resendQueued), so they commit together and their acks follow in order.
 func (p *pubPipe) commit(it *pubItem) bool {
 	n := p.b.cluster
-	delay := n.appendRetry
+	retried := false
 
 	for {
 		if it.err == nil {
-			ctx, cancel := context.WithTimeout(p.ctx, n.appendAttempt)
-			_, _, err := it.pend.Wait(ctx)
-
-			cancel()
-
+			err := p.wait(it)
 			if err == nil {
 				n.appends.Add(1)
+				n.logUp.up()
+
+				p.delay = 0
+
+				if retried {
+					p.resendQueued(it.sentAt)
+				}
 
 				if it.qos == 2 && !p.committed(it) {
 					return false
@@ -698,18 +747,225 @@ func (p *pubPipe) commit(it *pubItem) bool {
 			return false
 		}
 
-		n.log.Warn("tether: append failed, retrying", slog.String("client", p.cl.ID), slog.Uint64("packet_id", uint64(it.id)),
-			slog.Duration("in", delay), slog.Any("error", it.err))
-
-		select {
-		case <-p.ctx.Done():
+		if !p.pace(it) {
 			return false
-		case <-time.After(delay):
 		}
 
-		delay = min(2*delay, n.appendRetryMax)
+		retried = true
 
 		p.start(it)
+	}
+}
+
+// errAckLate is a commit wait that ran past appendLate.
+var errAckLate = fmt.Errorf("tether/broker: append ack is late: %w", cluster.ErrUnavailable)
+
+// wait waits for the commit of it's latest attempt, for appendLate at first.
+// An ack that has not come by then is taken as lost (errAckLate), and the
+// append is sent again; the next wait for this publish is twice as long, up
+// to appendAttempt, so on a link slower than appendLate an attempt still
+// gets the time it needs.
+func (p *pubPipe) wait(it *pubItem) error {
+	n := p.b.cluster
+
+	if it.late == 0 {
+		it.late = n.appendLate
+	}
+
+	ctx, cancel := context.WithTimeout(p.ctx, it.late)
+	defer cancel()
+
+	_, _, err := it.pend.Wait(ctx)
+	if err != nil && p.ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+		it.late = min(2*it.late, max(n.appendAttempt, n.appendLate))
+
+		return fmt.Errorf("%w: %w", errAckLate, err)
+	}
+
+	return err
+}
+
+// pace waits before it is sent again, and reports false when the connection
+// ended first. The wait is the pipe's backoff, appendRetry doubling to
+// appendRetryMax, starting over once the pipe commits something. When the
+// failure was the log being unreachable (an error wrapping
+// cluster.ErrUnavailable, a late ack included) the wait also ends as soon as
+// the node sees the log back (logHealth), and there is none at all when it
+// came back after the failed attempt went out: that attempt failed during
+// the outage, which is over.
+func (p *pubPipe) pace(it *pubItem) bool {
+	n := p.b.cluster
+	unreachable := errors.Is(it.err, cluster.ErrUnavailable)
+
+	if unreachable && n.logUp.cameBackSince(it.sentAt) {
+		n.log.Debug("tether: append failed while the log was down, sending it again", slog.String("client", p.cl.ID),
+			slog.Uint64("packet_id", uint64(it.id)), slog.Any("error", it.err))
+
+		return true
+	}
+
+	if p.delay == 0 {
+		p.delay = n.appendRetry
+	}
+
+	n.log.Warn("tether: append failed, retrying", slog.String("client", p.cl.ID), slog.Uint64("packet_id", uint64(it.id)),
+		slog.Duration("in", p.delay), slog.Any("error", it.err))
+
+	var back <-chan struct{}
+
+	if unreachable {
+		var release func()
+
+		back, release = n.logDown()
+		defer release()
+	}
+
+	timer := time.NewTimer(p.delay)
+	defer timer.Stop()
+
+	p.delay = min(2*p.delay, n.appendRetryMax)
+
+	select {
+	case <-p.ctx.Done():
+		return false
+	case <-back:
+	case <-timer.C:
+	}
+
+	return true
+}
+
+// resendQueued sends again, in order and without waiting, every publish
+// queued behind the head whose latest attempt went out before the head's
+// committed one (before): those went out while the log was down and failed,
+// or wait for an ack that died with the old leader. What did commit is
+// stored once (same message IDs). A publish the starter has not reached yet
+// goes out fresh from there.
+func (p *pubPipe) resendQueued(before time.Time) {
+	sent := 0
+
+	for _, x := range p.toAck.snapshot() {
+		select {
+		case <-x.started:
+		default:
+			// The starter goes in order: nothing after this has started.
+			return
+		}
+
+		if x.code != 0 || !x.sentAt.Before(before) {
+			continue
+		}
+
+		if p.ctx.Err() != nil {
+			return
+		}
+
+		p.start(x)
+
+		sent++
+	}
+
+	if sent > 0 {
+		p.b.cluster.log.Info("tether: the log is back, sending the queued publishes again", slog.String("client", p.cl.ID), slog.Int("publishes", sent))
+	}
+}
+
+// logHealth is what a node's pipes know about the log. A pipe whose append
+// failed because the log could not be reached marks it down (logDown) and
+// waits for back. While any pipe waits, one prober asks the log stream for a
+// leader every logProbe; when one answers, or an append commits, the log is
+// up again and back closes, so every waiting pipe retries at once instead of
+// at the end of its backoff. Its zero value is ready.
+type logHealth struct {
+	mu      sync.Mutex
+	down    bool          // found unreachable and not seen back since
+	back    chan struct{} // closed when it comes back; set while down
+	upAt    time.Time     // when it last came back
+	waiting int           // pipes waiting on back
+	probing bool          // the prober runs
+}
+
+// up records that the log took an append or answered the prober.
+func (h *logHealth) up() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.down {
+		h.down = false
+		h.upAt = time.Now()
+		close(h.back)
+		h.back = nil
+	}
+}
+
+// cameBackSince reports whether the log came back after t.
+func (h *logHealth) cameBackSince(t time.Time) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.upAt.After(t)
+}
+
+// logDown records that an append failed because the log could not be
+// reached, starts the prober when none runs, and returns the channel that
+// closes when the log is back and the func to call when done waiting.
+func (n *clusterNode) logDown() (back <-chan struct{}, release func()) {
+	h := &n.logUp
+
+	h.mu.Lock()
+
+	if !h.down {
+		h.down = true
+		h.back = make(chan struct{})
+	}
+
+	h.waiting++
+	back = h.back
+	start := !h.probing
+	h.probing = true
+
+	h.mu.Unlock()
+
+	if start {
+		go n.probeLog()
+	}
+
+	return back, func() {
+		h.mu.Lock()
+		h.waiting--
+		h.mu.Unlock()
+	}
+}
+
+// probeLog asks the log stream for a leader every logProbe, each ask bounded
+// by twice that, until the log is up or no pipe waits for it. It waits
+// before its first ask too, so a pipe that fails for a reason the probe
+// cannot see retries at most about once per logProbe.
+func (n *clusterNode) probeLog() {
+	h := &n.logUp
+
+	for {
+		time.Sleep(n.logProbe)
+
+		h.mu.Lock()
+
+		if !h.down || h.waiting == 0 {
+			h.probing = false
+			h.mu.Unlock()
+
+			return
+		}
+
+		h.mu.Unlock()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*n.logProbe)
+		err := n.Log.Ping(ctx)
+
+		cancel()
+
+		if err == nil {
+			h.up()
+		}
 	}
 }
 
@@ -954,6 +1210,14 @@ type fifo[T any] struct {
 }
 
 func newFifo[T any]() fifo[T] { return fifo[T]{wake: make(chan struct{}, 1)} }
+
+// snapshot returns the queued items, oldest first.
+func (q *fifo[T]) snapshot() []T {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	return slices.Clone(q.items)
+}
 
 func (q *fifo[T]) push(x T) {
 	q.mu.Lock()
