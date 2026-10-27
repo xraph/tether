@@ -1,0 +1,20 @@
+# cmd/tether-bench
+
+Tether's load harness. `go build -o bin/tether-bench ./cmd/tether-bench`. README.md has the commands, RESULTS.md the first numbers (commit 6dfe2dd, one M3 Max), `results/<date>/` the JSON of every run.
+
+## Commands
+
+- `cell --bin <tether binary> [--dir D --nodes 3 --nats 3 --devices 16]`: runs `--nats` NATS servers (this binary re-run as `tether-bench nats`, JetStream, one cluster) and `--nodes` tether processes in external mode on loopback ports, shared SQLite file, one at a time. Makes tenant "bench" (app `aapp_bench`), role `rw` (publish and subscribe `bench/#`), N unpinned devices. Writes `cell.json` (`cellInfo`: targets, admin URLs, token, tenant, creds path, broker and NATS pids) and `creds.csv` (0600), then waits for SIGINT or SIGTERM and stops its children. A SIGKILL leaves them running.
+- `provision --admin <base URL> --token T --devices N --out creds.csv`: the tenant, role and devices alone, against any node.
+- `conn --clients N --rate R --hold D`: opens N MQTT 5 clients (clean start) at R/s with at most `--parallel` dials in flight, holds them, reports connect latency, per-node counts (client side and from `GET /tenants/:id/stats`) and broker RSS before and after (`ps`, from `--pids` or cell.json).
+- `pubsub --qos 0|1 --clients N --rate R --duration D [--background B] [--placement cross|same]`: N/2 pairs, publisher j to topic `bench/t<j>`, subscriber j on node j mod nodes, publisher on the next node (cross). Payload = send time on the process clock (`epoch`) plus sequence. Percentiles are exact (sorted samples). Phases are by send time. Reports sent, acked, received, duplicates, lost.
+- `storm`: connects a group, waits for `--at`, resets every connection (SO_LINGER 0, no DISCONNECT), reconnects each at a random moment in `--window`, holds them until `--until`. `pubsub --storm-external --storm-at --storm-window --start-at` marks baseline, storm (to window + 2 s) and after phases and prints the storm over baseline p99 ratio. `pubsub --storm N` runs the same storm in-process.
+- `series.sh OUTDIR NAME RUNS COMMAND args...`: fresh cell per run, JSON per run, fence count from the broker logs. `STORM_CLIENTS`, `STORM_WINDOW`, `STORM_AT`, `STORM_DURATION` add the storm process.
+
+## Limits
+
+One loopback address has about 16,000 ephemeral ports on macOS, shared by every connection, the NATS routes included. Past about 15,000 clients the cell's own connections fail and the brokers fence. Teardown resets connections (`closeAll(.., true)`) so no port sits in TIME_WAIT for the next run.
+
+## Tests
+
+`TestBenchSmoke` starts two in-process nodes (two forge apps, each an embedded NATS routed to the other, shared memory stores, as extension/cluster_test.go does), provisions through the admin API into a CSV, runs 50 clients at QoS 1 for 5 s and checks the histogram, loss and per-node counts. Subtests run a small storm (skipped with `-short`) and `conn`. `TestSummarize` pins the percentile rule.
