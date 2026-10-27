@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/xraph/tether/cluster"
 )
 
 // TestMain lets the test binary serve as its own child processes: a
@@ -21,7 +23,10 @@ func TestMain(m *testing.M) {
 		os.Exit(code)
 	}
 
-	os.Exit(m.Run())
+	code := m.Run()
+
+	removeBinary()
+	os.Exit(code)
 }
 
 // result logs one line the README's results table is built from.
@@ -32,14 +37,18 @@ func result(t *testing.T, format string, args ...any) {
 
 // subscribe connects n persistent subscribers to node nd, subscribed to
 // filter, and waits until the cell has stored their sessions with the
-// subscription.
-func subscribe(t *testing.T, c *testCell, prefix, filter string, count int, nd *node) []*subscriber {
+// subscription. Each setup runs on a subscriber before it connects.
+func subscribe(t *testing.T, c *testCell, prefix, filter string, count int, nd *node, setup ...func(*subscriber)) []*subscriber {
 	t.Helper()
 
 	subs := make([]*subscriber, 0, count)
 
 	for i := range count {
 		s := newSubscriber(c, fmt.Sprintf("%s-%d", prefix, i), filter)
+
+		for _, f := range setup {
+			f(s)
+		}
 
 		cn, err := s.connect(nd)
 		if err != nil {
@@ -328,10 +337,12 @@ func firstAfter(m map[string]time.Time, t0 time.Time) time.Duration {
 
 // TestKill9NATSServer kills the NATS server that leads the log stream while a
 // publisher runs at 500 msg/s QoS 1 and persistent subscribers on two nodes
-// listen. Nothing acknowledged is lost, and publishing resumes within the
-// JetStream leader election time.
+// listen. The brokers run with the production heartbeat and lease (2 s and
+// 10 s): two servers still make a quorum, so no broker may fence. Nothing
+// acknowledged is lost, and publishing resumes within the JetStream leader
+// election time.
 func TestKill9NATSServer(t *testing.T) {
-	c := startCell(t)
+	c := startCell(t, withTimings(cluster.DefaultHeartbeat, cluster.DefaultLease))
 	n1, n2, n3 := c.nodes[0], c.nodes[1], c.nodes[2]
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -387,22 +398,52 @@ func TestKill9NATSServer(t *testing.T) {
 
 	time.Sleep(5 * time.Second)
 	pub.stop()
-	cancel()
 
 	st := pub.stats()
 
+	// The subscribers keep reconnecting until the loss check is done.
 	assertNoLoss(t, 60*time.Second, []*publisher{pub}, subs)
+	cancel()
 	assertNoCursorSkips(t, c, from, subs)
 
-	reconnects := 0
+	// No broker fenced: none logged it, and no client was let go with 0x88
+	// (server unavailable), which is how a fence drops a 5.0 client.
+	fenced := fences(c)
+	if slices.ContainsFunc(fenced, func(n int) bool { return n > 0 }) {
+		t.Errorf("brokers fenced %v times with a NATS quorum intact", fenced)
+	}
+
+	reconnects, unavailable := 0, 0
 
 	for _, s := range subs {
 		_, conns, _ := s.snapshot()
 		reconnects += len(conns) - 1
+
+		unavailable += count88(conns)
 	}
 
-	result(t, "killed %s (log stream leader); new leader after %s; publishing resumed %t after %s (bound election + %s); published %d, acknowledged %d; publisher connections %d, subscriber reconnects %d; fences %v",
-		leaderName, elected.Round(time.Millisecond), ok, resumed.Round(time.Millisecond), electionSlack, len(st.sent), len(st.acked), len(st.conns), reconnects, fences(c))
+	unavailable += count88(st.conns)
+
+	if unavailable > 0 {
+		t.Errorf("%d client connections were dropped with 0x88 (server unavailable)", unavailable)
+	}
+
+	result(t, "heartbeat %s, lease %s; killed %s (log stream leader); new leader after %s; publishing resumed %t after %s (bound election + %s); published %d, acknowledged %d; publisher connections %d, subscriber reconnects %d; 0x88 drops %d; fences %v",
+		c.heartbeat, c.lease, leaderName, elected.Round(time.Millisecond), ok, resumed.Round(time.Millisecond), electionSlack,
+		len(st.sent), len(st.acked), len(st.conns), reconnects, unavailable, fenced)
+}
+
+// count88 counts the connections the server ended with DISCONNECT 0x88.
+func count88(conns []conn) int {
+	n := 0
+
+	for _, cn := range conns {
+		if cn.gotDisconnect && cn.reason == 0x88 {
+			n++
+		}
+	}
+
+	return n
 }
 
 // resumedAfter finds when, after t0, PUBACKs for messages sent after t0 first
@@ -546,12 +587,19 @@ func TestPartitionBrokerFromNATS(t *testing.T) {
 
 	unfenced := c.waitBeat(0, healed, 30*time.Second).Sub(healed)
 
-	// n1 reclaims its own keys on unfence. It must not take back the
-	// sessions n2 now runs.
-	time.Sleep(3 * time.Second)
+	// n1 reclaims its own keys as it unfences. Give it a few heartbeats
+	// past that, then look at every record update since the heal: none may
+	// hand a session back to n1, which n2 now runs.
+	beatsAfter(t, c, "n1", healed, 4)
 	pub.stop()
 
 	for _, s := range subs {
+		for _, ev := range c.obs.events(c.sessionKey(s.id)) {
+			if ev.stamp.After(healed) && ev.rec != nil && ev.rec.Owner == "n1" {
+				t.Errorf("%s: record rev %d went back to n1 after the heal (epoch %d)", s.id, ev.rev, ev.rec.Epoch)
+			}
+		}
+
 		if rec := c.obs.record(c.sessionKey(s.id)); rec == nil || rec.Owner != "n2" {
 			t.Errorf("%s: record after the heal: %+v", s.id, rec)
 		}
@@ -604,6 +652,23 @@ func TestPartitionBrokerFromNATS(t *testing.T) {
 		firstMove.stamp.Sub(lastBeat).Round(time.Millisecond), lease+deadMargin,
 		firstMove.stamp.Sub(lastDrop).Round(time.Millisecond), takeovers, reasons, unfenced.Round(time.Millisecond),
 		len(st.sent), len(st.acked), fences(c))
+}
+
+// beatsAfter waits until the node has written n heartbeats stamped after t0.
+func beatsAfter(t *testing.T, c *testCell, nodeID string, t0 time.Time, n int) {
+	t.Helper()
+
+	eventually(t, 30*time.Second, fmt.Sprintf("%d heartbeats from %s", n, nodeID), func() bool {
+		got := 0
+
+		for _, b := range c.obs.beats(nodeID) {
+			if b.stamp.After(t0) {
+				got++
+			}
+		}
+
+		return got >= n
+	})
 }
 
 func maxTime(a, b time.Time) time.Time {
@@ -683,7 +748,6 @@ func TestNATSMinorityNoAcks(t *testing.T) {
 	time.Sleep(3 * time.Second)
 	minority.stop()
 	majority.stop()
-	cancel()
 
 	minSt, majSt := minority.stats(), majority.stats()
 
@@ -707,12 +771,25 @@ func TestNATSMinorityNoAcks(t *testing.T) {
 		t.Errorf("%d of %d QoS 1 publishes sent through the minority side during the partition got a PUBACK", acked, attempts)
 	}
 
-	// Broker 1 fenced and dropped the publisher, and refused it until the heal.
-	var dropped time.Duration
+	// Broker 1 fenced and dropped the publisher, and refused it until the
+	// heal. Exactly one connection was open at the cut, and it has to have
+	// ended within lease/2 + 1 s of it.
+	var (
+		dropped time.Duration
+		open    int
+	)
 
 	for _, cn := range minSt.conns {
 		switch {
-		case cn.at.Before(cut) && !cn.end.IsZero() && cn.end.After(cut):
+		case cn.at.Before(cut) && (cn.end.IsZero() || cn.end.After(cut)):
+			open++
+
+			if cn.end.IsZero() {
+				t.Error("n1 never dropped the minority publisher's connection from before the cut")
+
+				continue
+			}
+
 			dropped = cn.end.Sub(cut)
 			if dropped > lease/2+time.Second {
 				t.Errorf("n1 dropped the minority publisher %s after the cut, over lease/2 + 1 s", dropped.Round(time.Millisecond))
@@ -720,6 +797,10 @@ func TestNATSMinorityNoAcks(t *testing.T) {
 		case cn.at.After(cut) && cn.at.Before(healed):
 			t.Errorf("n1 accepted a CONNECT at %s, during the partition", cn.at.Format("15:04:05.000"))
 		}
+	}
+
+	if open != 1 {
+		t.Errorf("the minority publisher had %d connections open at the cut, want 1", open)
 	}
 
 	// The majority side keeps the cell going: past any fence and election the
@@ -735,7 +816,9 @@ func TestNATSMinorityNoAcks(t *testing.T) {
 
 	resumed += lease
 
+	// The subscribers keep reconnecting until the loss check is done.
 	assertNoLoss(t, 60*time.Second, []*publisher{minority, majority}, subs)
+	cancel()
 	assertNoCursorSkips(t, c, from, subs)
 
 	result(t, "minority publishes during the partition %d, acknowledged %d; minority publisher dropped %s after the cut; majority resumed after %s; acknowledged minority %d, majority %d; fences %v",
@@ -754,8 +837,7 @@ func TestSlowConsumerNoSkips(t *testing.T) {
 	n1, n2, n3 := c.nodes[0], c.nodes[1], c.nodes[2]
 
 	fast := subscribe(t, c, "slow-a", "chaos/slow/#", 1, n2)
-	slow := subscribe(t, c, "slow-b", "chaos/slow/#", 1, n2)
-	slow[0].slow = 3 * time.Millisecond
+	slow := subscribe(t, c, "slow-b", "chaos/slow/#", 1, n2, func(s *subscriber) { s.slow = 3 * time.Millisecond })
 	subs := append(fast, slow...)
 
 	from := baseline(t, c)
@@ -771,7 +853,7 @@ func TestSlowConsumerNoSkips(t *testing.T) {
 
 	var backlogs []string
 
-	move := func(to *node) {
+	move := func(to *node, wantBacklog int) {
 		acked := pub.stats().acked
 
 		for _, s := range subs {
@@ -784,6 +866,10 @@ func TestSlowConsumerNoSkips(t *testing.T) {
 			}
 
 			backlogs = append(backlogs, fmt.Sprintf("%s %d behind", s.id, behind))
+
+			if s.slow > 0 && behind < wantBacklog {
+				t.Fatalf("%s is only %d messages behind at the move, under %d: the scenario has no backlog to test", s.id, behind, wantBacklog)
+			}
 		}
 
 		for _, s := range subs {
@@ -804,9 +890,11 @@ func TestSlowConsumerNoSkips(t *testing.T) {
 		}
 	}
 
-	move(n3)
+	// 8 s at 500 msg/s against about 330 msg/s leaves well over a thousand
+	// behind; a few hundred is the floor for a backlog worth the name.
+	move(n3, 300)
 	time.Sleep(5 * time.Second)
-	move(n2)
+	move(n2, 0)
 	time.Sleep(5 * time.Second)
 	pub.stop()
 

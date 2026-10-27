@@ -23,9 +23,8 @@ jobs:
 
     env:
       GOWORK: "off"
-      # Every cell keeps its data and logs here, for the upload on failure.
+      # Every cell keeps its data and logs, for the upload on failure.
       TETHER_CHAOS_KEEP: "1"
-      TMPDIR: ${{ runner.temp }}/chaos
 
     steps:
       - name: Checkout
@@ -38,8 +37,12 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      # The runner context isn't available in job-level env, so TMPDIR is
+      # set here for the steps that follow.
       - name: Make the temp dir
-        run: mkdir -p "$TMPDIR"
+        run: |
+          mkdir -p "$RUNNER_TEMP/chaos"
+          echo "TMPDIR=$RUNNER_TEMP/chaos" >> "$GITHUB_ENV"
 
       - name: Run the chaos suite
         run: go test -tags chaos -count=1 -v -timeout 30m ./chaos/

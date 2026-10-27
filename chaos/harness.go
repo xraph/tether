@@ -44,7 +44,8 @@ import (
 )
 
 // The cell's timings. They are short so a run takes minutes; README.md
-// records them next to the results.
+// records them next to the results. A scenario can ask for others
+// (withTimings), as the NATS server kill does for the production defaults.
 const (
 	heartbeat = 500 * time.Millisecond
 	lease     = 3 * time.Second
@@ -389,6 +390,9 @@ type testCell struct {
 	token  string
 	tenant string
 
+	// heartbeat and lease are the brokers' cluster timings.
+	heartbeat, lease time.Duration
+
 	servers [natsSize]*natsServer
 	// routes[i][j] carries server i's route to server j.
 	routes [natsSize][natsSize]*faults.Proxy
@@ -401,6 +405,13 @@ var (
 	builtBin  string
 	errBuild  error
 )
+
+// removeBinary deletes the directory tetherBinary built into, for TestMain.
+func removeBinary() {
+	if builtBin != "" {
+		discard(os.RemoveAll(filepath.Dir(builtBin)))
+	}
+}
 
 // tetherBinary builds cmd/tether once per test binary.
 func tetherBinary(t *testing.T) string {
@@ -478,22 +489,46 @@ func newProxy(t *testing.T, target string) *faults.Proxy {
 	return p
 }
 
+// cellOption changes a cell before it starts.
+type cellOption func(*testCell)
+
+// withTimings runs the brokers with the given heartbeat and lease instead of
+// the chaos ones.
+func withTimings(hb, l time.Duration) cellOption {
+	return func(c *testCell) { c.heartbeat, c.lease = hb, l }
+}
+
 // startCell starts three NATS servers routed to each other through proxies,
 // then three brokers one after another (they share one SQLite file), each
 // connected to NATS through its own proxies, and makes a tenant with a role
 // that may publish and subscribe under chaos/#.
-func startCell(t *testing.T) *testCell {
+func startCell(t *testing.T, opts ...cellOption) *testCell {
 	t.Helper()
 
 	c := &testCell{
-		t:     t,
-		dir:   cellDir(t),
-		bin:   tetherBinary(t),
-		token: fmt.Sprintf("chaos-%d", time.Now().UnixNano()),
+		t:         t,
+		dir:       cellDir(t),
+		bin:       tetherBinary(t),
+		token:     fmt.Sprintf("chaos-%d", time.Now().UnixNano()),
+		heartbeat: heartbeat,
+		lease:     lease,
 	}
 
-	// Cleanups run last in, first out: brokers go before servers, and both
-	// before the proxies (registered first, so they close last).
+	for _, o := range opts {
+		o(c)
+	}
+
+	// Cleanups run last in, first out. The log dump goes first so it runs
+	// last, from the files, whatever stage a failure stopped at. The servers'
+	// live state is dumped from a cleanup startServers registers, which runs
+	// while they are still up. Brokers go before servers, and both before the
+	// proxies (registered first, so they close last).
+	t.Cleanup(func() {
+		if t.Failed() {
+			c.dumpLogs()
+		}
+	})
+
 	c.startServers()
 	c.obs = newObserver(t, c.serverURLs())
 	c.waitJetStream()
@@ -501,12 +536,6 @@ func startCell(t *testing.T) *testCell {
 	c.obs.watch(t)
 	c.waitMembers()
 	c.makeTenant()
-
-	t.Cleanup(func() {
-		if t.Failed() {
-			c.dumpLogs()
-		}
-	})
 
 	return c
 }
@@ -559,6 +588,13 @@ func (c *testCell) startServers() {
 	for i := range natsSize {
 		c.launchServer(i, dead)
 	}
+
+	// Registered after every server's stop, so it runs before them.
+	c.t.Cleanup(func() {
+		if c.t.Failed() {
+			c.dumpState()
+		}
+	})
 }
 
 // launchServer starts server i (again, after a kill) with its routes through
@@ -679,7 +715,7 @@ tether:
     replicas: 3
     no_discovery: true
 `, n.http, filepath.Join(c.dir, "tether.db"), n.mqtt, filepath.Join(c.dir, n.id, "sessions"),
-		n.id, cellName, strings.Join(quoted, ", "), heartbeat, lease)
+		n.id, cellName, strings.Join(quoted, ", "), c.heartbeat, c.lease)
 }
 
 func (c *testCell) launchBroker(i int) {
@@ -1012,8 +1048,7 @@ func (c *testCell) logCount(i int, s string) int {
 }
 
 // dumpLogs prints the warnings and errors of every process, for a failed
-// run, and saves each live NATS server's /jsz and /connz in the cell's
-// directory (kept when TETHER_CHAOS_KEEP is set).
+// run.
 func (c *testCell) dumpLogs() {
 	for _, n := range c.nodes {
 		if n == nil || n.proc == nil {
@@ -1023,14 +1058,20 @@ func (c *testCell) dumpLogs() {
 		c.t.Logf("---- %s (%s), warnings and errors:\n%s", n.id, n.logPath, grepTail(n.logPath, 60, "WARN", "ERROR", "level=warn", "level=error"))
 	}
 
-	for i, s := range c.servers {
+	for _, s := range c.servers {
 		if s == nil || s.proc == nil {
 			continue
 		}
 
 		c.t.Logf("---- %s (%s), tail:\n%s", s.name, s.logPath, tail(s.logPath, 20))
+	}
+}
 
-		if s.exited() {
+// dumpState saves each live NATS server's /jsz and /connz in the cell's
+// directory, for a failed run.
+func (c *testCell) dumpState() {
+	for i, s := range c.servers {
+		if s == nil || s.proc == nil || s.exited() {
 			continue
 		}
 
@@ -1722,28 +1763,35 @@ type publisher struct {
 	rate  int
 	nodes []*node // reconnect order
 
-	mu     sync.Mutex
-	sent   map[string]time.Time
-	acked  map[string]time.Time
-	nacked map[string]byte
-	failed int // publishes that ended without any PUBACK
-	next   int
-	conns  []*conn
-	cur    *conn
-	drop   chan struct{}
-	wg     sync.WaitGroup // in-flight publishes
-	cancel context.CancelFunc
-	loops  sync.WaitGroup
+	mu       sync.Mutex
+	sent     map[string]time.Time
+	acked    map[string]time.Time
+	nacked   map[string]byte
+	failed   int // publishes that ended without any PUBACK
+	next     int
+	conns    []*conn
+	cur      *conn
+	drop     chan struct{}
+	wg       sync.WaitGroup // in-flight publishes
+	cancel   context.CancelFunc
+	loops    sync.WaitGroup
+	stopOnce sync.Once
 }
 
 func newPublisher(c *testCell, name, topic string, rate int, nodes ...*node) *publisher {
 	clientID := "pub-" + name
 
-	return &publisher{
+	p := &publisher{
 		name: name, id: clientID, cr: c.device(clientID), topic: topic, rate: rate, nodes: nodes,
 		sent: make(map[string]time.Time), acked: make(map[string]time.Time), nacked: make(map[string]byte),
 		drop: make(chan struct{}, 1),
 	}
+
+	// A scenario that fails part way must not leave the publisher running
+	// into the next one: disconnect at once, without waiting for acks.
+	c.t.Cleanup(func() { p.halt(false) })
+
+	return p
 }
 
 // start connects and publishes until stop.
@@ -1767,19 +1815,34 @@ func (p *publisher) start() {
 }
 
 // stop ends publishing, waits for the publishes in flight to finish, and
-// disconnects.
-func (p *publisher) stop() {
-	p.cancel()
-	p.loops.Wait()
-	p.wg.Wait()
+// disconnects. Only the first stop or halt does anything.
+func (p *publisher) stop() { p.halt(true) }
 
-	p.mu.Lock()
-	cn := p.cur
-	p.mu.Unlock()
+// halt ends publishing and disconnects. With drain it first waits for the
+// publishes in flight to be answered; without, it disconnects at once, which
+// ends them.
+func (p *publisher) halt(drain bool) {
+	p.stopOnce.Do(func() {
+		if p.cancel != nil {
+			p.cancel()
+		}
 
-	if cn != nil {
-		discard(cn.pc.Disconnect(&paho.Disconnect{ReasonCode: 0}))
-	}
+		p.loops.Wait()
+
+		if drain {
+			p.wg.Wait()
+		}
+
+		p.mu.Lock()
+		cn := p.cur
+		p.mu.Unlock()
+
+		if cn != nil {
+			discard(cn.pc.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+		}
+
+		p.wg.Wait()
+	})
 }
 
 func (p *publisher) connectLoop(ctx context.Context) {
