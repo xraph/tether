@@ -89,6 +89,47 @@ tether:
   #   refresh_interval: 10m
   #   leeway: 30s
 
+  # Run this node as one broker of a cell: several nodes sharing sessions,
+  # QoS 1 and 2 messages, retained messages and shared subscriptions over
+  # NATS JetStream, so a client can connect to any of them. Off while this
+  # block is absent. Every node of a cell needs the same cell name and its own
+  # node_id (--node-id or TETHER_NODE_ID set it from outside the file).
+  #
+  # The binary keeps tenants, keys and roles in SQLite, so the nodes of one
+  # cell must share the same sqlite_path, which means one host. Across hosts,
+  # mount the extension in your own app on PostgreSQL.
+  # cluster:
+  #   enabled: true
+  #   node_id: "n1"
+  #   cell: "demo"                     # lowercase letters and digits, 1 to 16
+  #
+  #   # embedded runs a NATS server inside each node: for cells of up to
+  #   # three nodes. Past that, run NATS yourself and use external.
+  #   mode: embedded
+  #   embedded:
+  #     listen: "127.0.0.1:-1"           # NATS clients; -1 picks a free port
+  #     cluster_name: "demo"
+  #     cluster_listen: "127.0.0.1:6222" # routes from the other nodes
+  #     routes: ["nats://127.0.0.1:6223", "nats://127.0.0.1:6224"]
+  #     store_dir: ""                    # empty: ./data/nats/<node_id>
+  #     # A listen address past loopback needs user and password (every
+  #     # node of the cell gets the same pair), or insecure: true to let
+  #     # anyone who reaches the port in.
+  #     user: ""
+  #     password: ""
+  #     insecure: false
+  #
+  #   # external connects to NATS you run (3 or 5 JetStream servers).
+  #   # mode: external
+  #   # urls: ["nats://nats-1:4222", "nats://nats-2:4222", "nats://nats-3:4222"]
+  #   # credentials: "/etc/tether/nats.creds"
+  #
+  #   heartbeat: 2s        # how often a node renews its lease
+  #   lease: 10s           # a silent node is dead after lease + 2s
+  #   replicas: 0          # 0 picks min(3, servers)
+  #   log_max_age: 168h    # how long an offline session's messages wait
+  #   no_discovery: false  # only for a node behind a proxy
+
 # The dashboard has its own section (dashboard:), and its auth is off by
 # default. While it is off, Tether's dashboard pages refuse every request
 # unless the binary runs with --insecure-admin. Once you turn it on, set

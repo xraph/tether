@@ -37,6 +37,8 @@ func startEmbedded(cfg Config, wait time.Duration) (*server.Server, error) {
 		NoSigs:     true,
 		JetStream:  true,
 		StoreDir:   e.StoreDir,
+		Username:   e.User,
+		Password:   e.Password,
 	}
 
 	if e.ClusterName != "" {
@@ -45,12 +47,20 @@ func startEmbedded(cfg Config, wait time.Duration) (*server.Server, error) {
 			return nil, fmt.Errorf("embedded.cluster_listen: %w", cerr)
 		}
 
-		opts.Cluster = server.ClusterOpts{Name: e.ClusterName, Host: chost, Port: cport}
+		opts.Cluster = server.ClusterOpts{
+			Name: e.ClusterName, Host: chost, Port: cport,
+			Username: e.User, Password: e.Password,
+		}
 
 		for _, r := range e.Routes {
 			u, perr := url.Parse(r)
 			if perr != nil || u.Host == "" {
 				return nil, fmt.Errorf("embedded.routes: bad route %q", r)
+			}
+
+			// The other servers want the same pair this one does.
+			if u.User == nil && e.User != "" {
+				u.User = url.UserPassword(e.User, e.Password)
 			}
 
 			opts.Routes = append(opts.Routes, u)

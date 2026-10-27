@@ -156,7 +156,7 @@ func TestInjectorNotRepublished(t *testing.T) {
 
 	// A message handed to B directly, as its Router would, is injected and
 	// delivered, and not published again either.
-	b.DeliverRouted(c.t1.ID.String(), "a/direct", []byte("direct"), cluster.Props{}, false)
+	b.deliverRouted(c.t1.ID.String(), "a/direct", []byte("direct"), cluster.Props{}, false)
 	require.Equal(t, message{Topic: "a/direct", Payload: "direct"}, recvMsg(t, sub))
 
 	require.Equal(t, sentByA+5, a.cluster.published.Load())
@@ -326,7 +326,7 @@ func TestRouteFailureRefusesFilter(t *testing.T) {
 	require.Equal(t, []byte{1}, subscribe5(t, sub, "ok/+"))
 
 	// A closed Router refuses every subscribe.
-	b.cluster.Router.Close()
+	b.cluster.router.Close()
 
 	before := b.cluster.routeErrors.Load()
 	require.Equal(t, []byte{packets.ErrUnspecifiedError.Code}, subscribe5(t, sub, "r/#"))
@@ -511,20 +511,20 @@ func TestDeliverRoutedDropsForeign(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte{1, 1}, subscribe5(t, sub, "#", "$SYS/#"))
 
-	b.DeliverRouted("not-a-tenant", "a", []byte("x"), cluster.Props{}, false)
-	b.DeliverRouted(strings.ToUpper(tid), "a", []byte("x"), cluster.Props{}, false)
-	b.DeliverRouted(tid, "$SYS/clients/connected", []byte("999"), cluster.Props{}, false)
-	b.DeliverRouted(tid, "$sys/x", []byte("x"), cluster.Props{}, false)
-	b.DeliverRouted(tid, "a/+", []byte("x"), cluster.Props{}, false)
-	b.DeliverRouted(tid, "$share/g/a", []byte("x"), cluster.Props{}, false)
-	b.DeliverRouted(tid, "ok", []byte("sentinel"), cluster.Props{}, false)
+	b.deliverRouted("not-a-tenant", "a", []byte("x"), cluster.Props{}, false)
+	b.deliverRouted(strings.ToUpper(tid), "a", []byte("x"), cluster.Props{}, false)
+	b.deliverRouted(tid, "$SYS/clients/connected", []byte("999"), cluster.Props{}, false)
+	b.deliverRouted(tid, "$sys/x", []byte("x"), cluster.Props{}, false)
+	b.deliverRouted(tid, "a/+", []byte("x"), cluster.Props{}, false)
+	b.deliverRouted(tid, "$share/g/a", []byte("x"), cluster.Props{}, false)
+	b.deliverRouted(tid, "ok", []byte("sentinel"), cluster.Props{}, false)
 
 	require.Equal(t, message{Topic: "ok", Payload: "sentinel"}, recvMsg(t, sub))
 	noMoreMsgs(t, sub)
 
 	// After Stop nothing is injected, and nothing fails.
 	require.NoError(t, b.Stop(t.Context()))
-	b.DeliverRouted(tid, "ok", []byte("late"), cluster.Props{}, false)
+	b.deliverRouted(tid, "ok", []byte("late"), cluster.Props{}, false)
 	require.True(t, errors.Is(b.inject(tid, "ok", nil, 0, cluster.Props{}, "", 0, false), errNotInjecting))
 }
 

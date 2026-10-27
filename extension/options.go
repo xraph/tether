@@ -5,6 +5,7 @@ import (
 
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/store"
 )
 
@@ -20,6 +21,19 @@ func WithConfig(cfg Config) Option {
 // WithBrokerConfig sets the broker's listeners and limits.
 func WithBrokerConfig(cfg broker.Config) Option {
 	return func(e *Extension) { e.config.Broker = cfg }
+}
+
+// WithCluster runs the broker as one node of a cell, configured by cfg. It
+// turns cfg.Enabled on: passing it means you want the cell. Start connects
+// to the cell's NATS (or starts the embedded server), provisions its streams
+// and buckets, and joins; see cluster.Config for the keys and the README for
+// the embedded and external shapes. The "cluster" block of the config file
+// sets the same thing.
+func WithCluster(cfg cluster.Config) Option {
+	return func(e *Extension) {
+		cfg.Enabled = true
+		e.config.Cluster = cfg
+	}
 }
 
 // WithJWT lets users and service accounts connect with an authsome JWT as the

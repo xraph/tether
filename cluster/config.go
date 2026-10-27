@@ -6,6 +6,7 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"time"
 )
@@ -23,6 +24,9 @@ const (
 const (
 	DefaultHeartbeat = 2 * time.Second
 	DefaultLease     = 10 * time.Second
+	// DefaultLogMaxAge is how long the QoS 1 and 2 log keeps a message: the
+	// broker's default session expiry cap, 7 days.
+	DefaultLogMaxAge = 7 * 24 * time.Hour
 )
 
 // maxReplicas is the ceiling for stream and bucket replicas the cell asks for.
@@ -62,6 +66,11 @@ type Config struct {
 	// the proxy. With it on, the automatic replica count sees only the given
 	// URLs, so set Replicas.
 	NoDiscovery bool `yaml:"no_discovery" json:"no_discovery"`
+	// LogMaxAge is how long the QoS 1 and 2 log keeps a message, the MaxAge
+	// the cell's log stream is provisioned with. An offline session that
+	// stays away longer loses what it missed past that age, whatever its
+	// session expiry says. 0 means DefaultLogMaxAge.
+	LogMaxAge time.Duration `yaml:"log_max_age" json:"log_max_age"`
 }
 
 // EmbeddedConfig configures the nats-server that embedded mode runs.
@@ -83,6 +92,17 @@ type EmbeddedConfig struct {
 	Routes []string `yaml:"routes" json:"routes"`
 	// StoreDir is the JetStream storage directory.
 	StoreDir string `yaml:"store_dir" json:"store_dir"`
+	// User and Password, when set, are required of every client and every
+	// route of the embedded server: the broker's own connection, any tool
+	// you point at Listen, and the other servers of the cell, which must be
+	// given the same pair. They go into each route URL that carries none.
+	User     string `yaml:"user" json:"user"`
+	Password string `yaml:"password" json:"password"`
+	// Insecure lets Listen or ClusterListen bind an address other than
+	// loopback with no User and Password. Anyone who reaches such a port can
+	// then read and write every tenant's traffic, or join the cell as a
+	// route. Without it, Validate refuses that config.
+	Insecure bool `yaml:"insecure" json:"insecure"`
 }
 
 // DefaultConfig returns a disabled embedded configuration with the default
@@ -92,6 +112,7 @@ func DefaultConfig() Config {
 		Mode:      ModeEmbedded,
 		Heartbeat: DefaultHeartbeat,
 		Lease:     DefaultLease,
+		LogMaxAge: DefaultLogMaxAge,
 	}
 }
 
@@ -140,7 +161,20 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cluster: replicas %d must be 0 (auto) to %d", c.Replicas, maxReplicas)
 	}
 
+	if c.LogMaxAge < 0 {
+		return fmt.Errorf("cluster: log_max_age %s must not be negative", c.LogMaxAge)
+	}
+
 	return nil
+}
+
+// LogAge is LogMaxAge, or DefaultLogMaxAge when that is 0.
+func (c Config) LogAge() time.Duration {
+	if c.LogMaxAge == 0 {
+		return DefaultLogMaxAge
+	}
+
+	return c.LogMaxAge
 }
 
 func (e EmbeddedConfig) validate() error {
@@ -156,7 +190,56 @@ func (e EmbeddedConfig) validate() error {
 		return errors.New("cluster: embedded.cluster_name is required with routes")
 	}
 
+	if (e.User == "") != (e.Password == "") {
+		return errors.New("cluster: embedded.user and embedded.password go together")
+	}
+
+	return e.checkExposure()
+}
+
+// checkExposure refuses a listen address other than loopback when the server
+// would take anyone: no User and Password, and no Insecure.
+func (e EmbeddedConfig) checkExposure() error {
+	if e.User != "" || e.Insecure {
+		return nil
+	}
+
+	addrs := map[string]string{"embedded.listen": e.Listen}
+	if e.ClusterName != "" {
+		addrs["embedded.cluster_listen"] = e.ClusterListen
+	}
+
+	for _, key := range []string{"embedded.listen", "embedded.cluster_listen"} {
+		addr, ok := addrs[key]
+		if !ok || addr == "" {
+			continue
+		}
+
+		if !loopback(addr) {
+			return fmt.Errorf("cluster: %s %q is not a loopback address: set embedded.user and embedded.password "+
+				"(or embedded.insecure: true to accept anyone who reaches it)", key, addr)
+		}
+	}
+
 	return nil
+}
+
+// loopback reports whether the host of "host:port" is a loopback address. An
+// empty host binds every interface, so it is not; neither is an address that
+// does not parse.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	return ip != nil && ip.IsLoopback()
 }
 
 func checkNodeID(id string) error {

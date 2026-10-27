@@ -1,6 +1,10 @@
 package broker
 
-import "github.com/mochi-mqtt/server/v2/packets"
+import (
+	"time"
+
+	"github.com/mochi-mqtt/server/v2/packets"
+)
 
 // Metrics receives the broker's node-wide counters. None of them carries a
 // tenant: per-tenant numbers are in Stats and the tenant's $SYS topics, so
@@ -31,6 +35,32 @@ type Metrics interface {
 	ACLDenied(op string)
 }
 
+// ClusterMetrics receives a cell node's counters. A Deps.Metrics that also
+// implements it gets them when the broker runs with a cluster; the broker
+// finds it with a type assertion, so a Metrics written before clustering
+// keeps working. None carries a tenant. Like Metrics, the methods run on hot
+// paths and other goroutines, so they must be quick and safe for concurrent
+// use.
+type ClusterMetrics interface {
+	// ClusterFenced reports that the node was fenced (true: it drops its
+	// clients and refuses new ones) or unfenced (false).
+	ClusterFenced(fenced bool)
+
+	// LogAppended reports one QoS 1 or 2 append to the cell's log that
+	// committed: client publishes, host publishes and wills alike, with
+	// the time from the send to the commit (cluster.Log.OnAppend).
+	LogAppended(d time.Duration)
+
+	// CASLost counts a session record write that lost its compare-and-set
+	// to another writer (cluster.Sessions.OnLostCAS): contested CONNECTs,
+	// takeovers and the dead-node reclaims racing each other.
+	CASLost()
+
+	// ReplayMessage counts a message a replay sent to a session that came
+	// back (or moved here) behind the tenant's reader.
+	ReplayMessage()
+}
+
 // Reasons AuthFailure reports, one per CONNACK reason the broker refuses
 // with.
 const (
@@ -58,6 +88,14 @@ func (noMetrics) MessageIn()         {}
 func (noMetrics) MessageOut()        {}
 func (noMetrics) AuthFailure(string) {}
 func (noMetrics) ACLDenied(string)   {}
+
+// noClusterMetrics is the ClusterMetrics of a broker whose Metrics is not one.
+type noClusterMetrics struct{}
+
+func (noClusterMetrics) ClusterFenced(bool)        {}
+func (noClusterMetrics) LogAppended(time.Duration) {}
+func (noClusterMetrics) CASLost()                  {}
+func (noClusterMetrics) ReplayMessage()            {}
 
 // authReason is the AuthFailure reason for a refusal with code.
 func authReason(code packets.Code) string {

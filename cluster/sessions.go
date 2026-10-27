@@ -135,6 +135,23 @@ type Sessions struct {
 
 	// afterRead, when set by a test, runs after the first read of an Acquire.
 	afterRead func()
+
+	// onLostCAS is the OnLostCAS observer, nil for none.
+	onLostCAS atomic.Pointer[func()]
+}
+
+// OnLostCAS makes fn observe every write that loses its compare-and-set:
+// Acquire, Update, Expire and Delete call it once for each losing write
+// before they return or retry, an Acquire's own retry included. fn must be
+// quick and safe for concurrent use; it is for metrics. nil removes it.
+func (s *Sessions) OnLostCAS(fn func()) {
+	if fn == nil {
+		s.onLostCAS.Store(nil)
+
+		return
+	}
+
+	s.onLostCAS.Store(&fn)
 }
 
 // sessionHandles is what Sessions looks up once per process.
@@ -206,6 +223,10 @@ func splitSessionKey(key string) (tenant, clientID string, err error) {
 func (s *Sessions) wrapErr(op string, err error) error {
 	switch {
 	case isLostCAS(err):
+		if fn := s.onLostCAS.Load(); fn != nil {
+			(*fn)()
+		}
+
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrLostCAS, err)
 	case isUnavailable(err):
 		return fmt.Errorf("cluster: %s: %w: %w", op, ErrUnavailable, err)

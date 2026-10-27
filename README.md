@@ -8,9 +8,9 @@ Tether is a multi-tenant MQTT broker for Go. Every client that connects is resol
 
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/) [![CI](https://github.com/xraph/tether/actions/workflows/ci.yml/badge.svg)](https://github.com/xraph/tether/actions/workflows/ci.yml)
 
-[Quick start](#quick-start) · [Features](#why-tether) · [Tenants and devices](#tenants-devices-and-roles) · [JWT clients](#users-and-apps-over-jwt) · [Forge](#use-it-with-forge) · [Configuration](#configuration) · [Status](#status) · [FAQ](#faq)
+[Quick start](#quick-start) · [Features](#why-tether) · [Tenants and devices](#tenants-devices-and-roles) · [JWT clients](#users-and-apps-over-jwt) · [Forge](#use-it-with-forge) · [Cells](#run-a-cell) · [Configuration](#configuration) · [Status](#status) · [FAQ](#faq)
 
-Tether hasn't had a release yet. The single-node broker runs and its tests pass, so pin a commit until there's a tag.
+Tether hasn't had a release yet. The broker runs on one node or as a cell of several, and its tests pass, so pin a commit until there's a tag.
 
 ## Quick start
 
@@ -100,7 +100,8 @@ If you sell a connected product, sooner or later one broker carries traffic for 
 | Changes that take effect now | Revoking a key, narrowing a role or disabling a tenant reaches connections that are already open |
 | People and services on the bus | Users and service accounts can connect with an [Authsome](https://github.com/xraph/authsome) JWT next to device keys |
 | Per-tenant limits | Caps on connections, sessions and session expiry, and a publish rate with a burst |
-| Sessions that survive a restart | Subscriptions, in-flight messages and retained messages persist in Badger |
+| Sessions that survive a restart | Subscriptions, in-flight messages and retained messages persist in Badger on one node, or in NATS JetStream across a cell |
+| More than one node | A cell of nodes over NATS JetStream: a client connects to any node, a node that dies has its sessions taken over and its wills published |
 | Devices without MQTT | `POST /tether/v1/publish` with HTTP Basic auth, behind the same grants and rate limit |
 | An admin API and a dashboard | A REST admin API for tenants, devices, roles, live clients, sessions and retained messages, and 24 [Forge dashboard](https://github.com/xraph/forge-dashboard) intents |
 | Metrics | Connections, messages in and out, auth failures by reason and ACL denials by operation |
@@ -214,7 +215,82 @@ For the [Forge dashboard](https://github.com/xraph/forge-dashboard), the extensi
 
 A signed-in user only sees their own tenant: the one their session's `tenant_id` claim names if your auth provider sets it, otherwise the org of the Forge scope your auth middleware puts on the request (Authsome does this for you). Asking for another tenant gets `PERMISSION_DENIED`, and a session that names no tenant is refused outright. If your dashboard users run the whole node, pass `WithDashboardOperators()` or set `dashboard_operators: true`, and every signed-in user can reach any tenant and create, change and delete tenants.
 
-Metrics go through the app's `forge.Metrics` and scrape from `/_/metrics` as `forge_tether_connections`, `forge_tether_messages_in_total`, `forge_tether_messages_out_total`, `forge_tether_auth_failures_total{reason}` and `forge_tether_acl_denials_total{op}`. None of them carry a tenant label.
+Metrics go through the app's `forge.Metrics` and scrape from `/_/metrics` as `forge_tether_connections`, `forge_tether_messages_in_total`, `forge_tether_messages_out_total`, `forge_tether_auth_failures_total{reason}` and `forge_tether_acl_denials_total{op}`. A node in a cell adds `forge_tether_cluster_fenced`, `forge_tether_log_append_seconds`, `forge_tether_cas_lost_total` and `forge_tether_replay_messages_total`. None of them carry a tenant label.
+
+## Run a cell
+
+A cell is several Tether nodes that share sessions, QoS 1 and 2 messages, retained messages and shared subscriptions over [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream). A device can connect to whichever node your load balancer picks and find its session there. A QoS 1 or 2 publish gets its PUBACK or PUBREC only once JetStream has stored it. When a node dies, the others notice after the lease runs out, publish the wills of the clients it held and take over its sessions as those clients reconnect.
+
+You get the NATS underneath in one of two ways. In embedded mode each node runs its own NATS server, routed to the others, and there's nothing else to deploy. That's for cells of up to three nodes, and the binary refuses a bigger one. In external mode you run a NATS cluster (three or five JetStream servers) and the nodes connect to it, which is what you want in production and for anything past three nodes. Embedded mode stops at three because every broker restart would also be a JetStream peer leaving and joining, and you'd be cleaning that up by hand with a JetStream `peer-remove`.
+
+### Three nodes on one machine
+
+Each node needs its own HTTP, MQTT and route ports, so each gets its own config file. This loop writes all three, with every node routed to the other two:
+
+```bash
+for i in 1 2 3; do
+  routes=""
+  for j in 1 2 3; do [ "$j" != "$i" ] && routes="$routes\"nats://127.0.0.1:622$j\", "; done
+  cat > node$i.yaml <<EOF
+server:
+  http_address: ":808$i"
+tether:
+  broker:
+    tcp_address: ":188$i"
+  cluster:
+    enabled: true
+    cell: demo
+    embedded:
+      cluster_name: demo
+      cluster_listen: "127.0.0.1:622$i"
+      routes: [${routes%, }]
+EOF
+done
+```
+
+Start each node in its own terminal, with the same `TETHER_ADMIN_TOKEN` in all three:
+
+```bash
+./tether --config node1.yaml --node-id n1
+./tether --config node2.yaml --node-id n2
+./tether --config node3.yaml --node-id n3
+```
+
+Give them a second or two between starts. The three share `./data/tether.db`, and SQLite won't let three processes switch a brand new file to WAL mode at the same moment. Don't leave it much longer than that, though: a node waits for the other two before it serves anything, because JetStream needs all three to place the cell's streams, and it gives up after about 30 seconds. Each node keeps its own JetStream data under `./data/nats/<node id>`. `--node-id` can also come from `TETHER_NODE_ID`.
+
+Now run the [quick start](#quick-start) walkthrough against any node (change `8080` to `8081` in the `api` helper) and point the two clients at different nodes:
+
+```bash
+mosquitto_sub -h localhost -p 1883 -i display-1 -u "$DISPLAY_USER" -P "$DISPLAY_PASS" -t 'sensors/+/up' -q 1 -v
+```
+
+```bash
+mosquitto_pub -h localhost -p 1881 -i pump-1 -u "$PUMP_USER" -P "$PUMP_PASS" -t sensors/pump-1/up -q 1 -m 21.5
+```
+
+The pump talks to node 1 and the display hears it on node 3. If you kill a node with `kill -9`, the other two declare it dead about 12 seconds later (the 10 second lease plus 2), then publish the wills its clients left.
+
+The routes listen on loopback here, so nothing off the machine can reach them. If you bind `cluster_listen` (or the NATS client `embedded.listen`) to a real interface, Tether won't start until you either set `embedded.user` and `embedded.password`, the same pair on every node, or set `embedded.insecure: true`. Think hard before you pick the second one. Anyone who reaches an open route port can join the cell as a NATS server and read every tenant's traffic.
+
+One catch with the binary: it keeps tenants, keys and roles in SQLite, and the nodes of a cell have to share them, so a cell of binaries lives on one host. To spread a cell across machines, mount the extension in your own app on PostgreSQL (see [Use it with Forge](#use-it-with-forge)) with the same `cluster:` block, or `extension.WithCluster(cluster.Config{...})` in code.
+
+### NATS you run
+
+```yaml
+tether:
+  cluster:
+    enabled: true
+    cell: prod
+    mode: external
+    urls: ["nats://nats-1:4222", "nats://nats-2:4222", "nats://nats-3:4222"]
+    credentials: "/etc/tether/nats.creds"
+```
+
+You give every node the same block and its own ID. With `TETHER_NODE_ID` the file can be identical on every pod, and each pod sets the variable. On start, each node creates or updates the cell's streams and buckets (`TETHER_LOG_PROD`, `TETHER_CTL_PROD` and three KV buckets), with three replicas once NATS has three servers. Their subjects aren't namespaced by cell, so if you run more than one cell, give each its own NATS account.
+
+`log_max_age` is how long JetStream keeps a QoS 1 or 2 message for a session that's offline, 7 days by default. Keep `broker.max_session_expiry` at or under it. A session that stays away longer still has its subscriptions when it comes back, but the messages older than the log's age are gone, and Tether logs a warning at start when the two don't line up.
+
+A node that can't renew its lease for half of it fences itself: it drops its clients and refuses new ones until NATS answers again, so it never acts on sessions the rest of the cell may already have taken over. The extension's health check fails while that lasts, or while JetStream is out of reach, and it shows up in `/_/health`. `forge_tether_cluster_fenced` reads 1 at the same time.
 
 ## Configuration
 
@@ -254,16 +330,17 @@ tether:
 | `tether.broker.max_topic_length` | `1024` | A longer topic is refused with reason code 0x90 |
 | `tether.broker.max_inflight` | `1024` | QoS 1 and 2 messages in flight per client, an offline session's queue included. Past it, messages for that client are dropped |
 | `tether.jwt` | off | Authsome JWT clients. See [Users and apps over JWT](#users-and-apps-over-jwt) |
+| `tether.cluster` | off | Run the node in a cell. See [Run a cell](#run-a-cell) and the commented block in [`tether.example.yaml`](tether.example.yaml) |
 
-Environment variables aren't a config source, with one exception: `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. The `dashboard:` section of the same file belongs to the Forge dashboard.
+Environment variables aren't a config source, with two exceptions. `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. `TETHER_NODE_ID` sets `tether.cluster.node_id`, and `--node-id` beats it. The `dashboard:` section of the same file belongs to the Forge dashboard.
 
 In your own app the `tether:` block goes under `extensions.tether` (or a top-level `tether`) in the Forge config, and `WithConfig` and `WithBrokerConfig` layer over it.
 
 ## Status
 
-Tether runs on one node today, and everything in [Why Tether?](#why-tether) works on that node. What isn't there yet:
+Everything in [Why Tether?](#why-tether) works on one node and in a cell. What isn't there yet:
 
-- Clustering. Routing over NATS JetStream, shared durable sessions, takeover and cells are being built in the `cluster` package, and nothing wires it into the broker yet.
+- More than one cell. A cell is one NATS deployment; spreading tenants over several cells comes later. Inside a cell, rate and connection limits still count per node.
 - Per-tenant caps on retained messages and subscriptions. A tenant can hold as many of either as its devices' grants allow, bounded only by the packet and topic limits.
 - Metering, entitlements and audit trails, then webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication.
 
@@ -279,6 +356,7 @@ There's no docs site for Tether yet. Every package with a public surface has an 
 | Call the admin API or the publish endpoint | [`api/llm.txt`](api/llm.txt) |
 | Mount Tether in a Forge app | [`extension/llm.txt`](extension/llm.txt), [`extension/contract/llm.txt`](extension/contract/llm.txt) |
 | Understand the broker's hooks and limits | [`broker/llm.txt`](broker/llm.txt), [`limits/llm.txt`](limits/llm.txt) |
+| Run nodes as a cell | [`cluster/llm.txt`](cluster/llm.txt), [`extension/llm.txt`](extension/llm.txt) |
 | Plug in device keys or JWTs | [`auth/llm.txt`](auth/llm.txt), [`events/llm.txt`](events/llm.txt) |
 | Write topic grants | [`perm/llm.txt`](perm/llm.txt), [`acl/llm.txt`](acl/llm.txt), [`topic/llm.txt`](topic/llm.txt) |
 
@@ -302,7 +380,7 @@ You can run the binary without writing any Forge code, since it's a Forge app bu
 
 ### Does Tether cluster?
 
-Not yet. It runs on one node, and clustering over NATS JetStream is being built in the `cluster` package.
+Yes. Nodes form a cell over NATS JetStream, either with NATS embedded in each node (up to three) or with a NATS cluster you run. A client can connect to any node of the cell. See [Run a cell](#run-a-cell).
 
 ### Where are device passwords stored?
 

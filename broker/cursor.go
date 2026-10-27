@@ -963,6 +963,7 @@ func (b *Broker) replayOne(s *session, cl *mqtt.Client, ro *replayOut, m cluster
 			ro.pending.Add(1)
 			ro.q <- pk // room: pending < replayBuffer, one producer
 			b.cluster.replayed.Add(1)
+			b.cluster.metrics.ReplayMessage()
 		}
 	}
 

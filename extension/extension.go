@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/xraph/forge"
 	dashboard "github.com/xraph/forge/extensions/dashboard"
@@ -38,7 +39,6 @@ import (
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/events"
-	"github.com/xraph/tether/id"
 	"github.com/xraph/tether/limits"
 	"github.com/xraph/tether/perm"
 	"github.com/xraph/tether/service"
@@ -55,6 +55,10 @@ const ExtensionDescription = "Multi-tenant MQTT broker with keysmith device keys
 
 // ExtensionVersion is the extension's version, Tether's.
 const ExtensionVersion = tether.Version
+
+// stopAfterFailedStart bounds the broker's Stop when Start fails after the
+// broker started (Members could not start).
+const stopAfterFailedStart = 10 * time.Second
 
 var (
 	// ErrKeysmithNotWired is returned by Start when the app's keysmith
@@ -103,14 +107,6 @@ type Extension struct {
 	// ksExts are the keysmith extensions Keysmith built, guarded by mu.
 	ksExts []*keysmithext.Extension
 
-	// clusterDeps, when set, makes the broker one node of a cell: the
-	// node's connection and config, provisioned by the caller, and any
-	// cluster services it built. Start adds the cell's control bus
-	// (startControl). Seam for Task 14, which sets it from the config
-	// (WithCluster, with Members and the rest of the lifecycle); until then
-	// only tests set it (export_test.go).
-	clusterDeps *broker.Cluster
-
 	// lifecycle serializes Start and Stop, so a second call (vessel starts
 	// every Starter it resolves, and *Extension is one) waits for the first
 	// and then finds it done.
@@ -122,9 +118,9 @@ type Extension struct {
 	services *api.Services
 	active   store.Store
 	started  bool
-	// control is the cell's control bus Start made, nil without a cell.
-	// Stop stops it after the broker.
-	control *cluster.Control
+	// cell is what Start made to run the node in its cell, nil without a
+	// cell. Stop closes it after the broker.
+	cell *cell
 }
 
 // New returns the extension. Options override DefaultConfig; the app's
@@ -204,8 +200,11 @@ func (e *Extension) Register(app forge.App) error {
 // keysmith engine from the container (which must be the one the extension
 // from Keysmith owns, so the plugin is on it), the warden engine and its
 // plugin (registered now if Warden did not), the store (migrated),
-// the services, the broker with the plugins bound to its reactor, the
-// routes, and finally the broker's listeners.
+// the services, the cell when the config has one (connect, provision, the
+// cluster services, the tenant cache's eviction on the control bus), the
+// broker with the plugins bound to its reactor, the routes, the control bus,
+// the broker's listeners, and last Members, so the cell's callbacks find a
+// running broker. A failure undoes whatever had started.
 //
 // Start is idempotent: on an extension that is already started it returns nil
 // and does nothing. That matters because *Extension is provided to the
@@ -250,12 +249,17 @@ func (e *Extension) Start(ctx context.Context) error {
 	loader := perm.NewLoader(wd, perm.WithLogger(slogger))
 	limiter := limits.New()
 
-	// The cell's control bus, when there is a cell: the tenant cache's
-	// eviction goes on it before the broker's handlers (New subscribes
-	// them), so it runs first.
-	cdeps, ctl, err := e.clusterControl(tenants)
+	// The cell, when there is one: joined and provisioned before the broker
+	// exists, with the tenant cache's eviction on the control bus ahead of
+	// the broker's handlers (New subscribes them), so it runs first.
+	cl, err := e.openCell(ctx, st, tenants, slogger)
 	if err != nil {
 		return err
+	}
+
+	var metrics broker.Metrics = newBrokerMetrics(e.Metrics())
+	if cl != nil {
+		metrics = newCellMetrics(e.Metrics())
 	}
 
 	b, err := broker.New(e.config.Broker, broker.Deps{
@@ -263,14 +267,16 @@ func (e *Extension) Start(ctx context.Context) error {
 		Perms:   loader,
 		Limits:  limiter,
 		Logger:  slogger,
-		Metrics: newBrokerMetrics(e.Metrics()),
-		Cluster: cdeps,
+		Metrics: metrics,
+		Cluster: cl.brokerDeps(),
 	})
 	if err != nil {
-		stopControl(ctl)
+		cl.close()
 
 		return fmt.Errorf("tether: %w", err)
 	}
+
+	ctl := cl.controlBus()
 
 	// Bound before the broker listens, so no connection can miss a change.
 	// Until Start the reactor's broker calls do nothing. In a cell the
@@ -278,7 +284,7 @@ func (e *Extension) Start(ctx context.Context) error {
 	// comes back.
 	reactor, err := newReactor(authn, b, ctl, slogger)
 	if err != nil {
-		stopControl(ctl)
+		cl.close()
 
 		return err
 	}
@@ -302,7 +308,7 @@ func (e *Extension) Start(ctx context.Context) error {
 	if !e.config.DisableRoutes {
 		if err := e.mountRoutes(*services); err != nil {
 			e.unbind()
-			stopControl(ctl)
+			cl.close()
 
 			return err
 		}
@@ -313,7 +319,7 @@ func (e *Extension) Start(ctx context.Context) error {
 	if ctl != nil {
 		if err := ctl.Start(ctx); err != nil {
 			e.unbind()
-			stopControl(ctl)
+			cl.close()
 
 			return fmt.Errorf("tether: start control bus: %w", err)
 		}
@@ -321,50 +327,35 @@ func (e *Extension) Start(ctx context.Context) error {
 
 	if err := b.Start(ctx); err != nil {
 		e.unbind()
-		stopControl(ctl)
+		cl.close()
 
 		return fmt.Errorf("tether: start broker: %w", err)
 	}
 
+	// Members after the broker, so its fence and dead-peer callbacks find
+	// a running broker.
+	if err := cl.start(ctx); err != nil {
+		e.unbind()
+
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopAfterFailedStart)
+		if serr := b.Stop(sctx); serr != nil {
+			e.Logger().Warn("tether: stopping the broker after a failed start", forge.F("error", serr.Error()))
+		}
+
+		cancel()
+		cl.close()
+
+		return err
+	}
+
 	e.mu.Lock()
-	e.broker, e.services, e.active, e.started, e.control = b, services, st, true, ctl
+	e.broker, e.services, e.active, e.started, e.cell = b, services, st, true, cl
 	e.mu.Unlock()
 
 	e.MarkStarted()
 	e.Logger().Info("tether: broker started", forge.F("mqtt", addrString(b)), forge.F("base_path", e.config.BasePath))
 
 	return nil
-}
-
-// clusterControl returns the broker's cluster deps with the cell's control
-// bus in them, and the bus, or nils when the extension runs no cell. The bus
-// is always made here, whatever clusterDeps.Control holds, because the
-// extension has to order the subscriptions and start it. The service's tenant
-// cache is evicted on every tenant.updated event; that handler goes on first.
-func (e *Extension) clusterControl(tenants *service.Tenants) (*broker.Cluster, *cluster.Control, error) {
-	if e.clusterDeps == nil {
-		return nil, nil, nil
-	}
-
-	cd := *e.clusterDeps
-	if cd.Conn == nil {
-		return nil, nil, errors.New("tether: cluster: no NATS connection")
-	}
-
-	cd.Control = cluster.NewControl(cd.Conn, cd.Config)
-
-	err := events.EvictTenantsOnUpdate(cd.Control, func(tenantID string) {
-		if tid, perr := id.ParseTenantID(tenantID); perr == nil {
-			tenants.Evict(tid)
-		}
-	})
-	if err != nil {
-		cd.Control.Stop()
-
-		return nil, nil, fmt.Errorf("tether: control bus: %w", err)
-	}
-
-	return &cd, cd.Control, nil
 }
 
 // newReactor returns the handler the plugins report to: a cluster reactor on
@@ -380,13 +371,6 @@ func newReactor(authn *auth.Keysmith, b *broker.Broker, ctl *cluster.Control, lo
 	}
 
 	return r, nil
-}
-
-// stopControl stops ctl when there is one.
-func stopControl(ctl *cluster.Control) {
-	if ctl != nil {
-		ctl.Stop()
-	}
 }
 
 // connectAuth returns the authenticator MQTT CONNECT uses: keysmith alone, or
@@ -546,8 +530,12 @@ func (e *Extension) unbind() {
 }
 
 // Stop unbinds the plugins and stops the broker, which disconnects every
-// client. The store is left open: Tether did not open it. Stopping an
-// extension that is not started returns nil.
+// client. In a cell it then stops Members, the control bus and the NATS
+// connection (and the embedded server), in that order: Members goes after
+// the broker, since its peers take over this node's sessions and publish the
+// delayed wills it held once it stops heartbeating. The store is left open:
+// Tether did not open it. Stopping an extension that is not started returns
+// nil.
 func (e *Extension) Stop(ctx context.Context) error {
 	e.lifecycle.Lock()
 	defer e.lifecycle.Unlock()
@@ -563,22 +551,23 @@ func (e *Extension) Stop(ctx context.Context) error {
 	e.unbind()
 
 	e.mu.Lock()
-	b, ctl := e.broker, e.control
-	e.started, e.control = false, nil
+	b, cl := e.broker, e.cell
+	e.started, e.cell = false, nil
 	e.mu.Unlock()
 
 	e.MarkStopped()
 
 	if b == nil {
-		stopControl(ctl)
+		cl.close()
 
 		return nil
 	}
 
 	err := b.Stop(ctx)
 
-	// After the broker: its clients are gone, so nothing is left to apply.
-	stopControl(ctl)
+	// After the broker: its clients are gone, so nothing is left to apply,
+	// and the cell may take over its sessions.
+	cl.close()
 
 	if err != nil {
 		return fmt.Errorf("tether: %w", err)
@@ -587,7 +576,10 @@ func (e *Extension) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Health fails when the broker is not running or the store does not answer.
+// Health fails when the broker is not running or the store does not answer,
+// and in a cell when the node cannot act for it (broker.ClusterHealth): an
+// error wrapping cluster.ErrFenced while it is fenced, or
+// cluster.ErrUnavailable while NATS or JetStream is out of reach.
 func (e *Extension) Health(ctx context.Context) error {
 	e.mu.RLock()
 	b, st := e.broker, e.active
@@ -599,6 +591,10 @@ func (e *Extension) Health(ctx context.Context) error {
 
 	if err := st.Ping(ctx); err != nil {
 		return fmt.Errorf("tether: store: %w", err)
+	}
+
+	if err := b.ClusterHealth(ctx); err != nil {
+		return fmt.Errorf("tether: %w", err)
 	}
 
 	return nil

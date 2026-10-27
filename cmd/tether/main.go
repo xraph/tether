@@ -23,6 +23,7 @@ import (
 	wardenext "github.com/xraph/warden/extension"
 
 	"github.com/xraph/tether"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/extension"
 	"github.com/xraph/tether/store/sqlite"
 )
@@ -36,6 +37,21 @@ const (
 	// defaultConfigFile is read when --config is not given and the file
 	// exists in the working directory.
 	defaultConfigFile = "tether.yaml"
+
+	// defaultNATSDir is where an embedded cell node keeps its JetStream
+	// data when cluster.embedded.store_dir is empty, under a directory
+	// named for the node, so nodes on one host never share one.
+	defaultNATSDir = "./data/nats"
+
+	// nodeIDEnv names the environment variable that sets the node's ID in
+	// its cell, as --node-id does. The flag wins over it, and it wins over
+	// tether.cluster.node_id in the file.
+	nodeIDEnv = "TETHER_NODE_ID"
+
+	// maxEmbeddedNodes is the largest cell embedded mode runs: the node and
+	// two routes. Past it, run NATS yourself (mode: external), because
+	// every broker restart would otherwise be JetStream peer churn.
+	maxEmbeddedNodes = 3
 )
 
 // config is the binary's config file: the extension's own section under
@@ -94,6 +110,36 @@ func loadConfig(path string, explicit bool) (config, error) {
 	return cfg, nil
 }
 
+// applyCluster sets the node ID from --node-id or TETHER_NODE_ID (the flag
+// first), defaults an embedded node's store directory to ./data/nats/<node
+// id>, and refuses an embedded cell of more than three nodes. A config with
+// clustering off is left alone, apart from the node ID.
+func applyCluster(cfg *config, flagNodeID, envNodeID string) error {
+	c := &cfg.Tether.Cluster
+
+	switch {
+	case flagNodeID != "":
+		c.NodeID = flagNodeID
+	case envNodeID != "":
+		c.NodeID = envNodeID
+	}
+
+	if !c.Enabled || c.Mode != cluster.ModeEmbedded {
+		return nil
+	}
+
+	if n := 1 + len(c.Embedded.Routes); n > maxEmbeddedNodes {
+		return fmt.Errorf("tether: an embedded cell runs up to %d nodes and this one has %d (itself and %d routes); "+
+			"run NATS yourself and set tether.cluster.mode: external", maxEmbeddedNodes, n, n-1)
+	}
+
+	if c.Embedded.StoreDir == "" && c.NodeID != "" {
+		c.Embedded.StoreDir = filepath.Join(defaultNATSDir, c.NodeID)
+	}
+
+	return nil
+}
+
 // newApp builds the Forge app: a grove SQLite database in the container,
 // keysmith and warden with their own REST routes off, Tether, and the
 // dashboard. It does not start it.
@@ -110,7 +156,7 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 		return nil, nil, errors.New("tether: server.sqlite_path is empty")
 	}
 
-	for _, dir := range []string{filepath.Dir(cfg.Server.SQLitePath), cfg.Tether.Broker.DataDir} {
+	for _, dir := range []string{filepath.Dir(cfg.Server.SQLitePath), cfg.Tether.Broker.DataDir, natsDir(cfg)} {
 		if dir == "" {
 			continue
 		}
@@ -129,8 +175,9 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 		forge.WithAppName("tether"),
 		forge.WithAppVersion(tether.Version),
 		forge.WithHTTPAddress(cfg.Server.HTTPAddress),
-		// Environment variables are for the admin token only: the config
-		// file is the one place everything else is set.
+		// Environment variables are for the admin token and the node ID
+		// only (run reads both): the config file is the one place
+		// everything else is set.
 		forge.WithEnableEnvConfig(false),
 		forge.WithEnableAppScopedConfig(false),
 	}, appOpts...)...)
@@ -171,6 +218,17 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 	return app, func() { _ = db.Close() }, nil
 }
 
+// natsDir is the embedded NATS store directory to create, "" when the node
+// runs no embedded server.
+func natsDir(cfg config) string {
+	c := cfg.Tether.Cluster
+	if !c.Enabled || c.Mode != cluster.ModeEmbedded {
+		return ""
+	}
+
+	return c.Embedded.StoreDir
+}
+
 // openDB opens the grove SQLite database at path.
 func openDB(path string) (*grove.DB, error) {
 	drv := sqlitedriver.New()
@@ -189,8 +247,8 @@ func openDB(path string) (*grove.DB, error) {
 
 // run is the whole program, with its inputs passed in so a test can drive it:
 // the arguments after the program name, the environment, and where output goes:
-// stdout for --version, stderr for usage and flag errors. It returns when the app has shut down on SIGINT or SIGTERM, or when it
-// fails.
+// stdout for --version, stderr for usage and flag errors. It returns when the
+// app has shut down on SIGINT or SIGTERM, or when it fails.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("tether", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -198,6 +256,7 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) er
 	configPath := fs.String("config", "", "path to the YAML config file (default ./"+defaultConfigFile+" if it exists)")
 	insecure := fs.Bool("insecure-admin", false, "leave the admin API and the dashboard open when "+adminTokenEnv+" is empty")
 	showVersion := fs.Bool("version", false, "print the version and exit")
+	nodeID := fs.String("node-id", "", "this node's ID in its cell (tether.cluster.node_id); "+nodeIDEnv+" sets it too")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -222,6 +281,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) er
 	cfg, err := loadConfig(path, explicit)
 	if err != nil {
 		return err
+	}
+
+	if cerr := applyCluster(&cfg, *nodeID, getenv(nodeIDEnv)); cerr != nil {
+		return cerr
 	}
 
 	app, closeDB, err := newApp(cfg, token, *insecure, configSource(path)...)

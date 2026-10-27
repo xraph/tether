@@ -102,6 +102,11 @@ func Connect(ctx context.Context, cfg Config, logger *slog.Logger) (*Conn, error
 
 		opts = append(opts, nats.InProcessServer(srv))
 		qopts = append(qopts, nats.InProcessServer(srv))
+
+		if cfg.Embedded.User != "" {
+			opts = append(opts, nats.UserInfo(cfg.Embedded.User, cfg.Embedded.Password))
+			qopts = append(qopts, nats.UserInfo(cfg.Embedded.User, cfg.Embedded.Password))
+		}
 	} else {
 		addr = strings.Join(cfg.URLs, ",")
 

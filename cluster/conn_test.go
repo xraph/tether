@@ -399,6 +399,87 @@ func TestConnectUnavailable(t *testing.T) {
 	}
 }
 
+// Every node of a fresh cell provisions at once. The meta leader leaves
+// concurrent creates of one stream unanswered, so Provision bounds each
+// attempt and sends it again.
+func TestProvisionConcurrentFresh(t *testing.T) {
+	const n = 2
+
+	ports := clustertest.FreePorts(t, n)
+	conns := make([]*cluster.Conn, n)
+	cfgs := make([]cluster.Config, n)
+	errs := make([]error, n)
+
+	for i := range n {
+		cfgs[i] = embeddedConfig(t, fmt.Sprintf("n%d", i))
+		cfgs[i].Embedded.ClusterName = "fresh"
+		cfgs[i].Embedded.ClusterListen = fmt.Sprintf("127.0.0.1:%d", ports[i])
+		cfgs[i].Embedded.Routes = []string{clustertest.RouteURL(ports[1-i])}
+	}
+
+	ctx := ctxT(t, 40*time.Second)
+
+	var wg sync.WaitGroup
+
+	for i := range n {
+		wg.Go(func() {
+			conns[i], errs[i] = cluster.Connect(ctx, cfgs[i], nil)
+			if errs[i] == nil {
+				errs[i] = cluster.Provision(ctx, conns[i], cfgs[i], time.Hour)
+			}
+		})
+	}
+
+	wg.Wait()
+
+	for i := range n {
+		if conns[i] != nil {
+			t.Cleanup(conns[i].Close)
+		}
+
+		if errs[i] != nil {
+			t.Fatalf("node %d: %v", i, errs[i])
+		}
+	}
+}
+
+// An embedded server with a user and password takes no client without them,
+// and the node's own connection uses them.
+func TestEmbeddedCredentials(t *testing.T) {
+	port := clustertest.FreePorts(t, 1)[0]
+
+	cfg := embeddedConfig(t, "n1")
+	cfg.Embedded.Listen = fmt.Sprintf("127.0.0.1:%d", port)
+	cfg.Embedded.User, cfg.Embedded.Password = "tether", "s3cret"
+
+	c, err := cluster.Connect(ctxT(t, 10*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	if perr := cluster.Provision(ctxT(t, 10*time.Second), c, cfg, time.Hour); perr != nil {
+		t.Fatalf("Provision over the authenticated connection: %v", perr)
+	}
+
+	url := fmt.Sprintf("nats://127.0.0.1:%d", port)
+
+	for _, opt := range []nats.Option{nats.Name("anonymous"), nats.UserInfo("tether", "wrong")} {
+		if nc, cerr := nats.Connect(url, opt, nats.MaxReconnects(0)); cerr == nil {
+			nc.Close()
+			t.Fatal("a client without the right credentials connected")
+		}
+	}
+
+	nc, err := nats.Connect(url, nats.UserInfo("tether", "s3cret"))
+	if err != nil {
+		t.Fatalf("the right credentials: %v", err)
+	}
+
+	nc.Close()
+}
+
 func TestConnectNeedsEnabled(t *testing.T) {
 	if _, err := cluster.Connect(ctxT(t, time.Second), cluster.DefaultConfig(), nil); err == nil {
 		t.Fatal("Connect on a disabled config succeeded")
@@ -464,7 +545,33 @@ func TestValidate(t *testing.T) {
 			c.Embedded.ClusterName = "x"
 			c.Embedded.ClusterListen = "0.0.0.0:6222"
 			c.Embedded.Routes = []string{"nats://a:6222", "nats://b:6222"}
+			c.Embedded.User, c.Embedded.Password = "u", "p"
 		}), ""},
+		// Ruling R43: no listener past loopback without credentials or
+		// an explicit insecure.
+		{"open route listen", good(func(c *cluster.Config) {
+			c.Embedded.ClusterName = "x"
+			c.Embedded.ClusterListen = "0.0.0.0:6222"
+		}), "loopback"},
+		{"route listen on every interface", good(func(c *cluster.Config) {
+			c.Embedded.ClusterName = "x"
+			c.Embedded.ClusterListen = ":6222"
+		}), "loopback"},
+		{"open client listen", good(func(c *cluster.Config) { c.Embedded.Listen = "10.0.0.5:4222" }), "loopback"},
+		{"open listen, insecure", good(func(c *cluster.Config) {
+			c.Embedded.Listen = ":4222"
+			c.Embedded.ClusterName = "x"
+			c.Embedded.ClusterListen = "0.0.0.0:6222"
+			c.Embedded.Insecure = true
+		}), ""},
+		{"loopback listens", good(func(c *cluster.Config) {
+			c.Embedded.Listen = "localhost:4222"
+			c.Embedded.ClusterName = "x"
+			c.Embedded.ClusterListen = "[::1]:6222"
+		}), ""},
+		{"user without password", good(func(c *cluster.Config) { c.Embedded.User = "u" }), "password"},
+		{"password without user", good(func(c *cluster.Config) { c.Embedded.Password = "p" }), "user"},
+		{"negative log age", good(func(c *cluster.Config) { c.LogMaxAge = -time.Second }), "log_max_age"},
 		{"no node id", good(func(c *cluster.Config) { c.NodeID = "" }), "node_id"},
 		{"node id with dot", good(func(c *cluster.Config) { c.NodeID = "a.b" }), "node_id"},
 		{"node id with space", good(func(c *cluster.Config) { c.NodeID = "a b" }), "node_id"},

@@ -94,6 +94,23 @@ type Log struct {
 	// replays, 0 for the nats.go default (5 s, so a dead server is noticed
 	// after about 10 s). Tests shorten it.
 	heartbeat time.Duration
+
+	// onAppend is the OnAppend observer, nil for none.
+	onAppend atomic.Pointer[func(time.Duration)]
+}
+
+// OnAppend makes fn observe every append that commits: Wait calls it with the
+// time from the send to the commit it reports, before it returns. An append
+// that fails is not reported. fn must be quick and safe for concurrent use;
+// it is for metrics. nil removes it.
+func (l *Log) OnAppend(fn func(time.Duration)) {
+	if fn == nil {
+		l.onAppend.Store(nil)
+
+		return
+	}
+
+	l.onAppend.Store(&fn)
 }
 
 type streamBox struct{ s jetstream.Stream }
@@ -184,8 +201,9 @@ func (l *Log) Append(ctx context.Context, msg LogMessage, msgID string) (seq uin
 
 // PendingAppend is an append that has been sent and not yet acknowledged.
 type PendingAppend struct {
-	l   *Log
-	fut jetstream.PubAckFuture
+	l    *Log
+	fut  jetstream.PubAckFuture
+	sent time.Time
 }
 
 // AppendAsync is Append in two steps: it sends msg and returns at once, and
@@ -209,12 +227,14 @@ func (l *Log) AppendAsync(ctx context.Context, msg LogMessage, msgID string) (*P
 		opts = append(opts, jetstream.WithMsgID(msgID))
 	}
 
+	sent := time.Now()
+
 	fut, err := l.publishAsync(ctx, m, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	return &PendingAppend{l: l, fut: fut}, nil
+	return &PendingAppend{l: l, fut: fut, sent: sent}, nil
 }
 
 // Wait waits for the commit of the append and returns its sequence, and dup
@@ -228,6 +248,10 @@ func (p *PendingAppend) Wait(ctx context.Context) (seq uint64, dup bool, err err
 
 	select {
 	case ack := <-p.fut.Ok():
+		if fn := p.l.onAppend.Load(); fn != nil {
+			(*fn)(time.Since(p.sent))
+		}
+
 		return ack.Sequence, ack.Duplicate, nil
 	case err := <-p.fut.Err():
 		return 0, false, p.l.wrapErr("append", err)

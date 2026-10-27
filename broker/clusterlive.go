@@ -230,6 +230,8 @@ func (b *Broker) onFence() {
 		return
 	}
 
+	n.metrics.ClusterFenced(true)
+
 	srv := n.server()
 	if srv == nil {
 		return
@@ -244,6 +246,7 @@ func (b *Broker) onFence() {
 func (b *Broker) onUnfence() {
 	n := b.cluster
 	n.fenced.Store(false)
+	n.metrics.ClusterFenced(false)
 
 	if n.server() == nil {
 		return
@@ -610,7 +613,7 @@ func (b *Broker) sendWill(ctx context.Context, tenantID, rawID string, w *cluste
 	}
 
 	if w.QoS == 0 {
-		if err := n.Router.Publish(tenantID, w.Topic, w.Payload, w.Props, w.Retain); err != nil {
+		if err := n.router.Publish(tenantID, w.Topic, w.Payload, w.Props, w.Retain); err != nil {
 			n.routeErrors.Add(1)
 
 			return err

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -29,6 +30,14 @@ const (
 	errCodeNoPeers     jetstream.ErrorCode = 10005 // JSClusterNoPeersErrF
 	errCodeClusterWait jetstream.ErrorCode = 10008 // JSClusterNotAvailErr
 	placementRetry                         = 200 * time.Millisecond
+	// placementAttempt bounds the first create or update of a stream or
+	// bucket, and each later attempt gets twice the last, up to
+	// placementAttemptMax. When the nodes of a fresh cell all provision at
+	// once, the meta leader leaves concurrent creates of the same stream
+	// unanswered; the attempt times out and the next one finds the stream.
+	// A create that was only slow is harmless to send again.
+	placementAttempt    = time.Second
+	placementAttemptMax = 8 * time.Second
 )
 
 // Provision creates the cell's streams and buckets, or updates them to the
@@ -83,7 +92,7 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	}
 
 	for _, sc := range streams {
-		err := retryPlacement(ctx, func() error {
+		err := retryPlacement(ctx, func(ctx context.Context) error {
 			_, err := c.js.CreateOrUpdateStream(ctx, sc)
 
 			return err
@@ -120,7 +129,7 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	}
 
 	for _, bc := range buckets {
-		err := retryPlacement(ctx, func() error {
+		err := retryPlacement(ctx, func(ctx context.Context) error {
 			_, err := c.js.CreateOrUpdateKeyValue(ctx, bc)
 
 			return err
@@ -133,16 +142,23 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	return nil
 }
 
-// retryPlacement runs fn until it stops failing with a placement error or ctx
-// ends. It returns fn's last error.
-func retryPlacement(ctx context.Context, fn func() error) error {
-	for {
-		err := fn()
+// retryPlacement runs fn until it stops failing with a placement error or an
+// unanswered attempt, or ctx ends. Each attempt is bounded (placementAttempt,
+// doubling). It returns fn's last error.
+func retryPlacement(ctx context.Context, fn func(context.Context) error) error {
+	attempt := placementAttempt
 
-		var api *jetstream.APIError
-		if err == nil || !errors.As(err, &api) || (api.ErrorCode != errCodeNoPeers && api.ErrorCode != errCodeClusterWait) {
+	for {
+		actx, cancel := context.WithTimeout(ctx, attempt)
+		err := fn(actx)
+
+		cancel()
+
+		if err == nil || !retryable(ctx, err) {
 			return err
 		}
+
+		attempt = min(2*attempt, placementAttemptMax)
 
 		select {
 		case <-ctx.Done():
@@ -150,4 +166,16 @@ func retryPlacement(ctx context.Context, fn func() error) error {
 		case <-time.After(placementRetry):
 		}
 	}
+}
+
+// retryable reports whether a failed create is worth another attempt: a
+// placement error, or an attempt nobody answered while ctx still runs.
+func retryable(ctx context.Context, err error) bool {
+	var api *jetstream.APIError
+	if errors.As(err, &api) {
+		return api.ErrorCode == errCodeNoPeers || api.ErrorCode == errCodeClusterWait
+	}
+
+	return ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, nats.ErrTimeout) || errors.Is(err, nats.ErrNoResponders))
 }

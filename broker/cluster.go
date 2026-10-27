@@ -24,7 +24,8 @@ import (
 // broker alone, as before.
 //
 // The caller connects, provisions the cell and builds the services; the
-// broker uses them and closes none of them, except a Router it made itself.
+// broker uses them and closes none of them, except the Router (always its
+// own) and a Shared it made itself.
 type Cluster struct {
 	// Conn is the node's NATS connection. Required.
 	Conn *cluster.Conn
@@ -42,12 +43,6 @@ type Cluster struct {
 	// through it, and the node delivers QoS 1 and 2 to its sessions only
 	// from it. Leave it nil and the broker makes one on Conn.
 	Log *cluster.Log
-
-	// Router moves QoS 0 messages between the nodes. Leave it nil and the
-	// broker makes one on Conn whose deliver injects into this broker, and
-	// closes it on Stop. A Router you make yourself must hand what it
-	// delivers to (*Broker).DeliverRouted, and you close it.
-	Router *cluster.Router
 
 	// Members tracks the cell's live nodes. When it is set, New registers
 	// the broker's fence, unfence and dead-peer callbacks on it
@@ -90,8 +85,15 @@ const injectorID = "tether-cluster"
 type clusterNode struct {
 	Cluster
 
-	log       *slog.Logger
-	ownRouter bool
+	log *slog.Logger
+
+	// metrics gets the node's cluster counters: Deps.Metrics when it is a
+	// ClusterMetrics, else nothing.
+	metrics ClusterMetrics
+
+	// router moves QoS 0 messages between the nodes. New makes it on Conn
+	// with deliverRouted as its deliver, and close closes it.
+	router *cluster.Router
 
 	// injector is the inline client that publishes routed messages into
 	// mochi. The hook recognises it by pointer: mochi's own inline client
@@ -233,6 +235,7 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 	n := &clusterNode{
 		Cluster: *c,
 		log:     log.With(slog.String("node", c.Config.NodeID)),
+		metrics: noClusterMetrics{},
 		routes:  make(map[string]map[string]*routeRef),
 
 		readers:        make(map[string]*tenantReader),
@@ -270,10 +273,7 @@ func newClusterNode(c *Cluster, log *slog.Logger, deliver func(tenantID, name st
 
 	n.persistQoS2 = n.persistQoS2In
 
-	if n.Router == nil {
-		n.Router = cluster.NewRouter(c.Conn, c.Config.NodeID, deliver)
-		n.ownRouter = true
-	}
+	n.router = cluster.NewRouter(c.Conn, c.Config.NodeID, deliver)
 
 	return n, nil
 }
@@ -305,9 +305,7 @@ func (n *clusterNode) detach() {
 // mochi has shut down, so the releases of the last clean sessions still
 // reach them.
 func (n *clusterNode) close() {
-	if n.ownRouter {
-		n.Router.Close()
-	}
+	n.router.Close()
 
 	if n.ownShared {
 		n.Shared.Close()
@@ -392,11 +390,10 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 	return nil
 }
 
-// DeliverRouted hands the broker a QoS 0 message that another node routed,
+// deliverRouted hands the broker a QoS 0 message that another node routed,
 // as tenantID's message on the tenant-relative topic name, with its retain
-// flag. A Router the broker made calls it itself; a Router you set in
-// Cluster must call it from its deliver function. It does not block on
-// clients. The retain flag reaches only 5.0 subscriptions with Retain As
+// flag. It is the deliver function of the broker's Router. It does not block
+// on clients. The retain flag reaches only 5.0 subscriptions with Retain As
 // Published; the retained message itself comes from the cell's retained
 // store, never from here.
 //
@@ -404,7 +401,7 @@ func (b *Broker) inject(tenantID, name string, payload []byte, qos byte, props c
 // tenant ID that is not canonical, an invalid name and a name under $SYS
 // (in any casing) are dropped and logged. Before Start and after Stop it
 // drops everything.
-func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props cluster.Props, retain bool) {
+func (b *Broker) deliverRouted(tenantID, name string, payload []byte, props cluster.Props, retain bool) {
 	if b.cluster == nil {
 		return
 	}
@@ -429,7 +426,7 @@ func (b *Broker) DeliverRouted(tenantID, name string, payload []byte, props clus
 func (n *clusterNode) publish(tenantID, rel string, pk *packets.Packet) {
 	retain := pk.FixedHeader.Retain || retainedTag(*pk)
 
-	if err := n.Router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties), retain); err != nil {
+	if err := n.router.Publish(tenantID, rel, pk.Payload, clusterProps(pk.Properties), retain); err != nil {
 		n.routeErrors.Add(1)
 		n.log.Warn("tether: qos 0 message not routed", slog.String("tenant", tenantID), slog.String("topic", rel), slog.Any("error", err))
 
@@ -481,7 +478,7 @@ func (n *clusterNode) subscribe(nsID, tenantID, filter string) error {
 	set[filter] = ref
 	n.routesMu.Unlock()
 
-	err := n.Router.Subscribe(tenantID, filter)
+	err := n.router.Subscribe(tenantID, filter)
 
 	n.routesMu.Lock()
 
@@ -565,7 +562,7 @@ func (n *clusterNode) forget(nsID, filter string) {
 
 // unsubscribe drops one Router reference, logging and counting a failure.
 func (n *clusterNode) unsubscribe(tenantID, filter string) {
-	if err := n.Router.Unsubscribe(tenantID, filter); err != nil {
+	if err := n.router.Unsubscribe(tenantID, filter); err != nil {
 		n.routeErrors.Add(1)
 		n.log.Warn("tether: route not released", slog.String("tenant", tenantID), slog.String("filter", filter), slog.Any("error", err))
 	}

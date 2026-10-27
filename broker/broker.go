@@ -170,13 +170,19 @@ func New(cfg Config, deps Deps) (*Broker, error) {
 	}
 
 	if deps.Cluster != nil {
-		n, err := newClusterNode(deps.Cluster, deps.Logger, b.DeliverRouted)
+		n, err := newClusterNode(deps.Cluster, deps.Logger, b.deliverRouted)
 		if err != nil {
 			return nil, err
 		}
 
 		n.b = b
 		b.cluster = n
+
+		if cm, ok := deps.Metrics.(ClusterMetrics); ok {
+			n.metrics = cm
+			n.Log.OnAppend(cm.LogAppended)
+			n.Sessions.OnLostCAS(cm.CASLost)
+		}
 
 		b.watchMembers()
 
