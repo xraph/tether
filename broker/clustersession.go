@@ -2114,7 +2114,7 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 
 		if validWill(tenantID, w) {
 			log.Info("tether: session deleted with its will held, publishing the will")
-			n.goLive(func() { b.publishHeld(tenantID, clientID, w, "") })
+			b.goPublishHeld(tenantID, clientID, w, "")
 		}
 	}
 

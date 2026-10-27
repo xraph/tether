@@ -191,13 +191,31 @@ func (n *clusterNode) server() *mqtt.Server {
 	return n.srv
 }
 
-// goLive runs fn on a goroutine Stop waits for, unless Stop has begun.
-func (n *clusterNode) goLive(fn func()) {
+// goLive runs fn on a goroutine Stop waits for, unless Stop has begun. It
+// reports whether fn will run.
+func (n *clusterNode) goLive(fn func()) bool {
 	n.willsMu.Lock()
 	defer n.willsMu.Unlock()
 
-	if !n.stopped {
-		n.wg.Go(fn)
+	if n.stopped {
+		return false
+	}
+
+	n.wg.Go(fn)
+
+	return true
+}
+
+// goPublishHeld publishes a will whose key this node has settled (publishHeld)
+// on a goroutine Stop waits for. Once Stop has begun nothing more starts, and
+// the node holds the will's only copy, so a will dropped then is logged at
+// Warn.
+func (b *Broker) goPublishHeld(tenantID, clientID string, w *cluster.WillRecord, msgID string) {
+	n := b.cluster
+
+	if !n.goLive(func() { b.publishHeld(tenantID, clientID, w, msgID) }) {
+		n.log.Warn("tether: will lost, its key was settled as the broker stopped", slog.String("client", namespacedID(tenantID, clientID)),
+			slog.String("topic", w.Topic))
 	}
 }
 
@@ -868,7 +886,7 @@ func (b *Broker) reclaimKey(node string, e cluster.SessionEntry, msgID string) e
 		// On its own goroutine: the publish may retry until Stop, and must
 		// hold neither the session's lock (a CONNECT of the client waits on
 		// it) nor the reclaim's slot (the sweep waits on those).
-		n.goLive(func() { b.publishHeld(e.Tenant, e.ClientID, will, msgID) })
+		b.goPublishHeld(e.Tenant, e.ClientID, will, msgID)
 	}
 
 	return nil
