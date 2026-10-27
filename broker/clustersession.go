@@ -801,6 +801,19 @@ func (b *Broker) loadSession(s *session, cl *mqtt.Client, st *clientState, prev 
 		}
 
 		if or.Seq <= prev.Cursor {
+			if or.State == outPubrel {
+				// The cursor has passed it, but the client still waits
+				// for the PUBREL and the packet ID stays in use until
+				// PUBCOMP: it is sent again, kept out of the deliveries
+				// so the cursor does not go back.
+				s.qos2Out[id] = or
+				inflight = append(inflight, packets.Packet{
+					FixedHeader: packets.FixedHeader{Type: packets.Pubrel, Qos: 1}, PacketID: id,
+					Created: now - int64(len(ids)) + int64(i),
+				})
+				s.restored++
+			}
+
 			continue
 		}
 

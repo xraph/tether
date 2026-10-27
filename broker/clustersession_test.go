@@ -1547,3 +1547,65 @@ func TestHandoverWindowDeliveryNotLost(t *testing.T) {
 	eventually(t, "the message injected during the handover", func() bool { return sess.count("late") >= 1 })
 	require.Positive(t, c.nodes[0].cluster.handoverLost.Load())
 }
+
+// A retained QoS 2 message sent at SUBSCRIBE is not a log delivery, so the
+// session's record had no entry for it. Once the client has answered PUBREC,
+// the record says the flow is at PUBREL, so a resume on another node sends
+// the PUBREL and the packet ID is not left half way, where the client would
+// take a new message under it for a duplicate (B-I4).
+func TestRetainedQoS2PubrelResumedElsewhere(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	pub, _, err := connect5(t, c.addr(1), "rq-pub", "u1", true)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), logWait)
+	defer cancel()
+
+	_, err = pub.Publish(ctx, &paho.Publish{Topic: "rq/x", QoS: 2, Retain: true, Payload: []byte("kept")})
+	require.NoError(t, err)
+
+	expiry := uint32(3600)
+	connect := func(addr string) net.Conn {
+		return rawConnect(t, addr, &packets.Connect{
+			ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: "rq", CleanStart: false, KeepAlive: 30,
+			Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+			Properties: &packets.Properties{SessionExpiryInterval: &expiry},
+		})
+	}
+
+	conn := connect(c.addr(0))
+	writePacket(t, conn, &packets.Subscribe{PacketID: 1, Subscriptions: []packets.SubOptions{{Topic: "rq/#", QoS: 2}}, Properties: &packets.Properties{}})
+
+	var id uint16
+
+	for id == 0 {
+		cp := readPacket(t, conn)
+		if p, ok := cp.Content.(*packets.Publish); ok {
+			require.Equal(t, "kept", string(p.Payload))
+			require.Equal(t, byte(2), p.QoS)
+			id = p.PacketID
+		}
+	}
+
+	writePacket(t, conn, &packets.Pubrec{PacketID: id, Properties: &packets.Properties{}})
+
+	cp := readPacket(t, conn)
+	require.Equal(t, packets.PUBREL, cp.Type)
+
+	// No PUBCOMP: the connection drops with the flow at PUBREL.
+	_ = conn.Close()
+	waitOffline(t, c.nodes[1], tid, "rq")
+
+	conn = connect(c.addr(1))
+
+	for {
+		cp := readPacket(t, conn)
+		if cp.Type == packets.PUBREL {
+			require.Equal(t, id, cp.Content.(*packets.Pubrel).PacketID)
+
+			return
+		}
+	}
+}

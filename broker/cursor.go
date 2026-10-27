@@ -1327,6 +1327,18 @@ func (n *clusterNode) onPubrec(cl *mqtt.Client, pk packets.Packet) bool {
 	or, ok := s.qos2Out[pk.PacketID]
 
 	switch {
+	case !ok && pk.ReasonCode < packets.ErrUnspecifiedError.Code && outboundQoS2(cl, pk.PacketID):
+		// A QoS 2 delivery the record does not track (a retained message
+		// sent at SUBSCRIBE carries no log sequence): from here its flow
+		// is at PUBREL, which a resume anywhere must send again, or the
+		// client would take a new message under the packet ID for a
+		// duplicate. Seq 0 with no Shared: a resume sends only the PUBREL
+		// (sharedResend), and the cursor plays no part.
+		s.qos2Out[pk.PacketID] = cluster.OutRecord{State: outPubrel}
+		s.gen++
+		s.mu.Unlock()
+
+		return n.persistNow(s, cl)
 	case !ok:
 		s.mu.Unlock()
 
@@ -1351,6 +1363,14 @@ func (n *clusterNode) onPubrec(cl *mqtt.Client, pk packets.Packet) bool {
 	s.mu.Unlock()
 
 	return n.persistNow(s, cl)
+}
+
+// outboundQoS2 reports whether cl's inflight map holds a QoS 2 PUBLISH this
+// server sent under id: what a PUBREC from the client answers.
+func outboundQoS2(cl *mqtt.Client, id uint16) bool {
+	pk, ok := cl.State.Inflight.Get(id)
+
+	return ok && pk.FixedHeader.Type == packets.Publish && pk.FixedHeader.Qos == 2
 }
 
 // beforeQoS2Send runs in OnPacketEncode for a QoS 2 PUBLISH to a tracked
