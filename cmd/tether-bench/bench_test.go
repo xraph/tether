@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -169,6 +170,11 @@ func TestBenchSmoke(t *testing.T) {
 	assert.Equal(t, 50, res.Connected)
 	assert.Positive(t, res.AckLatency.Count)
 	assert.EqualValues(t, 0, res.Lost, "%+v", res)
+	assert.EqualValues(t, 0, res.Unacked)
+	assert.Positive(t, res.Lateness.Count, "the publishers recorded how late they woke")
+	assert.Zero(t, res.LostConns)
+	assert.Positive(t, res.Measured.Achieved)
+	assert.Positive(t, res.Measured.Latency.Count)
 	assert.Equal(t, res.Acked, res.Received)
 	require.Len(t, res.NodeSide, 2)
 	assert.Equal(t, 25, res.NodeSide[0].Connected, "each node holds half of the clients")
@@ -183,8 +189,8 @@ func TestBenchSmoke(t *testing.T) {
 	// A small reconnect storm on the same cell: the group is dropped and comes
 	// back, the measured pairs lose nothing, and the report has three phases.
 	t.Run("storm", func(t *testing.T) {
-		if testing.Short() {
-			t.Skip("the storm takes 15 s")
+		if os.Getenv("TETHER_BENCH_STORM") == "" {
+			t.Skip("the storm takes 15 s; set TETHER_BENCH_STORM=1 to run it")
 		}
 
 		so := o
@@ -229,4 +235,28 @@ func TestSummarize(t *testing.T) {
 	assert.InDelta(t, 99, s.P99, 0.001)
 	assert.InDelta(t, 100, s.Max, 0.001)
 	assert.Equal(t, summary{}, summarize(nil))
+}
+
+// A message is stamped with the time it was scheduled to go. A publisher that
+// woke 50 ms late therefore shows those 50 ms as latency, and does not look fast.
+func TestScheduledStamp(t *testing.T) {
+	sub := &subscriber{seen: map[uint64]struct{}{}}
+	sched := time.Now().Add(-50 * time.Millisecond)
+
+	sub.receive(payload(sched, 7, 64), time.Since(epoch))
+
+	require.Len(t, sub.samples, 1)
+	assert.GreaterOrEqual(t, sub.samples[0].lat, 50*time.Millisecond)
+	assert.Less(t, sub.samples[0].lat, time.Second)
+
+	// The same slot twice counts once.
+	sub.receive(payload(sched, 7, 64), time.Since(epoch))
+	assert.Len(t, sub.samples, 1)
+	assert.EqualValues(t, 1, sub.dups)
+}
+
+func TestParseCPUTime(t *testing.T) {
+	assert.InDelta(t, 12.34, parseCPUTime("0:12.34"), 0.001)
+	assert.InDelta(t, 3723.5, parseCPUTime("1:02:03.50"), 0.001)
+	assert.Zero(t, parseCPUTime("junk"))
 }

@@ -26,14 +26,15 @@ var epoch = time.Now()
 
 // target is what the load commands connect to and how they judge it.
 type target struct {
-	addrs   []string // MQTT listeners, host:port, one per node
-	creds   []cred
-	prefix  string // client ID prefix, unique per run
-	pids    []int  // broker processes, for memory
-	admins  []string
-	token   string
-	tenant  string
-	timeout time.Duration
+	addrs      []string // MQTT listeners, host:port, one per node
+	creds      []cred
+	prefix     string // client ID prefix, unique per run
+	pids       []int  // broker processes, for memory
+	serverPids []int  // NATS server processes, for CPU
+	admins     []string
+	token      string
+	tenant     string
+	timeout    time.Duration
 }
 
 // newPrefix is a short random client ID prefix, so a run never takes over the
@@ -170,6 +171,8 @@ type connStats struct {
 	Elapsed  float64        `json:"elapsed_s"`
 	Achieved float64        `json:"achieved_per_s"`
 	PerNode  []int          `json:"ok_per_node"`
+
+	raw []time.Duration // every successful connect's latency, for merging batches
 }
 
 // connector collects the results of connection attempts from many goroutines.
@@ -211,6 +214,7 @@ func (cn *connector) stats(elapsed time.Duration) connStats {
 	st := connStats{
 		OK: len(cn.clients), Failed: cn.failed, Latency: summarize(lat),
 		Elapsed: elapsed.Seconds(), PerNode: append([]int(nil), cn.perNode...),
+		raw: append([]time.Duration(nil), cn.lat...),
 	}
 
 	if len(cn.errs) > 0 {

@@ -50,6 +50,7 @@ type targetFlags struct {
 	targets *string
 	creds   *string
 	pids    *string
+	natsPid *string
 	admins  *string
 	token   *string
 	tenant  *string
@@ -63,7 +64,8 @@ func addTargetFlags(fs *flag.FlagSet) *targetFlags {
 		cell:    fs.String("cell", "", "cell.json written by `tether-bench cell`; fills in the flags below"),
 		targets: fs.String("target", "", "MQTT listener(s) as host:port, comma separated; clients spread over them"),
 		creds:   fs.String("creds", "", "credentials CSV (username,password) from `tether-bench provision`"),
-		pids:    fs.String("pids", "", "broker process IDs, comma separated, to read memory from"),
+		pids:    fs.String("pids", "", "broker process IDs, comma separated, to read memory and CPU from"),
+		natsPid: fs.String("nats-pids", "", "NATS server process IDs, comma separated, to read CPU from"),
 		admins:  fs.String("admin", "", "admin API base URLs, one per target, to read each node's connection count"),
 		token:   fs.String("token", "", "admin bearer token (default $"+tokenEnv+", then the cell file)"),
 		tenant:  fs.String("tenant", "", "tenant ID for the admin stats"),
@@ -94,6 +96,10 @@ func (f *targetFlags) build() (*target, error) {
 		return nil, err
 	}
 
+	if t.serverPids, err = parsePIDs(*f.natsPid); err != nil {
+		return nil, err
+	}
+
 	credsPath := *f.creds
 
 	if *f.cell != "" {
@@ -112,6 +118,10 @@ func (f *targetFlags) build() (*target, error) {
 
 		if len(t.pids) == 0 {
 			t.pids = ci.Brokers
+		}
+
+		if len(t.serverPids) == 0 {
+			t.serverPids = ci.Servers
 		}
 
 		if t.token == "" {

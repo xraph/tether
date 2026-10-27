@@ -86,14 +86,30 @@ type pubsubResult struct {
 	Stalled    int64         `json:"publish_skipped_window_full"`
 	Received   int64         `json:"received_unique"`
 	Duplicates int64         `json:"duplicates"`
-	Lost       int64         `json:"lost"`
-	Storm      *stormResult  `json:"storm,omitempty"`
+	// Lost counts messages the broker took (a PUBACK at QoS 1, a clean write at
+	// QoS 0) that the paired subscriber never received. Delivered counts the
+	// other way: messages received that were never acknowledged, which are not
+	// losses and must not hide one.
+	Lost       int64        `json:"lost"`
+	Unacked    int64        `json:"received_but_not_acked"`
+	Lateness   summary      `json:"send_lateness"`
+	StormSetup *connStats   `json:"storm_group_connect,omitempty"`
+	CPU        []phaseCPU   `json:"cpu_cores,omitempty"`
+	Storm      *stormResult `json:"storm,omitempty"`
 	// StormP99Ratio is the storm phase's p99 over the baseline phase's.
 	StormP99Ratio float64     `json:"storm_p99_ratio,omitempty"`
 	Memory        *memReport  `json:"memory,omitempty"`
 	Connected     int         `json:"connected_total"`
 	NodeSide      []nodeStats `json:"node_side,omitempty"`
 	LostConns     int         `json:"measured_connections_lost"`
+}
+
+// phaseCPU is the CPU the cell's processes used in one phase, in cores (CPU
+// seconds per wall second), summed over the brokers and over the NATS servers.
+type phaseCPU struct {
+	Name    string  `json:"name"`
+	Brokers float64 `json:"brokers"`
+	NATS    float64 `json:"nats_servers"`
 }
 
 // sample is one delivered message: when it was sent and how long it took.
@@ -108,10 +124,21 @@ type subscriber struct {
 	bad     int64
 }
 
-func (s *subscriber) onMsg(p *paho.Publish) {
-	now := time.Since(epoch)
+func (s *subscriber) onMsg(p *paho.Publish) { s.receive(p.Payload, time.Since(epoch)) }
 
-	if len(p.Payload) < payloadHeader {
+// payload is the message for slot k of a publisher, stamped with the time that
+// slot was scheduled for.
+func payload(sched time.Time, k uint64, size int) []byte {
+	buf := make([]byte, max(size, payloadHeader))
+	binary.BigEndian.PutUint64(buf[0:8], uint64(sched.Sub(epoch))) //nolint:gosec // G115: a duration since start, never negative.
+	binary.BigEndian.PutUint64(buf[8:16], k)
+
+	return buf
+}
+
+// receive records a message that arrived at now on the bench clock.
+func (s *subscriber) receive(payload []byte, now time.Duration) {
+	if len(payload) < payloadHeader {
 		s.mu.Lock()
 		s.bad++
 		s.mu.Unlock()
@@ -119,8 +146,8 @@ func (s *subscriber) onMsg(p *paho.Publish) {
 		return
 	}
 
-	sent := time.Duration(binary.BigEndian.Uint64(p.Payload[0:8])) //nolint:gosec // G115: a send time, far below 2^63 ns.
-	seq := binary.BigEndian.Uint64(p.Payload[8:16])
+	sent := time.Duration(binary.BigEndian.Uint64(payload[0:8])) //nolint:gosec // G115: a send time, far below 2^63 ns.
+	seq := binary.BigEndian.Uint64(payload[8:16])
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -145,31 +172,53 @@ type publisher struct {
 	stalled  atomic.Int64
 	mu       sync.Mutex
 	ackLat   []time.Duration
+	late     []time.Duration
+	good     map[uint64]struct{} // sequences the broker took: acked at QoS 1, written at QoS 0
 	inflight chan struct{}
+}
+
+// took records that the broker took message k.
+func (p *publisher) took(k uint64) {
+	p.mu.Lock()
+	p.good[k] = struct{}{}
+	p.mu.Unlock()
 }
 
 // run publishes until ctx ends: every interval, one message. QoS 0 writes inline.
 // QoS 1 sends from its own goroutine and counts a message it had no room for as
 // skipped, rather than let a slow broker make the offered rate drift.
+//
+// A message is stamped with the time it was scheduled to go, start + k*interval,
+// not the time the loop got round to it. A publisher that wakes late (a garbage
+// collection, a busy scheduler, a blocked write) then shows the delay in the
+// latency of the messages it holds up, instead of hiding it. The lateness itself
+// is recorded, so a run can say how often that happened.
 func (p *publisher) run(ctx context.Context, qos byte, size int, interval, offset time.Duration, wg *sync.WaitGroup) {
 	start := time.Now().Add(offset)
 
 	for k := 0; ctx.Err() == nil; k++ {
-		sleepUntil(ctx, start.Add(time.Duration(k)*interval))
+		sched := start.Add(time.Duration(k) * interval)
+
+		sleepUntil(ctx, sched)
 
 		if ctx.Err() != nil {
 			return
 		}
 
-		buf := make([]byte, max(size, payloadHeader))
-		binary.BigEndian.PutUint64(buf[0:8], uint64(time.Since(epoch))) //nolint:gosec // G115: a duration since start, never negative.
-		binary.BigEndian.PutUint64(buf[8:16], uint64(k))
+		p.mu.Lock()
+		p.late = append(p.late, max(time.Since(sched), 0))
+		p.mu.Unlock()
+
+		seq := uint64(k)
+		buf := payload(sched, seq, size)
 
 		if qos == 0 {
 			p.sent.Add(1)
 
 			if _, err := p.c.pc.Publish(ctx, &paho.Publish{Topic: p.topic, QoS: 0, Payload: buf}); err != nil {
 				p.failed.Add(1)
+			} else {
+				p.took(seq)
 			}
 
 			continue
@@ -191,9 +240,8 @@ func (p *publisher) run(ctx context.Context, qos byte, size int, interval, offse
 			pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 
-			t0 := time.Now()
 			resp, err := p.c.pc.Publish(pctx, &paho.Publish{Topic: p.topic, QoS: qos, Payload: buf})
-			lat := time.Since(t0)
+			lat := time.Since(sched)
 
 			if err != nil || resp == nil || resp.ReasonCode >= 0x80 {
 				p.failed.Add(1)
@@ -204,6 +252,7 @@ func (p *publisher) run(ctx context.Context, qos byte, size int, interval, offse
 			p.acked.Add(1)
 			p.mu.Lock()
 			p.ackLat = append(p.ackLat, lat)
+			p.good[seq] = struct{}{}
 			p.mu.Unlock()
 		})
 	}
@@ -255,7 +304,7 @@ func (o pubsubOpts) measure(ctx context.Context, t *target) (*pubsubResult, erro
 
 		group, st = t.connectMany(ctx, "s", o.Storm, o.ConnRate, o.Parallel, nil, nil)
 		all = append(all, group...)
-		_ = st
+		res.StormSetup = &st
 	}
 
 	// The measured pairs. Subscriber j sits on node j mod N. Its publisher sits
@@ -317,6 +366,11 @@ func (o pubsubOpts) measure(ctx context.Context, t *target) (*pubsubResult, erro
 	sleepUntil(ctx, time.Now().Add(2*time.Second))
 
 	res.Memory = memoryReport(rssBefore, rssBytes(ctx, t.pids), len(all))
+	if o.StormExternal && res.Memory != nil {
+		// The storm process's clients sit on the brokers too, and this process
+		// doesn't count them, so a per-connection figure would come out far too big.
+		res.Memory.PerConnKiB = 0
+	}
 
 	if ns, err := t.adminStats(ctx); err == nil {
 		res.NodeSide = ns
@@ -325,7 +379,7 @@ func (o pubsubOpts) measure(ctx context.Context, t *target) (*pubsubResult, erro
 	// Publishers.
 	pubs := make([]*publisher, pairs)
 	for j := range pubs {
-		pubs[j] = &publisher{c: pubByIdx[j], topic: fmt.Sprintf("%s/t%d", benchTopicRoot, j), inflight: make(chan struct{}, 64)}
+		pubs[j] = &publisher{c: pubByIdx[j], topic: fmt.Sprintf("%s/t%d", benchTopicRoot, j), inflight: make(chan struct{}, 64), good: map[uint64]struct{}{}}
 	}
 
 	interval := time.Duration(float64(time.Second) * float64(pairs) / o.Rate)
@@ -372,6 +426,15 @@ func (o pubsubOpts) measure(ctx context.Context, t *target) (*pubsubResult, erro
 		}()
 	}
 
+	var cpuDone chan []phaseCPU
+
+	if len(t.pids)+len(t.serverPids) > 0 {
+		cpuDone = make(chan []phaseCPU, 1)
+		windowStart := time.Now().Add(o.Warmup)
+
+		go func() { cpuDone <- o.sampleCPU(ctx, t, windowStart) }()
+	}
+
 	sleepUntil(ctx, time.Now().Add(o.Warmup+o.Duration))
 	stopPub()
 	pubWG.Wait()
@@ -391,7 +454,11 @@ func (o pubsubOpts) measure(ctx context.Context, t *target) (*pubsubResult, erro
 	}
 
 	res.NodeSide = firstNonEmpty(res.NodeSide, t.adminStatsQuiet(ctx))
-	collect(res, o, subs, pubs, subCs, mStart)
+	collect(res, o, subs, pubs, append(append([]*client(nil), subCs...), pubCs...), mStart)
+
+	if cpuDone != nil {
+		res.CPU = <-cpuDone
+	}
 
 	return res, ctx.Err()
 }
@@ -436,18 +503,96 @@ func runStorm(ctx context.Context, t *target, group []*client, window time.Durat
 	}, cn.clients
 }
 
-// collect turns what the pairs saw into the result.
-func collect(res *pubsubResult, o pubsubOpts, subs []*subscriber, pubs []*publisher, subCs []*client, mStart time.Duration) {
+// phaseBound is a stretch of the measured window, from and to counted from its start.
+type phaseBound struct {
+	name     string
+	from, to time.Duration
+}
+
+// bounds are the phases of the run: one, or baseline, storm and after.
+func (o pubsubOpts) bounds() []phaseBound {
+	if o.stormPhases() {
+		end := o.StormAt + o.StormWindow + stormTail
+
+		return []phaseBound{{"baseline", 0, o.StormAt}, {"storm", o.StormAt, end}, {"after", end, o.Duration}}
+	}
+
+	return []phaseBound{{"steady", 0, o.Duration}}
+}
+
+// sampleCPU reads the CPU time of the cell's processes at the edges of every
+// phase and returns the cores each phase used. It reads nothing and returns nil
+// when it cannot (ps failed, or no process IDs).
+func (o pubsubOpts) sampleCPU(ctx context.Context, t *target, windowStart time.Time) []phaseCPU {
+	bs := o.bounds()
+	edges := make([]time.Duration, 1, len(bs)+1)
+	edges[0] = bs[0].from
+
+	for _, b := range bs {
+		edges = append(edges, b.to)
+	}
+
+	brokers := make([]float64, len(edges))
+	servers := make([]float64, len(edges))
+
+	for i, e := range edges {
+		sleepUntil(ctx, windowStart.Add(e))
+
+		brokers[i], servers[i] = sum(cpuSeconds(ctx, t.pids)), sum(cpuSeconds(ctx, t.serverPids))
+	}
+
+	out := make([]phaseCPU, len(bs))
+
+	for i, b := range bs {
+		secs := (b.to - b.from).Seconds()
+		out[i] = phaseCPU{Name: b.name, Brokers: (brokers[i+1] - brokers[i]) / secs, NATS: (servers[i+1] - servers[i]) / secs}
+	}
+
+	return out
+}
+
+func sum(v []float64) float64 {
+	var t float64
+
+	for _, x := range v {
+		t += x
+	}
+
+	return t
+}
+
+// collect turns what the pairs saw into the result. cs are the measured clients.
+func collect(res *pubsubResult, o pubsubOpts, subs []*subscriber, pubs []*publisher, cs []*client, mStart time.Duration) {
 	var (
 		all  []sample
 		acks []time.Duration
+		late []time.Duration
 	)
 
-	for _, s := range subs {
+	for j, s := range subs {
 		s.mu.Lock()
 		all = append(all, s.samples...)
 		res.Received += int64(len(s.seen))
 		res.Duplicates += s.dups
+
+		p := pubs[j]
+		p.mu.Lock()
+
+		for seq := range p.good {
+			if _, ok := s.seen[seq]; !ok {
+				res.Lost++
+			}
+		}
+
+		for seq := range s.seen {
+			if _, ok := p.good[seq]; !ok {
+				res.Unacked++
+			}
+		}
+
+		acks = append(acks, p.ackLat...)
+		late = append(late, p.late...)
+		p.mu.Unlock()
 		s.mu.Unlock()
 	}
 
@@ -456,20 +601,9 @@ func collect(res *pubsubResult, o pubsubOpts, subs []*subscriber, pubs []*publis
 		res.Acked += p.acked.Load()
 		res.Failed += p.failed.Load()
 		res.Stalled += p.stalled.Load()
-
-		p.mu.Lock()
-		acks = append(acks, p.ackLat...)
-		p.mu.Unlock()
 	}
 
-	expect := res.Sent
-	if o.QoS > 0 {
-		expect = res.Acked
-	}
-
-	res.Lost = max(expect-res.Received, 0)
-
-	for _, c := range subCs {
+	for _, c := range cs {
 		select {
 		case <-c.lost:
 			res.LostConns++
@@ -478,23 +612,10 @@ func collect(res *pubsubResult, o pubsubOpts, subs []*subscriber, pubs []*publis
 	}
 
 	// Phases are by send time, relative to the start of the measured window.
-	type bounds struct {
-		name     string
-		from, to time.Duration
-	}
-
-	var ph []bounds
-
-	if o.stormPhases() {
-		end := o.StormAt + o.StormWindow + stormTail
-		ph = []bounds{{"baseline", 0, o.StormAt}, {"storm", o.StormAt, end}, {"after", end, o.Duration}}
-	} else {
-		ph = []bounds{{"steady", 0, o.Duration}}
-	}
-
+	bounds := o.bounds()
 	inWindow := make([]time.Duration, 0, len(all))
 
-	for _, b := range ph {
+	for _, b := range bounds {
 		var d []time.Duration
 
 		for _, s := range all {
@@ -509,6 +630,7 @@ func collect(res *pubsubResult, o pubsubOpts, subs []*subscriber, pubs []*publis
 
 	res.Overall = summarize(inWindow)
 	res.AckLatency = summarize(acks)
+	res.Lateness = summarize(late)
 
 	if len(res.Phases) == 3 && res.Phases[0].Delivered.P99 > 0 {
 		res.StormP99Ratio = res.Phases[1].Delivered.P99 / res.Phases[0].Delivered.P99
@@ -532,11 +654,18 @@ func firstNonEmpty(a, b []nodeStats) []nodeStats {
 	return a
 }
 
-// mergeStats adds two batches of connection attempts together. The latency is a's.
+// mergeStats adds two batches of connection attempts together. The batches ran
+// one after the other, so the elapsed times add.
 func mergeStats(a, b connStats) connStats {
 	out := connStats{
-		OK: a.OK + b.OK, Failed: a.Failed + b.Failed, Elapsed: max(a.Elapsed, b.Elapsed),
-		Latency: a.Latency, Errors: map[string]int{},
+		OK: a.OK + b.OK, Failed: a.Failed + b.Failed, Elapsed: a.Elapsed + b.Elapsed,
+		Errors: map[string]int{}, raw: append(append([]time.Duration(nil), a.raw...), b.raw...),
+	}
+
+	out.Latency = summarize(append([]time.Duration(nil), out.raw...))
+
+	if out.Elapsed > 0 {
+		out.Achieved = float64(out.OK+out.Failed) / out.Elapsed
 	}
 
 	for _, m := range []map[string]int{a.Errors, b.Errors} {
@@ -666,8 +795,13 @@ func printPubsub(w io.Writer, r *pubsubResult) {
 		fmt.Fprintf(w, "publish-to-ack: %s\n", r.AckLatency)
 	}
 
-	fmt.Fprintf(w, "sent %d, acked %d, failed %d, skipped %d, received %d, duplicates %d, lost %d, measured connections lost %d\n",
-		r.Sent, r.Acked, r.Failed, r.Stalled, r.Received, r.Duplicates, r.Lost, r.LostConns)
+	fmt.Fprintf(w, "sent %d, acked %d, failed %d, skipped %d, received %d, duplicates %d, lost %d, received but not acked %d, measured connections lost %d\n",
+		r.Sent, r.Acked, r.Failed, r.Stalled, r.Received, r.Duplicates, r.Lost, r.Unacked, r.LostConns)
+	fmt.Fprintf(w, "publisher lateness (a message is stamped with its scheduled time): %s\n", r.Lateness)
+
+	for _, c := range r.CPU {
+		fmt.Fprintf(w, "cpu %-9s brokers %.2f cores, nats servers %.2f cores\n", c.Name, c.Brokers, c.NATS)
+	}
 
 	if r.StormP99Ratio > 0 {
 		fmt.Fprintf(w, "storm phase p99 over baseline p99: %.2f\n", r.StormP99Ratio)

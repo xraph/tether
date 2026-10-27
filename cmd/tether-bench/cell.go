@@ -32,7 +32,8 @@ const (
 )
 
 // runNATS runs one nats-server with JetStream until stdin closes. The cell
-// command holds stdin, so a server goes away with it however it ends.
+// command holds stdin, so a server goes away with it however it ends, SIGKILL
+// included. The broker processes have no such tie and outlive a killed cell.
 func runNATS(args []string, stdout, stderr io.Writer) error {
 	fs := newFlags(natsCommand, stderr)
 	name := fs.String("name", "s1", "server name")

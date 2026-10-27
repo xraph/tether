@@ -30,7 +30,7 @@ type connResult struct {
 type memReport struct {
 	BeforeMiB   []float64 `json:"before_mib"`
 	AfterMiB    []float64 `json:"after_mib"`
-	PerConnKiB  float64   `json:"per_connection_kib"`
+	PerConnKiB  float64   `json:"per_connection_kib,omitempty"`
 	TotalDeltaM float64   `json:"total_delta_mib"`
 }
 

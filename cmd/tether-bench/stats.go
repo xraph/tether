@@ -170,3 +170,38 @@ func parsePIDs(s string) ([]int, error) {
 
 	return out, nil
 }
+
+// cpuSeconds is the CPU time each process has used so far, by pid, read from
+// ps. A process that has gone reads zero.
+func cpuSeconds(ctx context.Context, pids []int) []float64 {
+	out := make([]float64, len(pids))
+
+	for i, pid := range pids {
+		//nolint:gosec // G204: pid is an integer.
+		raw, err := exec.CommandContext(ctx, "ps", "-o", "time=", "-p", strconv.Itoa(pid)).Output()
+		if err != nil {
+			continue
+		}
+
+		out[i] = parseCPUTime(strings.TrimSpace(string(raw)))
+	}
+
+	return out
+}
+
+// parseCPUTime reads ps's time column: [[hh:]mm:]ss with a fraction on the last
+// part. It returns zero for anything else.
+func parseCPUTime(s string) float64 {
+	var secs float64
+
+	for part := range strings.SplitSeq(s, ":") {
+		v, err := strconv.ParseFloat(part, 64)
+		if err != nil {
+			return 0
+		}
+
+		secs = secs*60 + v
+	}
+
+	return secs
+}

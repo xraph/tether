@@ -33,6 +33,20 @@ type stormReport struct {
 	Setup   connStats   `json:"setup"`
 	Storm   stormResult `json:"storm"`
 	At      time.Time   `json:"dropped_at"`
+	// CPUCores is how much CPU this process used from the drop to the last
+	// reconnect, in cores, so a run can say how much of the machine the storm took.
+	CPUCores float64 `json:"storm_process_cpu_cores"`
+}
+
+// processCPU is the CPU time this process has used, user and system.
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		return 0
+	}
+
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
 }
 
 // runStormCommand is a reconnect storm in a process of its own: it connects the group,
@@ -96,9 +110,14 @@ func runStormCommand(args []string, stdout, stderr io.Writer) error {
 	}
 
 	rep.At = time.Now()
+	cpu0 := processCPU()
 
 	sr, again := runStorm(ctx, t, group, *window, *parallel)
 	rep.Storm = sr
+
+	if d := time.Since(rep.At); d > 0 {
+		rep.CPUCores = float64(processCPU()-cpu0) / float64(d)
+	}
 
 	defer closeAll(again, true)
 

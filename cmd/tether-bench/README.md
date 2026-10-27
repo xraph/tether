@@ -23,7 +23,7 @@ That starts three NATS servers (one JetStream cluster) and three Tether nodes on
 
 `cell.json` lists the MQTT address, admin URL and process ID of every node, the admin token and the tenant. Every other command takes `--cell /tmp/cell/cell.json` and reads what it needs from there.
 
-If you kill `cell` with `kill -9`, the children stay up. Stop them with `pkill -f 'tether-bench nats'` and by killing the pids in `cell.json`.
+Ctrl-C and SIGTERM stop everything. If `cell` is killed with `kill -9`, the NATS servers go with it (they exit when their stdin closes), but the three `tether` nodes keep running. Stop them with `kill` on the `broker_pids` in `cell.json`.
 
 To test a cell you started some other way, skip `cell`. Make the tenant and the devices with `provision`, then pass `--target host:port[,host:port...]` and `--creds creds.csv` to the load commands:
 
@@ -50,7 +50,7 @@ bin/tether-bench pubsub --cell /tmp/cell/cell.json --qos 1 --clients 200 --rate 
   --duration 30s --background 12000
 ```
 
-It opens 12,000 idle connections as background load, then 200 measured clients: 100 subscribers, each with one publisher on a different node (`--placement cross`, the default) or on the same node (`--placement same`). The publishers send 2,000 messages a second between them for 5 seconds of warmup and then 30 seconds that count. Each payload carries its send time, and the subscriber reads the clock when the message arrives. Both ends live in this process, so there's no clock skew to correct.
+It opens 12,000 idle connections as background load, then 200 measured clients: 100 subscribers, each with one publisher on a different node (`--placement cross`, the default) or on the same node (`--placement same`). The publishers send 2,000 messages a second between them for 5 seconds of warmup and then 30 seconds that count. Each payload carries the time its slot was scheduled for, and the subscriber reads the clock when the message arrives. The scheduled time, not the moment the publisher got round to sending, so a publisher that wakes late (a garbage collection, a busy machine) adds that delay to the latency of the messages it held up instead of hiding it. The report also gives the publishers' lateness (p50, p99, max), so you can see how often it happened. Both ends live in this process, so there's no clock skew to correct.
 
 You get exact percentiles over every delivered message (a sorted list, not buckets), the publish-to-PUBACK time at QoS 1, and the counts of messages sent, acknowledged, received, duplicated and lost. It also prints the machine and the load average it saw.
 
