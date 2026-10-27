@@ -337,8 +337,9 @@ func firstAfter(m map[string]time.Time, t0 time.Time) time.Duration {
 
 // TestKill9NATSServer kills the NATS server that leads the log stream while a
 // publisher runs at 500 msg/s QoS 1 and persistent subscribers on two nodes
-// listen. The brokers run with the production heartbeat and lease (2 s and
-// 10 s): two servers still make a quorum, so no broker may fence. Nothing
+// listen. The brokers run with the production heartbeat and lease
+// (cluster.DefaultHeartbeat and cluster.DefaultLease): two servers still make
+// a quorum, so no broker may fence. Nothing
 // acknowledged is lost, and publishing resumes within the JetStream leader
 // election time.
 func TestKill9NATSServer(t *testing.T) {

@@ -34,13 +34,13 @@ The observer is a plain NATS client that goes straight to the servers, past ever
 
 ### Timings
 
-Most scenarios run the brokers on short timings so a run takes minutes. `TestKill9NATSServer` is the exception: it runs the production defaults, a 2 s heartbeat and a 10 s lease, because what it checks is that losing one server of three doesn't fence anyone in a real deployment.
+Most scenarios run the brokers on short timings so a run takes minutes. `TestKill9NATSServer` is the exception: it runs the production defaults (`cluster.DefaultHeartbeat` and `cluster.DefaultLease`, 2 s and 24 s today), because what it checks is that losing one server of three doesn't fence anyone in a real deployment.
 
 | Setting | Value | What follows from it |
 |---|---|---|
 | Heartbeat | 500 ms | |
 | Lease | 3 s | A node fences after 1.5 s without an acknowledged heartbeat, and the cell calls a peer dead after 5 s of silence (lease + 2 s) |
-| Heartbeat and lease in `TestKill9NATSServer` | 2 s and 10 s | The defaults: a node fences after 5 s without a renew |
+| Heartbeat and lease in `TestKill9NATSServer` | the defaults, 2 s and 24 s | A node fences after 12 s without a renew, longer than the 4 to 9 s a JetStream election takes |
 | NATS ping interval | 1 s, 3 outstanding | |
 | Slow node delay | 200 ms each way | A heartbeat round trip stays under the 750 ms write timeout (lease / 4), so the slow node never fences |
 | Resume bound | 10 s | From the spec |
@@ -72,20 +72,20 @@ The subscribers then move to `n2`, `n1` heals, and the records must still name `
 
 ## Results
 
-Recorded on 27 October 2026 on an Apple M3 Max (16 cores, 128 GiB), macOS 27.0.1, Go 1.26.9, nats-server 2.15.1 and nats.go 1.54.0, at commit `4860bba` plus this suite. The machine was shared with other work, so each run has its load average next to it (the 1-minute figure when it started). The first block is one full suite run. The three runs after it are `TestKill9NATSServer` on its own.
+Recorded on 27 October 2026 on an Apple M3 Max (16 cores, 128 GiB), macOS 27.0.1, Go 1.26.9, nats-server 2.15.1 and nats.go 1.54.0, at commit `bc3ea5e` (the CHAOS-1 and CHAOS-2 fixes, the 24 s default lease and prompt heartbeat retries). The machine was shared with other work, so each run has its load average next to it (the 1-minute figure when it started). The first block is one full suite run. The three runs after it are `TestKill9NATSServer` on its own.
 
 | Scenario | Load | Result | Numbers |
 |---|---|---|---|
-| TestKill9BrokerDuringQoS1 | 8.4 | pass | 5,195 acknowledged, none lost; reconnected 32 ms after the kill; slowest catch-up 18 ms |
-| TestKill9NATSServer | 8.4 | **fail** | killed `s2`; new log leader after 6.6 s; the members bucket took about 7.8 s, so every broker fenced at 5 s and unfenced at 8 s; 12 clients dropped with 0x88; resumed after 7.9 s against a bound of 7.6 s; none lost |
-| TestPartitionBrokerFromNATS | 8.4 | pass | drops within 1.59 s; first takeover 5.09 s after the last heartbeat, 3.46 s after the last drop; four 0x88 DISCONNECTs, no 0x8E |
-| TestNATSMinorityNoAcks | 8.4 | pass | 280 minority publishes during the partition, 0 acknowledged; publisher dropped after 1.40 s; majority at rate from cut + 3.0 s |
-| TestSlowConsumerNoSkips | 8.4 | pass | 12,265 acknowledged, none lost; slow subscriber 1,691 then 3,038 behind at the moves; 120 records checked, no skips |
-| TestKill9NATSServer | 8.8 | pass | killed `s3`; new leader after 7.7 s; resumed after 7.9 s; no fence, no 0x88; 8,935 acknowledged, none lost |
-| TestKill9NATSServer | 7.9 | pass | killed `s1`; new leader after 4.4 s; resumed after 4.1 s; no fence; 7,200 acknowledged, none lost |
-| TestKill9NATSServer | 6.5 | pass | killed `s3`; new leader after 5.5 s; resumed after 5.0 s; no fence; 7,755 acknowledged, none lost |
+| TestKill9BrokerDuringQoS1 | 6.4 | pass | 5,175 acknowledged, none lost; reconnected 31 ms after the kill; slowest catch-up 16 ms |
+| TestKill9NATSServer | 6.4 | pass | killed `s2`; new log leader after 5.5 s; resumed after 5.3 s; no fence, no 0x88; 7,750 acknowledged, none lost |
+| TestPartitionBrokerFromNATS | 6.4 | pass | drops within 1.58 s; first takeover 5.10 s after the last heartbeat, 3.48 s after the last drop; four 0x88 DISCONNECTs, no 0x8E |
+| TestNATSMinorityNoAcks | 6.4 | pass | 277 minority publishes during the partition, 0 acknowledged; publisher dropped after 1.39 s; majority at rate from cut + 3.0 s |
+| TestSlowConsumerNoSkips | 6.4 | pass | 12,250 acknowledged, none lost; slow subscriber 1,701 then 3,028 behind at the moves; 111 records checked, no skips |
+| TestKill9NATSServer | 5.7 | pass | killed `s1`; new leader after 5.5 s; resumed after 4.8 s; no fence; 7,755 acknowledged, none lost |
+| TestKill9NATSServer | 6.3 | pass | killed `s1`; new leader after 6.6 s; resumed after 6.5 s; no fence; 8,300 acknowledged, none lost |
+| TestKill9NATSServer | 6.6 | pass | killed `s3`; new leader after 8.8 s; resumed after 8.1 s; no fence; 9,385 acknowledged, none lost |
 
-The failed run is a JetStream election that ran longer than half the 10 s lease. A node that can't renew for 5 s fences, whatever the reason, and the test doesn't excuse it. If you see this one fail, check the brokers' logs first: a "heartbeat write failed" line followed 5 s later by "fenced" means the members bucket had no leader for that long. Earlier, at `6226d78`, the four other scenarios each passed three runs out of three.
+Before the 24 s lease, the NATS server kill failed about one run in three. A JetStream election of the members bucket that ran past half the old 10 s lease fenced every broker, the brokers dropped their clients with 0x88, and publishing resumed only after the unfence. If you see it fail now, check the brokers' logs first: a "heartbeat write failed" line followed by "fenced" means the members bucket had no leader for 12 s, which is longer than any election should take.
 
 ### Worth knowing
 
