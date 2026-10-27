@@ -359,9 +359,10 @@ func (b *Broker) logDeliver(tenantID string) func(cluster.LogMessage) error {
 // the starter sends each to the log in arrival order (so one client's
 // messages are committed in the order it sent them), the writer waits for
 // each commit in that same order and writes the ack, retrying a failed
-// append while the connection is open. When the connection ends (close, from
-// lastHook.OnDisconnect) whatever is pending is abandoned without an ack;
-// the client sends it again when it reconnects.
+// append while the connection is open. When the connection stops owning its
+// client ID (close, from the registry's closePipe: bind, remove,
+// sweepClosed) whatever is pending is abandoned without an ack; the client
+// sends it again when it reconnects.
 type pubPipe struct {
 	b   *Broker
 	srv *mqtt.Server
