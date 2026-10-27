@@ -1237,7 +1237,7 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 		s := n.sessionOf(cl)
 
 		var lp uint64
-		if s != nil && s.tracked {
+		if s != nil && s.tracked.Load() {
 			lp = s.tt.livePos.Load()
 		}
 
@@ -1245,7 +1245,7 @@ func (b *Broker) commitPublish(cl *mqtt.Client, st *clientState, rel string, pk 
 			return
 		}
 
-		if s != nil && s.tracked {
+		if s != nil && s.tracked.Load() {
 			n.pinIfFull(s, cl, lp)
 		}
 	}
@@ -1382,7 +1382,7 @@ func (b *Broker) pubrel(cl *mqtt.Client, id uint16) {
 
 	b.cluster.clearQoS2(cl.ID, id)
 
-	if s := b.cluster.sessionOf(cl); s != nil && s.tracked {
+	if s := b.cluster.sessionOf(cl); s != nil && s.tracked.Load() {
 		s.touch()
 	}
 }

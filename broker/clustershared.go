@@ -307,7 +307,7 @@ func (n *clusterNode) shareClient(nsID string) (*session, *mqtt.Client, <-chan s
 		return nil, nil, nil, false
 	}
 
-	return s, s.cl, s.connacked, true
+	return s, s.cl, s.ack.ch, true
 }
 
 // deliverShared prepares a group's message for the member nsID holds through
@@ -774,7 +774,7 @@ func (n *clusterNode) isOwnShare(nsID string, s *session, held, pk packets.Packe
 func (n *clusterNode) repinShare(s *session, cl *mqtt.Client, id uint16, seq uint64) bool {
 	s.mu.Lock()
 
-	tracked := s.tracked
+	tracked := s.tracked.Load()
 
 	or, ok := s.qos2Out[id]
 	if ok && or.Seq == 0 && or.Shared == seq && s.savedGen >= s.gen {
@@ -851,7 +851,7 @@ func (n *clusterNode) renumberShare(nsID string, s *session, pk packets.Packet, 
 func (n *clusterNode) claimID(s *session, id uint16) bool {
 	s.mu.Lock()
 
-	tracked := s.tracked
+	tracked := s.tracked.Load()
 	repin := false
 
 	if seq, ok := s.out[id]; ok {

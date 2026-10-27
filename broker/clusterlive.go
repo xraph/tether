@@ -468,7 +468,7 @@ func (b *Broker) clusterWill(cl *mqtt.Client, st *clientState, rel string, will 
 
 	if delay > 0 && s != nil {
 		s.mu.Lock()
-		tracked := s.tracked
+		tracked := s.tracked.Load()
 		s.mu.Unlock()
 
 		if deleting || !tracked {

@@ -1318,7 +1318,7 @@ func (n *clusterNode) onAck(cl *mqtt.Client, id uint16, comp bool) {
 // not answer.
 func (n *clusterNode) onPubrec(cl *mqtt.Client, pk packets.Packet) bool {
 	s := n.sessionOf(cl)
-	if s == nil || !s.tracked {
+	if s == nil || !s.tracked.Load() {
 		return true
 	}
 
@@ -1385,7 +1385,7 @@ func (n *clusterNode) beforeQoS2Send(cl *mqtt.Client, pk packets.Packet) bool {
 	}
 
 	s := n.sessionOf(cl)
-	if s == nil || !s.tracked {
+	if s == nil || !s.tracked.Load() {
 		return true
 	}
 

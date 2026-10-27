@@ -70,8 +70,9 @@ type session struct {
 	tt                    *tenantTrack
 
 	// tracked: the session has a cursor, replays and persists (persistent, or
-	// resumed from a persistent record). Set once at CONNECT.
-	tracked bool
+	// resumed from a persistent record). Set at CONNECT, and by a handover
+	// that makes a clean session persistent; read without s.mu.
+	tracked atomic.Bool
 	// expiryCap is the connection's session expiry cap, for the final TTL.
 	expiryCap uint32
 
@@ -91,10 +92,10 @@ type session struct {
 	// nothing is written after it.
 	done bool
 
-	// connacked is closed once the connection's CONNACK is out, so a
-	// takeover's DISCONNECT never goes first.
-	connacked chan struct{}
-	ackOnce   sync.Once
+	// ack (sessMu) is the CONNACK signal of the connection in cl: a new
+	// one for each connection (handOver), so marking one connection's
+	// CONNACK never races the switch to the next.
+	ack *connAck
 
 	wmu sync.Mutex
 	mu  sync.Mutex
@@ -171,9 +172,29 @@ func (s *session) touch() {
 	s.mu.Unlock()
 }
 
-// markConnacked closes connacked. Safe to call more than once.
-func (s *session) markConnacked() {
-	s.ackOnce.Do(func() { close(s.connacked) })
+// connAck is closed once one connection's CONNACK is out, so a takeover's
+// DISCONNECT never goes first.
+type connAck struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newConnAck() *connAck { return &connAck{ch: make(chan struct{})} }
+
+// markConnacked marks cl's CONNACK out, if cl still serves s. Safe to call
+// more than once.
+func (n *clusterNode) markConnacked(s *session, cl *mqtt.Client) {
+	n.sessMu.Lock()
+
+	var a *connAck
+	if s.cl == cl {
+		a = s.ack
+	}
+	n.sessMu.Unlock()
+
+	if a != nil {
+		a.once.Do(func() { close(a.ch) })
+	}
 }
 
 // sessionLocks is a lock per namespaced client ID that serialises what a
@@ -249,7 +270,7 @@ func (n *clusterNode) deliveriesOf(cl *mqtt.Client) *session {
 	n.sessMu.Lock()
 	defer n.sessMu.Unlock()
 
-	if s := n.sess[cl.ID]; s != nil && s.tracked && (s.cl == cl || s.prevCl == cl) {
+	if s := n.sess[cl.ID]; s != nil && s.tracked.Load() && (s.cl == cl || s.prevCl == cl) {
 		return s
 	}
 
@@ -437,7 +458,7 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		nsID: nsID, tenantID: st.tenantID, rawID: st.rawID, tt: tt,
 		expiryCap: st.expiryCap,
 		cl:        cl, st: st,
-		connacked: make(chan struct{}),
+		ack:       newConnAck(),
 		rev:       rev,
 		base:      *rec,
 		out:       make(map[uint16]uint64),
@@ -459,7 +480,7 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	}
 
 	resumed := resume && prev != nil && prev.ExpirySeconds > 0
-	s.tracked = persistent || resumed
+	s.tracked.Store(persistent || resumed)
 
 	if resumed {
 		if err := b.loadSession(s, cl, st, prev, fetched); err != nil {
@@ -475,7 +496,7 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	n.sess[nsID] = s
 	n.sessMu.Unlock()
 
-	if s.tracked {
+	if s.tracked.Load() {
 		tt.mu.Lock()
 		tt.sessions[s] = struct{}{}
 		tt.mu.Unlock()
@@ -631,7 +652,7 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 	s.base.Subscriptions, s.base.QoS2In, s.base.QoS2Out, s.base.QoS2Done = nil, nil, nil, nil
 	s.recvMax = int(cl.Properties.Props.ReceiveMaximum)
 	s.expiryCap = st.expiryCap
-	wasTracked := s.tracked
+	wasTracked := s.tracked.Load()
 	s.gen++
 	s.mu.Unlock()
 
@@ -642,7 +663,7 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 		lp := s.tt.livePos.Load()
 
 		s.mu.Lock()
-		s.tracked = true
+		s.tracked.Store(true)
 		s.mode, s.pos, s.liveFloor = modeLive, lp, lp
 
 		for _, pk := range prevCl.State.Inflight.GetAll(false) {
@@ -673,8 +694,7 @@ func (b *Broker) handOver(s *session, cl *mqtt.Client, st *clientState, persiste
 	n.sessMu.Lock()
 	s.prevCl = prevCl
 	s.cl, s.st = cl, st
-	s.connacked = make(chan struct{})
-	s.ackOnce = sync.Once{}
+	s.ack = newConnAck()
 	s.closedAt = time.Time{}
 	n.sessMu.Unlock()
 
@@ -1119,9 +1139,9 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 		return
 	}
 
-	s.markConnacked()
+	n.markConnacked(s, cl)
 
-	if s.tracked {
+	if s.tracked.Load() {
 		// What mochi cloned may have filled the inflight map before this
 		// ran, and a message injected meanwhile been dropped: the cursor
 		// stays at the live position from before the clone.
@@ -1166,7 +1186,7 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 	}
 
 	s.mu.Lock()
-	replaying := s.tracked && s.mode != modeLive
+	replaying := s.tracked.Load() && s.mode != modeLive
 	s.mu.Unlock()
 
 	if replaying {
@@ -1325,7 +1345,7 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 		n.goLive(func() { b.reclaimID(s.tenantID, s.rawID, msgID) })
 
 		return
-	case expire || !s.tracked:
+	case expire || !s.tracked.Load():
 		go b.deleteKey(s)
 	default:
 		ttl := time.Duration(sessionExpiry(cl, s.expiryCap)) * time.Second
@@ -1454,7 +1474,7 @@ func (n *clusterNode) snapshot(s *session, cl *mqtt.Client, final bool) (rec *cl
 
 	done := s.baseLocked(lp)
 
-	if s.tracked {
+	if s.tracked.Load() {
 		rec.Cursor = s.cursorLocked(lp)
 
 		// A resume still replaying keeps what its record said was dealt
@@ -1690,7 +1710,7 @@ func (n *clusterNode) lose(s *session, deleted bool) {
 	}
 
 	s.lost, s.deleted = true, deleted
-	cl, acked := s.cl, s.connacked
+	cl, acked := s.cl, s.ack.ch
 	n.sessMu.Unlock()
 
 	n.takeovers.Add(1)
@@ -1897,7 +1917,7 @@ func (b *Broker) flush() {
 			continue
 		}
 
-		if s.tracked {
+		if s.tracked.Load() {
 			dirty = append(dirty, s)
 		}
 	}
@@ -1970,7 +1990,7 @@ func (n *clusterNode) mayResend(st *clientState) bool {
 // message ID. Sessions without a record to resume keep it in memory only.
 func (n *clusterNode) persistQoS2In(tenantID, rawID string, _ uint16, _ string) error {
 	s := n.sessionByID(namespacedID(tenantID, rawID))
-	if s == nil || !s.tracked {
+	if s == nil || !s.tracked.Load() {
 		return nil
 	}
 
