@@ -504,7 +504,7 @@ func TestNames(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := cluster.DefaultConfig()
-	if cfg.Enabled || cfg.Mode != cluster.ModeEmbedded || cfg.Heartbeat != 2*time.Second || cfg.Lease != 10*time.Second {
+	if cfg.Enabled || cfg.Mode != cluster.ModeEmbedded || cfg.Heartbeat != 2*time.Second || cfg.Lease != 24*time.Second {
 		t.Fatalf("DefaultConfig = %+v", cfg)
 	}
 

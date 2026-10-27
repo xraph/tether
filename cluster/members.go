@@ -22,6 +22,16 @@ const (
 	minMonitorTick = 5 * time.Millisecond
 	// startWait bounds Start when its context has no deadline.
 	startWait = 10 * time.Second
+	// renewRetry is how soon a failed heartbeat write is tried again
+	// (ruling R47), well inside the Lease/2 before the fence, so the node
+	// renews as soon as the bucket has a leader again after an election,
+	// not a whole Heartbeat later.
+	renewRetry = 250 * time.Millisecond
+	// maxPutTimeout caps one heartbeat write, so a write sent into a dead
+	// leader gives way to a retry instead of holding the loop for Lease/4.
+	// An acknowledged write takes milliseconds; a spurious timeout costs only
+	// a retry 250 ms later, with Lease/2 to go before the fence.
+	maxPutTimeout = 500 * time.Millisecond
 )
 
 // heartbeat is the value of a node's key in the members bucket.
@@ -371,10 +381,11 @@ func (m *Members) wrapErr(op string, err error) error {
 	return fmt.Errorf("cluster: members: %s: %w", op, err)
 }
 
-// putTimeout is how long one heartbeat write may take: well under Lease/2, so
-// a write that hangs does not hold the fence back.
+// putTimeout is how long one heartbeat write may take: Lease/4 up to 500 ms,
+// well under Lease/2, so a write that hangs neither holds the fence back nor
+// keeps the retries from coming every renewRetry.
 func (m *Members) putTimeout() time.Duration {
-	return max(m.cfg.Lease/4, 20*time.Millisecond)
+	return min(max(m.cfg.Lease/4, 20*time.Millisecond), maxPutTimeout)
 }
 
 // renew writes one heartbeat and, when it is acknowledged, records the renew.
@@ -415,10 +426,15 @@ func (m *Members) renew(ctx context.Context) error {
 	return nil
 }
 
+// heartbeatLoop renews every Heartbeat, and after a failed write every
+// renewRetry (or Heartbeat, if that is shorter) until one is acknowledged
+// (ruling R47): losing the server that leads the members bucket, with quorum
+// left, costs an election of 4 to 9 s, and the node must renew as soon as it
+// is over rather than at its next heartbeat.
 func (m *Members) heartbeatLoop() {
 	defer m.wg.Done()
 
-	t := time.NewTicker(m.cfg.Heartbeat)
+	t := time.NewTimer(m.cfg.Heartbeat)
 	defer t.Stop()
 
 	for {
@@ -433,9 +449,15 @@ func (m *Members) heartbeatLoop() {
 
 		cancel()
 
+		next := m.cfg.Heartbeat
+
 		if err != nil && m.ctx.Err() == nil {
 			m.noteFailure(err)
+
+			next = min(renewRetry, m.cfg.Heartbeat)
 		}
+
+		t.Reset(next)
 	}
 }
 

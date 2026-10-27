@@ -22,8 +22,16 @@ const (
 
 // Defaults for DefaultConfig.
 const (
+	// DefaultHeartbeat is how often a node renews its lease.
 	DefaultHeartbeat = 2 * time.Second
-	DefaultLease     = 10 * time.Second
+	// DefaultLease is 24 s (ruling R48): a node fences after Lease/2 (12 s)
+	// without a renew and is dead to its peers after Lease + 2 s (26 s).
+	// Losing one NATS server costs a JetStream election of 4 to 9 s (the
+	// raft election timeout of nats-server 2.15) for every stream and
+	// bucket it led, the members bucket included, so the fence has to
+	// outlast one; at the old 10 s lease an ordinary server loss fenced the
+	// whole cell.
+	DefaultLease = 24 * time.Second
 	// DefaultLogMaxAge is how long the QoS 1 and 2 log keeps a message: the
 	// broker's default session expiry cap, 7 days.
 	DefaultLogMaxAge = 7 * 24 * time.Hour
@@ -52,7 +60,9 @@ type Config struct {
 	// Heartbeat is how often a node renews its lease and announces itself.
 	Heartbeat time.Duration `yaml:"heartbeat" json:"heartbeat"`
 	// Lease is how long a node's claim on its sessions lasts without a renew.
-	// It must exceed twice the heartbeat.
+	// It must exceed twice the heartbeat. Keep Lease/2 above a JetStream
+	// leader election (9 s at most), or losing one NATS server fences every
+	// node.
 	Lease time.Duration `yaml:"lease" json:"lease"`
 	// Credentials is the path of a NATS credentials file (external mode).
 	Credentials string `yaml:"credentials" json:"credentials"`

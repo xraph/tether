@@ -125,7 +125,7 @@ tether:
   #   # credentials: "/etc/tether/nats.creds"
   #
   #   heartbeat: 2s        # how often a node renews its lease
-  #   lease: 10s           # a silent node is dead after lease + 2s
+  #   lease: 24s           # fence after lease/2, dead after lease + 2s
   #   replicas: 0          # 0 picks min(3, servers)
   #   log_max_age: 168h    # how long an offline session's messages wait
   #   no_discovery: false  # only for a node behind a proxy

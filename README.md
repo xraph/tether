@@ -268,7 +268,7 @@ mosquitto_sub -h localhost -p 1883 -i display-1 -u "$DISPLAY_USER" -P "$DISPLAY_
 mosquitto_pub -h localhost -p 1881 -i pump-1 -u "$PUMP_USER" -P "$PUMP_PASS" -t sensors/pump-1/up -q 1 -m 21.5
 ```
 
-The pump talks to node 1 and the display hears it on node 3. If you kill a node with `kill -9`, the other two declare it dead about 12 seconds later (the 10 second lease plus 2), then publish the wills its clients left.
+The pump talks to node 1 and the display hears it on node 3. If you kill a node with `kill -9`, the other two declare it dead about 26 seconds later (the 24 second lease plus 2), then publish the wills its clients left.
 
 The routes listen on loopback here, so nothing off the machine can reach them. If you bind `cluster_listen` (or the NATS client `embedded.listen`) to a real interface, Tether won't start until you either set `embedded.user` and `embedded.password`, the same pair on every node, or set `embedded.insecure: true`. Think hard before you pick the second one. Anyone who reaches an open route port can join the cell as a NATS server and read every tenant's traffic.
 
