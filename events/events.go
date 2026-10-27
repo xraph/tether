@@ -11,9 +11,12 @@
 // [NewClusterReactor] sends each change through the control bus instead, and
 // every node applies it.
 //
-// Plugin hooks run synchronously inside the engine call that made the change,
-// so the reaction is done when that call returns. They never fail and never
-// panic into the engine: keysmith stops dispatching at the first plugin error.
+// Plugin hooks run synchronously inside the engine call that made the change.
+// With [NewReactor] the reaction is done when that call returns. With
+// [NewClusterReactor] the call returns once the bus has stored the change,
+// and each node, this one included, applies it asynchronously when the event
+// reaches it. Hooks never fail and never panic into the engine: keysmith
+// stops dispatching at the first plugin error.
 package events
 
 import (
@@ -25,7 +28,10 @@ import (
 //
 // Implementations are called from inside keysmith and warden admin calls (and
 // from keysmith's ValidateKey for an expired key), so they should finish
-// quickly and must not call back into the engine that called them.
+// quickly and must not call back into the engine that called them. The
+// cluster reactor ([NewClusterReactor]) waits for the control bus to store
+// each change, so it can hold such a call, a device's ValidateKey included,
+// for up to its publish wait (5 s) while the bus does not answer.
 type Handler interface {
 	// KeyInvalidated reports that the keysmith key keyID changed.
 	// disconnect is true when the key may no longer be used at all

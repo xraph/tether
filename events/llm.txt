@@ -12,7 +12,7 @@ Turns keysmith key changes and warden role changes into reactions on live MQTT c
 - `RolesChanged(ctx, roleID string)`: a role was updated or deleted, or a permission attached to or detached from it.
 - `SubjectChanged(ctx, subjectKind, subjectID string)`: a role was assigned to or unassigned from a warden subject (`"api_key"` for keysmith keys, `"user"`, `"service_acct"`).
 
-Called synchronously from inside the engine call that made the change (and from keysmith's ValidateKey for `OnKeyExpired`). Implementations must be quick and must not call back into that engine.
+Called synchronously from inside the engine call that made the change (and from keysmith's ValidateKey for `OnKeyExpired`). Implementations must be quick and must not call back into that engine. With NewReactor the reaction is done when the call returns; the cluster reactor returns once the bus has stored the change (each node applies it asynchronously on receipt), and can hold the engine call, a device's ValidateKey included, for up to `publishWait` (5 s) while the bus does not answer.
 
 ## Plugins
 
