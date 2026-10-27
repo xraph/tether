@@ -858,6 +858,12 @@ func (n *clusterNode) shareWriteFailed(nsID string, s *session, cl *mqtt.Client,
 		return
 	}
 
+	if qos > 0 && errors.Is(err, packets.ErrPacketTooLarge) {
+		// Over the client's Maximum Packet Size: OnPacketEncode finished it
+		// (discardOversized), its group's message included.
+		return
+	}
+
 	if qos > 0 {
 		if qos == 1 {
 			n.shMu.Lock()

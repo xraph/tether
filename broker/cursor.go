@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -753,7 +754,11 @@ func (ro *replayOut) send(pk packets.Packet) bool {
 		}
 	}
 
-	return cl.WritePacket(pk) == nil
+	// A packet over the client's Maximum Packet Size was discarded as
+	// delivered (discardOversized): the connection is fine.
+	err := cl.WritePacket(pk)
+
+	return err == nil || errors.Is(err, packets.ErrPacketTooLarge)
 }
 
 // runReplay replays the log for s from its position to the reader's, again
@@ -1209,6 +1214,56 @@ func (n *clusterNode) onQosDropped(cl *mqtt.Client, pk packets.Packet) {
 	}
 
 	s.mu.Unlock()
+}
+
+// tooLarge reports whether pk, encoded as it is, is over the Maximum Packet
+// Size its Mods carry (the client's, set by WritePacket), 0 for none.
+func tooLarge(pk packets.Packet) bool {
+	limit := pk.Mods.MaxSize
+	if limit == 0 {
+		return false
+	}
+
+	if uint64(len(pk.Payload)) >= uint64(limit) {
+		return true
+	}
+
+	var buf bytes.Buffer
+	if err := pk.PublishEncode(&buf); err != nil {
+		return false
+	}
+
+	return uint64(buf.Len()) > uint64(limit)
+}
+
+// discardOversized deals with an outbound PUBLISH over the client's Maximum
+// Packet Size, which the server must discard as if it had completed sending
+// it [MQTT-3.1.2-25]. mochi would leave a QoS 1 or 2 one in the inflight map
+// and send it again on every resume, and the session's deliveries would hold
+// its cursor below it for good, so it is finished here: out of the inflight
+// map (send quota restored), and complete for the session (onAck) or, for a
+// shared delivery, for its group (shareDropped).
+func (n *clusterNode) discardOversized(cl *mqtt.Client, pk packets.Packet) {
+	n.oversized.Add(1)
+	n.log.Info("tether: message over the client's maximum packet size, discarded",
+		slog.String("client", cl.ID), slog.Int("payload_bytes", len(pk.Payload)))
+
+	if pk.FixedHeader.Qos == 0 {
+		return
+	}
+
+	if cl.State.Inflight.Delete(pk.PacketID) {
+		atomic.AddInt64(&n.mochi.Info.Inflight, -1)
+		cl.State.Inflight.IncreaseSendQuota()
+	}
+
+	if _, tagged := seqOf(pk); !tagged {
+		n.shareDropped(cl, pk, false)
+
+		return
+	}
+
+	n.onAck(cl, pk.PacketID, true)
 }
 
 // onAck handles a PUBACK or PUBCOMP read from a client for one of its

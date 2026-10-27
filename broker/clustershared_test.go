@@ -1065,3 +1065,33 @@ func TestSharedPinnedFetchedAlone(t *testing.T) {
 	require.Less(t, n.fetchRead.Load()-before, uint64(10), "the resume read the log between the pinned and its own")
 	t.Logf("resumed in %v", time.Since(start))
 }
+
+// A shared message over the member's Maximum Packet Size is discarded as if
+// delivered, at QoS 1 and 2: the group's message is finished once, nothing
+// stays in flight, and the next message arrives (B-C2).
+func TestSharedOversizedDiscarded(t *testing.T) {
+	c := startCluster(t, 2)
+	tenant := c.t1.ID.String()
+
+	m, _, err := dial5(t, c.addr(0), oversizedConnect("small-member"))
+	require.NoError(t, err)
+	subscribeQoS(t, m, "$share/g/big/#", 2, false)
+
+	pub, _, err := connect5(t, c.addr(1), "big-pub", "u1", true)
+	require.NoError(t, err)
+
+	for _, qos := range []byte{1, 2} {
+		require.Equal(t, byte(0), publishQ(t, pub, "big/x", "a", qos))
+		require.Equal(t, byte(0), publishQ(t, pub, "big/x", strings.Repeat("Z", 1000), qos))
+		require.Equal(t, byte(0), publishQ(t, pub, "big/x", "b", qos))
+	}
+
+	require.Equal(t, []string{"a", "b", "a", "b"}, recvPayloads(t, m, 4))
+
+	eventually(t, "every shared delivery finished", func() bool {
+		return c.nodes[0].cluster.pendingShares(namespacedID(tenant, "small-member")) == 0 &&
+			c.nodes[0].cluster.sharedDone.Load() == 6
+	})
+	require.Equal(t, uint64(2), c.nodes[0].cluster.oversized.Load())
+	require.Zero(t, c.nodes[0].cluster.sharedLost.Load())
+}

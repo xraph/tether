@@ -663,6 +663,24 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			pk.FixedHeader.Retain = true
 		}
 
+		if n := h.b.cluster; n != nil {
+			// What WritePacket encodes once this returns: the topic without
+			// the tenant, problem information as below.
+			sized := pk
+			sized.TopicName = name
+			sized.Mods.DisallowProblemInfo = false
+
+			if tooLarge(sized) {
+				// Over the client's Maximum Packet Size: discarded as if
+				// delivered [MQTT-3.1.2-25]. mochi's encoding of exactly
+				// this packet fails the same size check, so nothing goes
+				// out.
+				n.discardOversized(cl, pk)
+
+				return sized
+			}
+		}
+
 		if n := h.b.cluster; n != nil && pk.FixedHeader.Qos == 2 && !n.beforeQoS2Send(cl, pk) {
 			// The delivery is not in the session's record, so it must not
 			// go out; beforeQoS2Send stopped the client.

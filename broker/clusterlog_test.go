@@ -1410,3 +1410,98 @@ func TestQoS2ReusedPacketIDNotDedupedAsStale(t *testing.T) {
 	m := recvLog(t, sub)
 	require.Equal(t, "N", m.Payload, "N was acked with PUBREC but never stored")
 }
+
+// oversizedConnect is a persistent 5.0 CONNECT of clientID with a Maximum
+// Packet Size of 300 bytes.
+func oversizedConnect(clientID string) *paho.Connect {
+	expiry, maxPkt := uint32(3600), uint32(300)
+
+	return &paho.Connect{
+		ClientID: clientID, Username: "u1", UsernameFlag: true, Password: []byte("secret"), PasswordFlag: true,
+		CleanStart: false, KeepAlive: 30,
+		Properties: &paho.ConnectProperties{SessionExpiryInterval: &expiry, MaximumPacketSize: &maxPkt},
+	}
+}
+
+// recvPayloads collects the payloads c receives until want have arrived or
+// logWait passes.
+func recvPayloads(t *testing.T, c *client5, want int) []string {
+	t.Helper()
+
+	var got []string
+
+	deadline := time.After(logWait)
+
+	for len(got) < want {
+		select {
+		case m := <-c.msgs:
+			got = append(got, m.Payload)
+		case <-deadline:
+			return got
+		}
+	}
+
+	return got
+}
+
+// A message over a client's Maximum Packet Size that a resumed session's
+// replay reaches is discarded as if delivered [MQTT-3.1.2-25]: the replay
+// goes on to the next message and the session goes live (B-C2).
+func TestOversizedMessageSkippedByReplay(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	s, _, err := dial5(t, c.addr(0), oversizedConnect("small"))
+	require.NoError(t, err)
+	subscribeQoS(t, s, "big/#", 1, false)
+	require.NoError(t, s.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitOffline(t, c.nodes[1], tid, "small")
+
+	pub, _, err := connect5(t, c.addr(1), "big-pub", "u1", true)
+	require.NoError(t, err)
+
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", "a", 1))
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", strings.Repeat("Z", 1000), 1))
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", "b", 1))
+
+	s2, ca, err := dial5(t, c.addr(1), oversizedConnect("small"))
+	require.NoError(t, err)
+	require.True(t, ca.SessionPresent)
+	require.Equal(t, []string{"a", "b"}, recvPayloads(t, s2, 2))
+
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", "live", 1))
+	require.Equal(t, []string{"live"}, recvPayloads(t, s2, 1), "the session never went live")
+}
+
+// A live delivery over a client's Maximum Packet Size is discarded as if
+// delivered: it leaves the inflight map and the session's deliveries, so the
+// session's cursor moves past it (B-C2).
+func TestOversizedMessageDoesNotPinCursor(t *testing.T) {
+	c := startCluster(t, 2)
+	tid := c.t1.ID.String()
+
+	s, _, err := dial5(t, c.addr(0), oversizedConnect("small2"))
+	require.NoError(t, err)
+	subscribeQoS(t, s, "big/#", 1, false)
+
+	pub, _, err := connect5(t, c.addr(1), "big-pub2", "u1", true)
+	require.NoError(t, err)
+
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", "a", 1))
+	require.Equal(t, byte(0), publishQ(t, pub, "big/x", strings.Repeat("Z", 1000), 1))
+
+	for range 5 {
+		require.Equal(t, byte(0), publishQ(t, pub, "big/x", "b", 1))
+	}
+
+	require.Equal(t, []string{"a", "b", "b", "b", "b", "b"}, recvPayloads(t, s, 6))
+
+	tt := c.nodes[0].cluster.trackIfAny(tid)
+	require.NotNil(t, tt)
+
+	eventually(t, "the cursor passes the oversized message", func() bool {
+		rec, err := sessionKey(t, c.nodes[0], tid, "small2")
+
+		return err == nil && len(rec.Pending) == 0 && rec.Cursor >= tt.livePos.Load()
+	})
+}

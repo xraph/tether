@@ -146,8 +146,9 @@ type clusterNode struct {
 
 	// Counters for tests: appends committed (client and host publishes),
 	// acks written, log messages injected, readers restarted, and attempts
-	// to append a client publish (every send, retries included).
-	appends, acks, logDelivered, readerRestarts, appendAttempts atomic.Uint64
+	// to append a client publish (every send, retries included), and
+	// outbound messages discarded over a client's Maximum Packet Size.
+	appends, acks, logDelivered, readerRestarts, appendAttempts, oversized atomic.Uint64
 
 	// holdAppend, when a test sets it before Start, runs before every
 	// append of a client publish and may block until ctx ends. An error
