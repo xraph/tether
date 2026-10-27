@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -23,14 +24,14 @@ const (
 	// startWait bounds Start when its context has no deadline.
 	startWait = 10 * time.Second
 	// renewRetry is how soon another heartbeat write goes out after one
-	// failed, or while one has not been acknowledged yet (ruling R47), well
-	// inside the Lease/2 before the fence, so the node renews as soon as the
-	// bucket has a leader again after an election, not a Heartbeat later.
+	// failed, or after one has gone unanswered for longer than writes take
+	// (ruling R47), well inside the Lease/2 before the fence.
 	renewRetry = 250 * time.Millisecond
 	// maxRenewsInFlight is how many heartbeat writes may be outstanding at
-	// once. The retries run alongside a write that is merely slow, and
-	// whichever is acknowledged first renews, so a slow write is never cut
-	// short and a dead one never holds the retries back.
+	// once. A second runs alongside one that seems lost, and whichever is
+	// acknowledged first renews, so a slow write is never cut short. Two
+	// writes swallowed by a dead leader hold the retries back until the
+	// first of them ends at its Lease/4 bound.
 	maxRenewsInFlight = 2
 )
 
@@ -105,6 +106,9 @@ type Members struct {
 	peers      map[string]*peerState
 	queue      []func()
 	wake       chan struct{}
+
+	// writes counts heartbeat writes sent (tests).
+	writes atomic.Int64
 
 	kv      jetstream.KeyValue
 	watcher jetstream.KeyWatcher
@@ -426,21 +430,36 @@ func (m *Members) renew(ctx context.Context) error {
 	return nil
 }
 
-// heartbeatLoop renews every Heartbeat. When a write fails, or has not been
-// acknowledged renewRetry after it went out, another goes out every
-// renewRetry (or Heartbeat, if that is shorter), with at most
-// maxRenewsInFlight outstanding, each bounded by Lease/4 (ruling R47).
-// Whichever write is acknowledged first renews. Losing the server that leads
-// the members bucket, with quorum left, costs an election of 4 to 9 s, and
-// the node renews as soon as it is over; a bucket that is slow but working
-// renews within Lease/4, as it always did.
+// renewResult is one heartbeat write's outcome and when it went out.
+type renewResult struct {
+	sent time.Time
+	err  error
+}
+
+// heartbeatLoop renews every Heartbeat (ruling R47 for the retries). A write
+// is bounded by Lease/4. Another goes out every renewRetry (or Heartbeat, if
+// that is shorter) while the last one failed, or while the one outstanding
+// has gone unanswered for more than twice the time the last acknowledged
+// write took (renewRetry at least), with at most maxRenewsInFlight
+// outstanding; whichever is acknowledged first renews, and the next write is
+// due a Heartbeat after the one that renewed went out. So a bucket that is
+// slow but working gets one write per Heartbeat, however slow, and a write
+// lost to a dead leader gets company after 250 ms. A failure of a write sent
+// before the last one that renewed is stale and is dropped: it must not
+// report a failure right after a renew.
 func (m *Members) heartbeatLoop() {
 	defer m.wg.Done()
 
 	retry := min(renewRetry, m.cfg.Heartbeat)
-	results := make(chan error, maxRenewsInFlight)
+	results := make(chan renewResult, maxRenewsInFlight)
 	inFlight := 0
-	lastSent := time.Now()
+
+	var (
+		lastSent  time.Time     // the newest write sent
+		lastOK    time.Time     // when the newest acknowledged write went out
+		latency   time.Duration // how long the last acknowledged write took
+		lastWrong bool          // the newest write that answered failed
+	)
 
 	t := time.NewTimer(m.cfg.Heartbeat)
 	defer t.Stop()
@@ -449,36 +468,51 @@ func (m *Members) heartbeatLoop() {
 		select {
 		case <-m.ctx.Done():
 			return
-		case err := <-results:
+		case r := <-results:
 			inFlight--
 
-			if err != nil {
-				if m.ctx.Err() == nil {
-					m.noteFailure(err)
+			if r.err != nil {
+				if m.ctx.Err() == nil && !r.sent.Before(lastOK) {
+					lastWrong = true
+
+					m.noteFailure(r.err)
 				}
 
 				// The retry timer is running.
 				continue
 			}
 
-			if inFlight == 0 {
-				t.Reset(max(time.Until(lastSent.Add(m.cfg.Heartbeat)), 0))
+			latency = time.Since(r.sent)
+
+			if r.sent.After(lastOK) {
+				lastOK = r.sent
 			}
+
+			lastWrong = false
+
+			// Back on the Heartbeat, whatever else is outstanding: a slower
+			// write still in flight finishes on its own.
+			t.Reset(max(time.Until(lastOK.Add(m.cfg.Heartbeat)), 0))
 		case <-t.C:
-			if inFlight < maxRenewsInFlight {
+			due := inFlight == 0 || lastWrong || time.Since(lastSent) >= max(retry, 2*latency)
+
+			if due && inFlight < maxRenewsInFlight {
 				inFlight++
 				lastSent = time.Now()
+				sent := lastSent
 
+				m.writes.Add(1)
 				m.wg.Go(func() {
 					pctx, cancel := context.WithTimeout(m.ctx, m.putTimeout())
 					defer cancel()
 
-					results <- m.renew(pctx)
+					results <- renewResult{sent: sent, err: m.renew(pctx)}
 				})
 			}
 
 			// Look again in renewRetry: the write is acknowledged by then,
-			// which puts the timer back on the Heartbeat, or another goes.
+			// which puts the timer back on the Heartbeat, or it is looked at
+			// again.
 			t.Reset(retry)
 		}
 	}

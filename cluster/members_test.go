@@ -568,12 +568,13 @@ func TestMembersWatchRestarts(t *testing.T) {
 
 // Ruling R47 with the R48 default lease: losing the server that leads the
 // members bucket, with quorum left, costs a raft election of 4 to 9 s, and
-// the node must ride it out. It is not fenced, and it renews within 1.5 s of
-// the bucket having a leader again, not at its next 2 s heartbeat or after
-// a write that hung for Lease/4, because a failed write is retried every
-// 250 ms with each attempt bounded by 500 ms. (A write that went out just
-// before the leader appeared can still take its 500 ms, or wait out the
-// stream's delayed 503, before the next one: 1.5 s covers both.)
+// the node must ride it out without fencing. The cut-off leader swallows the
+// writes sent to it without a reply (a stream member drops a publish it
+// cannot lead), so the node's two write slots fill with writes that end only
+// at their Lease/4 bound (6 s); after that a write goes every 250 ms. So the
+// first renew after the cut comes once the bucket has a leader again and
+// those writes have timed out, give or take a retry, and well before the
+// 12 s fence.
 func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 	pc := clustertest.StartProxied(t)
 
@@ -601,13 +602,15 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 
 	bucket := "KV_" + cfg.MembersBucket()
 
+	// Short asks, so a leaderless stream (no answer) does not hold the
+	// polling back for long and "leader seen" is close to the election.
 	leaderOf := func(c *Conn) string {
-		st, err := c.js.Stream(tctx(t, 2*time.Second), bucket)
+		st, err := c.js.Stream(tctx(t, 300*time.Millisecond), bucket)
 		if err != nil {
 			return ""
 		}
 
-		info, err := st.Info(tctx(t, 2*time.Second))
+		info, err := st.Info(tctx(t, 300*time.Millisecond))
 		if err != nil || info.Cluster == nil {
 			return ""
 		}
@@ -674,28 +677,38 @@ func TestMembersRideOutBucketLeaderLoss(t *testing.T) {
 		return false
 	})
 
-	renewedAfter := func() bool {
+	// A write in flight at the cut may still be acknowledged just after it;
+	// the renew that counts comes later.
+	renewedAfterCut := func() bool {
 		n.m.mu.Lock()
 		defer n.m.mu.Unlock()
 
-		return n.m.lastRenew.After(elected)
+		return n.m.lastRenew.After(cut.Add(200 * time.Millisecond))
 	}
 
-	eventually(t, 5*time.Second, "a renew after the election", renewedAfter)
+	eventually(t, 15*time.Second, "a renew after the cut", renewedAfterCut)
 
 	n.m.mu.Lock()
-	gap := n.m.lastRenew.Sub(elected)
+	renewed := n.m.lastRenew
 	n.m.mu.Unlock()
 
-	t.Logf("leader %s cut off; new leader seen after %s; renewed %s after that", leader,
-		elected.Sub(cut).Round(time.Millisecond), gap.Round(time.Millisecond))
+	// The swallowed writes went out at most a retry after the cut and end
+	// at Lease/4; after that, and once there is a leader, a write lands
+	// within a retry or two.
+	due := cut.Add(n.m.putTimeout() + renewRetry)
+	if elected.After(due) {
+		due = elected
+	}
+
+	t.Logf("leader %s cut off; new leader seen after %s; first renew after the cut at %s (due by %s)", leader,
+		elected.Sub(cut).Round(time.Millisecond), renewed.Sub(cut).Round(time.Millisecond), due.Sub(cut).Round(time.Millisecond))
 
 	if elected.Sub(cut) < 2*time.Second {
 		t.Fatalf("new leader after %s: no real election happened", elected.Sub(cut))
 	}
 
-	if gap > 1500*time.Millisecond {
-		t.Fatalf("renewed %s after the bucket had a leader again, want within 1.5 s", gap)
+	if late := renewed.Sub(due); late > time.Second {
+		t.Fatalf("renewed %s after the cut, %s past when it was due", renewed.Sub(cut), late)
 	}
 
 	if n.m.Fenced() || len(n.ev.fenceTimes()) != 0 {
@@ -769,5 +782,92 @@ func TestMembersSlowWritesDoNotFence(t *testing.T) {
 
 	if renews < 3 {
 		t.Fatalf("%d renews in 5 s, want them to keep landing", renews)
+	}
+}
+
+// A bucket that is slow but working gets one heartbeat write per Heartbeat,
+// not two in flight for as long as it stays slow. With the production timings
+// (2 s heartbeat, 24 s lease) the node is behind a link delayed 200 ms each
+// way, so every write takes over 400 ms, longer than the 250 ms retry. Over
+// 10 s it must send about five writes, as on a fast link, keep renewing and
+// never fence. (Going back to the Heartbeat only once nothing was in flight
+// sent about 40.)
+func TestMembersHeartbeatCadenceOnSlowBucket(t *testing.T) {
+	cell := startMemberCell(t)
+
+	proxy, err := chaos.NewProxy(strings.TrimPrefix(cell.urls[0], "nats://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(proxy.Close)
+
+	cfg := memberConfig("n1", "nats://"+proxy.Addr())
+	cfg.Heartbeat = DefaultHeartbeat
+	cfg.Lease = DefaultLease
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	n := &memberNode{cfg: cfg, conn: c, ev: &memberEvents{}}
+	n.m = n.newMembers()
+
+	if err := n.m.Start(tctx(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(n.m.Stop)
+
+	const window = 10 * time.Second
+
+	count := func() (writes int64, renews int) {
+		from := time.Now()
+		before := n.m.writes.Load()
+
+		var last time.Time
+
+		for time.Since(from) < window {
+			time.Sleep(50 * time.Millisecond)
+
+			n.m.mu.Lock()
+			lr := n.m.lastRenew
+			n.m.mu.Unlock()
+
+			if lr.After(from) && lr.After(last) {
+				renews++
+				last = lr
+			}
+		}
+
+		return n.m.writes.Load() - before, renews
+	}
+
+	fastWrites, fastRenews := count()
+
+	proxy.SetDelay(chaos.Both, 200*time.Millisecond)
+	proxy.SetMode(chaos.Both, chaos.Delay)
+
+	slowWrites, slowRenews := count()
+
+	t.Logf("in %s: fast link %d writes, %d renews; slow link %d writes, %d renews", window, fastWrites, fastRenews, slowWrites, slowRenews)
+
+	want := int64(window / cfg.Heartbeat)
+
+	for _, got := range []int64{fastWrites, slowWrites} {
+		if got < want-1 || got > want+2 {
+			t.Fatalf("%d writes in %s, want about %d (one per heartbeat)", got, window, want)
+		}
+	}
+
+	if slowRenews < int(want)-2 {
+		t.Fatalf("%d renews in %s on the slow link, want about %d", slowRenews, window, want)
+	}
+
+	if n.m.Fenced() || len(n.ev.fenceTimes()) != 0 {
+		t.Fatal("fenced on a slow but working bucket")
 	}
 }
