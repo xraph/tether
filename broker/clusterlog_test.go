@@ -1518,6 +1518,40 @@ func TestFitPacketSize(t *testing.T) {
 	require.Equal(t, uint32(1<<20), fitPacketSize(1<<20, 0, log), "unknown limit: unchanged")
 }
 
+// A cell node advertises the Maximum Packet Size it accepts on a 5.0
+// success CONNACK, since fitPacketSize may have lowered it below what the
+// client expects (R53); without a cluster the CONNACK carries none, as mochi
+// writes it.
+func TestConnackAdvertisesPacketSize(t *testing.T) {
+	c := startCluster(t, 1)
+	limit := c.nodes[0].MaxPacketSize()
+	require.Less(t, limit, uint32(DefaultMaxPacketSize), "the test cell's NATS lowers the packet size")
+
+	_, ca, err := connect5(t, c.addr(0), "mps", "u1", true)
+	require.NoError(t, err)
+	require.NotNil(t, ca.Properties.MaximumPacketSize, "the CONNACK says nothing about the packet size")
+	require.Equal(t, limit, *ca.Properties.MaximumPacketSize)
+
+	// A resume gets it too.
+	s, _, err := dial5(t, c.addr(0), oversizedConnect("mps-p"))
+	require.NoError(t, err)
+	require.NoError(t, s.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+	waitOffline(t, c.nodes[0], c.t1.ID.String(), "mps-p")
+
+	_, ca, err = dial5(t, c.addr(0), oversizedConnect("mps-p"))
+	require.NoError(t, err)
+	require.True(t, ca.SessionPresent)
+	require.NotNil(t, ca.Properties.MaximumPacketSize)
+	require.Equal(t, limit, *ca.Properties.MaximumPacketSize)
+
+	single := startBroker(t, map[string]*auth.Identity{"u1": ident(newTenant(tenant.Limits{}), "u1")},
+		map[string]acl.Rules{"u1": {Publish: []string{"#"}, Subscribe: []string{"#"}}})
+
+	_, ca, err = connect5(t, single.Addr().String(), "mps", "u1", true)
+	require.NoError(t, err)
+	require.Nil(t, ca.Properties.MaximumPacketSize, "Phase 1's CONNACK changed")
+}
+
 // A publish the log refuses as too large for NATS is refused to the client,
 // not retried for ever behind its acks: a 5.0 client gets 0x83 on its
 // PUBACK or PUBREC and its later publishes go on; a will too large for the

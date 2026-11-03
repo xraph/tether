@@ -597,6 +597,15 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 	case packets.Connack:
 		code, ok := h.b.state.takeRefusal(cl)
 		if !ok {
+			// A cell node may have lowered its Maximum Packet Size to fit
+			// NATS (fitPacketSize), and mochi v2.7.9 never advertises the
+			// limit: a 5.0 client must learn it [MQTT-3.2.2.3.6], or a
+			// packet over it closes the connection with nothing said.
+			// Without a cluster the CONNACK stays as mochi writes it.
+			if h.b.cluster != nil && cl.Properties.ProtocolVersion == 5 && pk.ReasonCode < packets.ErrUnspecifiedError.Code {
+				pk.Properties.MaximumPacketSize = h.b.cfg.MaxPacketSize
+			}
+
 			// Mochi has just handed this connection the session it
 			// inherited and will resend the session's inflight messages
 			// right after this CONNACK.
