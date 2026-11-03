@@ -131,6 +131,7 @@ func TestEmitNeverBlocks(t *testing.T) {
 func TestDenyCollapsed(t *testing.T) {
 	sink := &fakeSink{}
 	cfg := enabled()
+	cfg.Writers = 1 // the sink sees the queue's order
 	cfg.DenyWindow = 200 * time.Millisecond
 
 	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)
@@ -186,6 +187,46 @@ func TestDenyAloneNoSummary(t *testing.T) {
 	stop(t, r)
 
 	require.Len(t, sink.events(), 1)
+}
+
+// TestDenyWindowEndedBeforeSweep: a denial after a window ended but before
+// the sweep closed it closes the window itself, so the repeats it counted
+// still get their summary.
+func TestDenyWindowEndedBeforeSweep(t *testing.T) {
+	sink := &fakeSink{}
+	cfg := enabled()
+	cfg.DenyWindow = time.Hour
+	cfg.Writers = 1 // the sink sees the queue's order
+
+	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)
+	r.Start()
+
+	deny := func(at time.Time) {
+		r.Emit(audit.Event{Action: audit.ActionACLDenied, TenantID: "t1", ClientID: "c1", At: at,
+			Meta: map[string]any{audit.MetaOp: "publish", audit.MetaTopic: "x"}})
+	}
+
+	start := time.Now()
+	deny(start)
+
+	for i := range 10 {
+		deny(start.Add(time.Duration(i+1) * time.Minute))
+	}
+
+	// The sweep ticks every 15 minutes of wall time, so it has not run.
+	deny(start.Add(time.Hour + time.Second))
+
+	eventually(t, "the first denial, the summary and the new one", func() bool { return len(sink.events()) == 3 })
+
+	evs := sink.events()
+	require.NotContains(t, evs[0].Meta, audit.MetaSuppressed)
+	require.Equal(t, 10, evs[1].Meta[audit.MetaSuppressed])
+	require.Equal(t, start.Add(10*time.Minute), evs[1].At, "the summary is the latest repeat")
+	require.NotContains(t, evs[2].Meta, audit.MetaSuppressed)
+
+	// The new window counted nothing, so Stop adds no summary.
+	stop(t, r)
+	require.Len(t, sink.events(), 3)
 }
 
 func TestEventsFilter(t *testing.T) {
@@ -255,6 +296,7 @@ func TestStopDrains(t *testing.T) {
 func TestStopDrainsDenySummaries(t *testing.T) {
 	sink := &fakeSink{}
 	cfg := enabled()
+	cfg.Writers = 1 // the sink sees the queue's order
 	cfg.DenyWindow = time.Hour
 
 	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)

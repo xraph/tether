@@ -187,8 +187,15 @@ func (r *Recorder) Emit(ev Event) {
 		ev.At = r.now()
 	}
 
-	if ev.Action == ActionACLDenied && r.collapse(ev) {
-		return
+	if ev.Action == ActionACLDenied {
+		repeat, closed := r.collapse(ev)
+		if closed != nil {
+			r.enqueue(*closed)
+		}
+
+		if repeat {
+			return
+		}
 	}
 
 	r.enqueue(ev)
@@ -214,9 +221,12 @@ func (r *Recorder) enqueue(ev Event) {
 
 // collapse reports whether ev repeats a denial whose window is open, and
 // counts it if so. Otherwise it opens a window for ev, which the caller
-// records. The windows are bounded by the queue size: past that, a new
-// denial is recorded without one.
-func (r *Recorder) collapse(ev Event) bool {
+// records. A window of the same denial that ended before ev but that the
+// sweep has not closed yet is closed here: closed is its summary when it
+// counted repeats, for the caller to queue before ev. The windows are
+// bounded by the queue size: past that, a new denial is recorded without
+// one.
+func (r *Recorder) collapse(ev Event) (repeat bool, closed *Event) {
 	k := denyKey{tenant: ev.TenantID, client: ev.ClientID}
 
 	if op, ok := ev.Meta[MetaOp].(string); ok {
@@ -230,18 +240,39 @@ func (r *Recorder) collapse(ev Event) bool {
 	r.dmu.Lock()
 	defer r.dmu.Unlock()
 
-	if e, ok := r.denies[k]; ok && ev.At.Before(e.until) {
+	e, ok := r.denies[k]
+	if ok && ev.At.Before(e.until) {
 		e.suppressed++
 		e.last = ev
 
-		return true
+		return true, nil
 	}
 
-	if len(r.denies) < r.cfg.QueueSize {
+	if ok && e.suppressed > 0 {
+		sum := summary(e)
+		closed = &sum
+	}
+
+	if ok || len(r.denies) < r.cfg.QueueSize {
 		r.denies[k] = &denyEntry{until: ev.At.Add(r.cfg.DenyWindow)}
 	}
 
-	return false
+	return false, closed
+}
+
+// summary is the event that closes a window with repeats: the latest of
+// them, with Meta["suppressed"] set to their count.
+func summary(e *denyEntry) Event {
+	ev := e.last
+	ev.Meta = maps.Clone(ev.Meta)
+
+	if ev.Meta == nil {
+		ev.Meta = make(map[string]any, 1)
+	}
+
+	ev.Meta[MetaSuppressed] = e.suppressed
+
+	return ev
 }
 
 // sweep closes the deny windows as they end, several times per window.
@@ -279,15 +310,7 @@ func (r *Recorder) closeWindows(now time.Time) {
 			continue
 		}
 
-		ev := e.last
-		ev.Meta = maps.Clone(ev.Meta)
-
-		if ev.Meta == nil {
-			ev.Meta = make(map[string]any, 1)
-		}
-
-		ev.Meta[MetaSuppressed] = e.suppressed
-		summaries = append(summaries, ev)
+		summaries = append(summaries, summary(e))
 	}
 
 	r.dmu.Unlock()
