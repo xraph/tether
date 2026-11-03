@@ -8,7 +8,7 @@ Tether's REST layer on Forge routers: an admin API and one public endpoint, POST
 
 `Register(admin, public forge.Router, s Services) error` mounts the admin routes on `admin` and `POST /v1/publish` on `public`, both relative to whatever base path (default `/tether`) those routers carry. It adds no admin authentication: the caller adds its own auth middleware to `admin` with `admin.Use(...)` before calling Register. Register mounts its routes on groups nested in `admin`. Since forge v1.13.0 those inherit both `admin.Use` and `forge.WithGroupMiddleware`; forge v1.12.10 and earlier dropped the second and mounted the routes open, so `Use` is the form the extension uses. The error is a missing required service or a failed route registration (joined; earlier routes stay mounted).
 
-`Services{Tenants *service.Tenants; Devices *service.Devices; Roles *perm.Roles; Broker *broker.Broker; Auth auth.Authenticator; Perms broker.PermLoader; Limits *limits.Limiter; Logger *slog.Logger; MaxPublishPayload int}`. All but Logger and MaxPublishPayload are required. MaxPublishPayload caps the decoded payload of POST /v1/publish; zero or less means the `MaxPublishPayload` constant (1 MiB, the broker's default packet size). The extension sets it to the broker's `MaxPacketSize`. Logger gets the internal errors the API hides from clients (nil discards them). `Auth`, `Perms` and `Limits` should be the very ones the broker runs with, so an HTTP publish meets the same checks and shares the tenant's rate bucket.
+`Services{Tenants *service.Tenants; Devices *service.Devices; Roles *perm.Roles; Broker *broker.Broker; Auth auth.Authenticator; Perms broker.PermLoader; Limits *limits.Limiter; Logger *slog.Logger; MaxPublishPayload int; Audit audit.Emitter}`. All but Logger, MaxPublishPayload and Audit are required. MaxPublishPayload caps the decoded payload of POST /v1/publish; zero or less means the `MaxPublishPayload` constant (1 MiB, the broker's default packet size). The extension sets it to the broker's `MaxPacketSize`. Logger gets the internal errors the API hides from clients (nil discards them). `Auth`, `Perms` and `Limits` should be the very ones the broker runs with, so an HTTP publish meets the same checks and shares the tenant's rate bucket.
 
 ## Admin routes
 
@@ -40,6 +40,25 @@ Revoke, delete and rotate do not call the broker themselves: the keysmith plugin
 
 Every route that calls the broker (clients, kick, sessions, retained, stats, publish) is 503 while `Broker.Running()` is false. Tenant PATCH and DELETE are not gated: `UpdateTenant` is a no-op on a stopped broker, and the store write is the point.
 
+## Audit
+
+With `Services.Audit` set, every state-changing route records one `audit.Event` once its handler returned; reads and `POST /v1/publish` record nothing. `(*Services).Emit(ev, err)` does the stamping for both this package and the dashboard contract: Outcome success, or failure with `err.Error()` (the mapped HTTP error) as Reason, and Node from `Broker.NodeID()`. Actor is the `Subject` of forge's `extensions/auth` `AuthContext`, read from the forge context (`auth.GetAuthContext`, where forge's auth middleware puts it) and then the request context (`auth.GetAuthContextFromStdContext`); empty when the admin middleware sets neither.
+
+Most routes are wrapped where they're registered (`audited(a, describe, handler)`, generic over the request and response types); the describe function builds the event from the request alone. POST tenants and POST devices record their own event, since the tenant or device they make is only known after they ran and they write their own response. A request forge refuses before the handler (a body that doesn't bind) is not recorded. Path IDs go in as sent, so a malformed one shows up in a failure event as the caller wrote it.
+
+| Route | Action | Target |
+|---|---|---|
+| `POST /v1/tenants` | `admin.tenant.create` | TenantID and `target` the new tenant; Meta `app_id`, `external_id` |
+| `PATCH /:tenantId` | `admin.tenant.update` | `target` the tenant; Meta `enabled` when the body set it |
+| `DELETE /:tenantId` | `admin.tenant.delete` | `target` the tenant |
+| `POST .../devices` | `admin.device.provision` | Subject and `target` the new device, ClientID the pinned client ID |
+| `POST .../rotate`, `.../revoke`, `DELETE .../devices/:deviceId` | `admin.device.rotate`, `revoke`, `delete` | Subject and `target` the device |
+| `PUT .../devices/:deviceId/roles` | `admin.device.roles` | Subject and `target` the device; Meta `roles` |
+| `POST .../roles`, `DELETE .../roles/:roleSlug` | `admin.role.create`, `delete` | `target` the slug |
+| `PUT .../roles/:roleSlug/topics` | `admin.role.topics` | `target` the slug; Meta `publish`, `subscribe` |
+| `POST .../clients/:clientId/kick`, `DELETE .../sessions/:clientId` | `admin.client.kick`, `admin.session.delete` | ClientID |
+| `DELETE .../retained?topic=` | `admin.retained.delete` | `target` the topic |
+
 ## Tenant scope
 
 The tenant in the path is parsed (malformed is 400) and loaded (unknown is 404); devices, roles and broker calls then take that tenant's ID or external ID. A device, client, session, retained topic or role that belongs to another tenant is a 404 (or an empty list), never a read or a change. `TestTenantScopeInPath` pins it for every route.
@@ -64,4 +83,4 @@ Forge's binder treats a non-pointer field without `omitempty` or `optional:"true
 
 ## Tests
 
-`api_test.go` runs the whole stack (memory store, keysmith and warden engines, the broker on a loopback port, paho clients) behind a Forge test app and `httptest`. `errors_internal_test.go` has the `mapError` table. `spec_test.go` checks the route list.
+`api_test.go` runs the whole stack (memory store, keysmith and warden engines, the broker on a loopback port, paho clients) behind a Forge test app and `httptest`. `errors_internal_test.go` has the `mapError` table. `spec_test.go` checks the route list. `audit_test.go` checks the audit events of provision, kick, revoke and a failing delete with an auth context on the forge context and on the request's, and that every state-changing route records its action.

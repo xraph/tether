@@ -40,6 +40,7 @@ The root package is `tether`: the version and the sentinel errors. The rest foll
 - `perm/`: warden roles and their topic grants, and the loader the broker uses.
 - `service/`: tenant and device management on top of a store, keysmith and warden.
 - `metering/`: per-tenant usage sent to ledger every minute (the ledger adapter is in `extension/`).
+- `audit/`: the audit trail of connections, refusals, ACL denials, takeovers and admin changes, through a bounded non-blocking queue to chronicle (the chronicle adapter is in `extension/`).
 - `extension/`: the Forge extension, with `extension/contract/` for the dashboard contract.
 - `cmd/tether/`: the standalone server.
 - Smaller pieces: `acl/` (compiled grants), `topic/` (validation and namespacing), `limits/` (per-tenant rate and connection limits), `scope/` (keysmith, warden and forge tenant scope), `tenant/` and `device/` (models), `id/` (TypeIDs), and `store/` with `memory`, `sqlite`, `postgres` and the shared `storetest` suite. Every package with a public surface gets an `llm.txt` written for agents, the way forge does, so update it in the same commit when the surface changes.

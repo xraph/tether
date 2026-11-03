@@ -11,7 +11,9 @@ import (
 	"log/slog"
 
 	"github.com/xraph/forge"
+	forgeauth "github.com/xraph/forge/extensions/auth"
 
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/limits"
@@ -54,6 +56,11 @@ type Services struct {
 	// takes, in bytes. Zero (or less) means the MaxPublishPayload constant.
 	// Set it to the broker's MaxPacketSize so HTTP and MQTT agree.
 	MaxPublishPayload int
+
+	// Audit hears about every admin change once it ran, with its outcome
+	// and the caller. The dashboard contract emits through the same field.
+	// Nil records nothing.
+	Audit audit.Emitter
 }
 
 // API holds the services the handlers share.
@@ -93,6 +100,67 @@ func Register(admin, public forge.Router, s Services) error {
 		a.registerClients(admin),
 		a.registerPublish(public),
 	)
+}
+
+// Emit stamps an admin event with the broker's node and hands it to Audit.
+// It does nothing without one. Callers fill Action, TenantID, Actor and
+// what the change acted on; err is what the change returned, and makes the
+// outcome a failure with err as the reason.
+func (s *Services) Emit(ev audit.Event, err error) {
+	if s == nil || s.Audit == nil {
+		return
+	}
+
+	ev.Outcome = audit.OutcomeSuccess
+	if err != nil {
+		ev.Outcome = audit.OutcomeFailure
+		ev.Reason = err.Error()
+	}
+
+	if s.Broker != nil {
+		ev.Node = s.Broker.NodeID()
+	}
+
+	s.Audit.Emit(ev)
+}
+
+// actor is who made a REST call: the Subject of the forge auth context the
+// admin middleware set, on the forge context or on the request's.
+func actor(c forge.Context) string {
+	if ac, ok := forgeauth.GetAuthContext(c); ok && ac != nil {
+		return ac.Subject
+	}
+
+	if ac, ok := forgeauth.GetAuthContextFromStdContext(c.Context()); ok && ac != nil {
+		return ac.Subject
+	}
+
+	return ""
+}
+
+// record emits the admin change ev of the REST call c, which returned err.
+func (a *API) record(c forge.Context, ev audit.Event, err error) {
+	if a.Audit == nil {
+		return
+	}
+
+	ev.Actor = actor(c)
+	a.Emit(ev, err)
+}
+
+// audited wraps h, a handler that changes state, so the change is recorded
+// once h returned: describe builds the event from the request, record adds
+// the caller and the outcome. A request forge refuses before h runs (a body
+// that does not bind) is not a change and records nothing.
+func audited[R, O any](a *API, describe func(req *R) audit.Event,
+	h func(forge.Context, *R) (*O, error),
+) func(forge.Context, *R) (*O, error) {
+	return func(c forge.Context, req *R) (*O, error) {
+		out, err := h(c, req)
+		a.record(c, describe(req), err)
+
+		return out, err
+	}
 }
 
 // check reports the first missing required service.

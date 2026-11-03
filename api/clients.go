@@ -6,6 +6,7 @@ import (
 
 	"github.com/xraph/forge"
 
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/topic"
 )
@@ -48,16 +49,28 @@ func (a *API) registerClients(r forge.Router) error {
 	return errors.Join(
 		g.GET("/clients", a.listClients, forge.WithName("listClients"),
 			forge.WithSummary("List a tenant's connections and kept sessions on this node")),
-		g.POST("/clients/:clientId/kick", a.kickClient, forge.WithName("kickClient"),
+		g.POST("/clients/:clientId/kick", audited(a, clientEvent(audit.ActionClientKick), a.kickClient), forge.WithName("kickClient"),
 			forge.WithSummary("Disconnect a client and keep its session")),
-		g.DELETE("/sessions/:clientId", a.deleteSession, forge.WithName("deleteSession"),
+		g.DELETE("/sessions/:clientId", audited(a, clientEvent(audit.ActionSessionDelete), a.deleteSession), forge.WithName("deleteSession"),
 			forge.WithSummary("Disconnect a client and delete its session")),
 		g.GET("/retained", a.listRetained, forge.WithName("listRetained"),
 			forge.WithSummary("List retained messages matching a filter")),
-		g.DELETE("/retained", a.deleteRetained, forge.WithName("deleteRetained"),
+		g.DELETE("/retained", audited(a, retainedDeleted, a.deleteRetained), forge.WithName("deleteRetained"),
 			forge.WithSummary("Delete the retained message on a topic")),
 		g.GET("/stats", a.stats, forge.WithName("tenantStats"), forge.WithSummary("A tenant's counters on this node")),
 	)
+}
+
+// clientEvent describes a change to the client or session a path names.
+func clientEvent(action string) func(*clientPath) audit.Event {
+	return func(req *clientPath) audit.Event {
+		return audit.Event{Action: action, TenantID: req.TenantID, ClientID: req.ClientID}
+	}
+}
+
+// retainedDeleted describes DELETE .../retained?topic=.
+func retainedDeleted(req *deleteRetainedRequest) audit.Event {
+	return audit.Event{Action: audit.ActionRetainedDelete, TenantID: req.TenantID, Meta: audit.Target(req.Topic)}
 }
 
 func (a *API) listClients(c forge.Context, req *tenantPath) (*list[broker.ClientInfo], error) {

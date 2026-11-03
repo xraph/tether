@@ -1,0 +1,44 @@
+# tether/audit
+
+Import: github.com/xraph/tether/audit
+
+The audit trail of connections and admin changes: connects, disconnects, refused CONNECTs, ACL denials of a PUBLISH or SUBSCRIBE, session takeovers and every state-changing REST route and dashboard command. Never a single message and never a delivery. Events go to a Sink (chronicle, through `extension/chronicle.go`) from a bounded queue, so the broker never waits on it.
+
+The package imports the standard library only, no Tether package: `broker` imports it, and `metering` imports `broker`. That's why it has its own `Tenant` and `Tenants`, copies of metering's.
+
+## Types
+
+- `Event{Action, Outcome, TenantID, ClientID, Subject, Actor, Reason, Node string; Meta map[string]any; At time.Time}`. ClientID is the client ID as the client sent it, without the tenant prefix. Subject is who the event is about: the MQTT principal (keysmith key ID or token subject), or the device an admin change acted on. Actor is who made an admin change. Reason is the AuthReason of a refused CONNECT, or the error of a failed admin change. Node is the broker's `NodeID()` (`single` alone).
+- Outcomes: `OutcomeSuccess` "success", `OutcomeFailure` "failure", `OutcomeDenied` "denied".
+- MQTT actions: `ActionConnect` "mqtt.connect", `ActionDisconnect` "mqtt.disconnect", `ActionAuthFailed` "mqtt.auth.failed", `ActionACLDenied` "mqtt.acl.denied", `ActionTakeover` "mqtt.session.takeover".
+- Admin actions, `admin.<resource>.<verb>`: `ActionTenantCreate|Update|Delete` (`admin.tenant.*`), `ActionDeviceProvision|Rotate|Revoke|Delete|Roles` (`admin.device.provision|rotate|revoke|delete|roles`), `ActionRoleCreate|Delete|Topics` (`admin.role.*`), `ActionClientKick` "admin.client.kick", `ActionSessionDelete` "admin.session.delete", `ActionRetainedDelete` "admin.retained.delete".
+- Meta keys: `MetaOp` "op" and `MetaTopic` "topic" (an ACL denial's operation, "publish" or "subscribe", and its tenant-relative topic or filter), `MetaSuppressed` "suppressed" (see the deny window), `MetaTarget` "target" (what an admin change acted on when ClientID doesn't say: a tenant, device or role, or a topic). `Target(s)` returns `{"target": s}`.
+- `Emitter{Emit(ev Event)}`: must never block or call the sink inline. `broker.Deps.Audit` and `api.Services.Audit` take one; nil records nothing.
+- `Tenant{ID, AppID, ExternalID string}` and `Tenants{Get(ctx, tenantID string) (Tenant, error)}`. The extension adapts its one 30 s tenant cache (`auditTenants` next to metering's `meteringTenants`; one type can't have both `Get` methods).
+- `Sink{Record(ctx, ev Event, t Tenant) error}`. Only a Recorder writer calls it.
+- `Kind(action) string`: the Config kind of an action, "" for an unknown one.
+
+## Config
+
+`Config{Enabled bool; Events []string; QueueSize, Writers int; DenyWindow time.Duration}`, yaml/json `enabled`, `events`, `queue_size`, `writers`, `deny_window`. Kinds: `connect`, `disconnect`, `auth_failure`, `acl_deny`, `takeover`, `admin` (`Kind*` constants). `DefaultConfig()`: off, every kind, queue 10000, 4 writers, deny window 1 min. `Validate()` refuses an unknown kind and negative numbers. NewRecorder gives zero numbers and an empty Events list their defaults.
+
+## Recorder
+
+`NewRecorder(cfg, sink, tenants, logger) *Recorder`. Nil tenants records every event with its Tether ID alone; nil logger discards. Off (`Enabled` false) or with a nil sink, Emit does nothing.
+
+- `Emit(ev)`: drops an event of a kind `Events` doesn't list, stamps `At` when zero, then puts it on the queue without waiting. A full queue drops it and counts it in `Dropped()`. It takes a read lock and, for a denial, the deny window mutex; nothing else.
+- Deny window: an `mqtt.acl.denied` with the same (tenant, client, `Meta["op"]`, `Meta["topic"]`) as one recorded less than DenyWindow before (by `At`) isn't queued, it's counted. When the window closes (a sweep runs every DenyWindow/4) one more event is queued, the latest of the repeats, with `Meta["suppressed"] = n`. A window with no repeats closes silently. The open windows are capped at QueueSize; past that a new denial is queued without one.
+- Writers: `Writers` goroutines take events off the queue, look the tenant up (a failed lookup still records, with `Tenant{ID}` alone, so a deleted tenant's last events aren't lost) and call the sink, each lookup and record bounded by 10 s. A sink error is logged at Warn at most every 10 s, with the running count.
+- `Start()`: starts the writers and the sweep. Once; nothing when off or after Stop.
+- `Stop(ctx) error`: takes no more events (later Emits count as dropped), queues the summaries of the windows still open, closes the queue, and waits for the writers to write what's left. When ctx ends first it cancels the writers' context, counts what they didn't get to as dropped, and returns ctx's error.
+- `Dropped() uint64`.
+
+## Who emits what
+
+- broker (see broker/llm.txt): `mqtt.connect` at the success CONNACK, `mqtt.disconnect` when a network connection that connected ends, `mqtt.auth.failed` in `refuse`, `mqtt.acl.denied` for a PUBLISH or SUBSCRIBE the grants refuse, `mqtt.session.takeover` for a connection displaced on this node or by another node.
+- api: every state-changing REST route once it returned, Actor from the forge auth context.
+- extension/contract: every command once it ran, Actor from the dashboard user's Subject.
+
+## Tests
+
+`recorder_test.go`: 100,000 Emits against a sink that never returns finish within a second and drop; 50 denials in a 200 ms window record twice, the second with `suppressed` 49; the Events filter; Stop drains the queue and the open windows; Stop is bounded by its ctx; the sink gets each event's own tenant.

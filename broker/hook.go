@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	"github.com/xraph/tether/acl"
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/subject"
@@ -37,6 +39,11 @@ type hook struct {
 
 	b      *Broker
 	server *mqtt.Server
+
+	// connecting maps a CONNECT in OnConnectAuthenticate to the tenant it
+	// authenticated as, for the audit of a refusal (noteTenant). Only while
+	// Deps.Audit is set.
+	connecting sync.Map
 }
 
 // ID implements mqtt.Hook.
@@ -96,6 +103,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	defer cancel()
 
 	gen := h.b.changes.Load()
+
+	if h.b.auditing() {
+		defer h.connecting.Delete(cl)
+	}
 
 	if h.b.cluster != nil {
 		// Ruling R13: the cell keys sessions by client ID, which it caps.
@@ -212,6 +223,7 @@ func (h *hook) authorize(ctx context.Context, cl *mqtt.Client, pk packets.Packet
 	}
 
 	log = log.With(slog.String("tenant", ident.Tenant.ID.String()))
+	h.noteTenant(cl, ident.Tenant.ID.String())
 
 	if !ident.Tenant.Enabled {
 		return nil, nil, h.refuse(cl, log, packets.ErrNotAuthorized, "tenant disabled", nil)
@@ -430,6 +442,7 @@ func (h *hook) refuse(cl *mqtt.Client, log *slog.Logger, code packets.Code, msg 
 func (h *hook) refuseAs(cl *mqtt.Client, log *slog.Logger, code packets.Code, reason, msg string, err error) bool {
 	h.b.state.refuse(cl, code)
 	h.b.deps.Metrics.AuthFailure(reason)
+	h.auditRefusal(cl, code, reason, msg)
 	log.Info("tether: connection refused", slog.String("reason", msg), slog.Int("code", int(code.Code)), slog.Any("error", err))
 
 	return false
@@ -514,6 +527,8 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 		if err := prev.boundWrites(); err != nil {
 			h.b.log.Debug("tether: no write deadline on the connection taken over", slog.String("client", cl.ID), slog.Any("error", err))
 		}
+
+		h.b.auditTakeover(st.tenantID, st.rawID, prev, st)
 	}
 }
 
@@ -638,6 +653,10 @@ func (h *hook) OnPacketRead(cl *mqtt.Client, pk packets.Packet) (packets.Packet,
 
 	pk.Filters = filters
 
+	if pk.FixedHeader.Type == packets.Subscribe {
+		h.auditSubscribeDenials(cl, filters)
+	}
+
 	return pk, nil
 }
 
@@ -685,6 +704,8 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 			if st == nil {
 				return pk
 			}
+
+			h.auditConnect(cl, st, pk.SessionPresent)
 
 			if h.b.cluster != nil && h.b.state.owner(cl.ID) != st {
 				// A concurrent CONNECT on this node took the ID after this
@@ -894,6 +915,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		// OnACLCheck let it through (cluster mode), so the refusal is
 		// made here, where its ack can wait its turn in the pipe.
 		h.b.deps.Metrics.ACLDenied(ACLOpPublish)
+		h.auditDenied(cl, ACLOpPublish, pk.TopicName)
 
 		switch {
 		case qos == 0:
@@ -1184,7 +1206,7 @@ func (h *lastHook) Provides(b byte) bool { return b == mqtt.OnDisconnect }
 // (unacked; the client sends them again) and, for a session that ends with
 // the connection, drops its pending QoS 2 entries, unless another connection
 // holds the session now.
-func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
+func (h *lastHook) OnDisconnect(cl *mqtt.Client, err error, expire bool) {
 	if hold := h.b.disconnectHold; hold != nil {
 		hold(cl, false)
 	}
@@ -1199,6 +1221,7 @@ func (h *lastHook) OnDisconnect(cl *mqtt.Client, _ error, expire bool) {
 
 	if st != nil {
 		st.releaseSlot()
+		h.b.auditDisconnect(cl, st, err)
 	}
 
 	if n := h.b.cluster; n != nil && !cl.Net.Inline {
@@ -1279,6 +1302,12 @@ func (h *hook) OnACLCheck(cl *mqtt.Client, name string, write bool) bool {
 	}
 
 	h.b.deps.Metrics.ACLDenied(aclOp(write))
+
+	// A read is a SUBSCRIBE or a delivery, which this cannot tell apart:
+	// OnPacketRead audits the SUBSCRIBE (auditSubscribeDenials).
+	if write {
+		h.auditDenied(cl, ACLOpPublish, name)
+	}
 
 	return false
 }
@@ -1432,4 +1461,195 @@ func canPublish(set *acl.Set, name string) bool {
 	}
 
 	return set.CanPublish(name)
+}
+
+// auditing reports whether Deps.Audit is set, so an emit point builds no
+// event for nobody.
+func (b *Broker) auditing() bool { return b.deps.Audit != nil }
+
+// emit stamps ev with this node and hands it to Deps.Audit, which queues it
+// and returns.
+func (b *Broker) emit(ev audit.Event) {
+	if b.deps.Audit == nil {
+		return
+	}
+
+	ev.Node = b.NodeID()
+	b.deps.Audit.Emit(ev)
+}
+
+// singleNode is the node name of a broker that runs alone, the same one
+// metering keys its usage with.
+const singleNode = "single"
+
+// NodeID is the cell's name for this node (cluster.Config.NodeID), or
+// "single" for a broker that runs alone. Audit events carry it.
+func (b *Broker) NodeID() string {
+	if b.cluster != nil {
+		return b.cluster.Config.NodeID
+	}
+
+	return singleNode
+}
+
+// principalOf is the audit Subject of a connection: its keysmith key ID or
+// token subject.
+func principalOf(st *clientState) string {
+	if ident := st.ident.Load(); ident != nil {
+		return ident.PrincipalID
+	}
+
+	return st.username
+}
+
+// auditConnect records a connection that got its success CONNACK.
+func (h *hook) auditConnect(cl *mqtt.Client, st *clientState, sessionPresent bool) {
+	if !h.b.auditing() {
+		return
+	}
+
+	h.b.emit(audit.Event{
+		Action: audit.ActionConnect, Outcome: audit.OutcomeSuccess,
+		TenantID: st.tenantID, ClientID: st.rawID, Subject: principalOf(st),
+		Meta: map[string]any{
+			"protocol":        int(cl.Properties.ProtocolVersion),
+			"clean_start":     cl.Properties.Clean,
+			"session_present": sessionPresent,
+			"remote":          cl.Net.Remote,
+		},
+	})
+}
+
+// auditDisconnect records the end of a network connection that connected.
+// The reason code is the one the connection was stopped with, or 0 for a
+// clean DISCONNECT; a connection that just broke has its error instead.
+func (b *Broker) auditDisconnect(cl *mqtt.Client, st *clientState, err error) {
+	if !b.auditing() || cl.Net.Inline {
+		return
+	}
+
+	meta := map[string]any{
+		"connected_for": time.Since(st.connectedAt).Seconds(),
+		"remote":        cl.Net.Remote,
+	}
+
+	var code packets.Code
+
+	switch {
+	case errors.As(cl.StopCause(), &code), errors.As(err, &code):
+		meta["reason_code"] = int(code.Code)
+	case err == nil:
+		meta["reason_code"] = int(packets.CodeSuccess.Code)
+	default:
+		meta["error"] = err.Error()
+	}
+
+	b.emit(audit.Event{
+		Action: audit.ActionDisconnect, Outcome: audit.OutcomeSuccess,
+		TenantID: st.tenantID, ClientID: st.rawID, Subject: principalOf(st), Meta: meta,
+	})
+}
+
+// auditRefusal records a refused CONNECT. The tenant is known once the
+// credentials resolved to one (noteTenant); a CONNECT refused before that
+// has none.
+func (h *hook) auditRefusal(cl *mqtt.Client, code packets.Code, reason, msg string) {
+	if !h.b.auditing() {
+		return
+	}
+
+	var tenantID string
+	if v, ok := h.connecting.Load(cl); ok {
+		if id, ok := v.(string); ok {
+			tenantID = id
+		}
+	}
+
+	h.b.emit(audit.Event{
+		Action: audit.ActionAuthFailed, Outcome: audit.OutcomeFailure,
+		TenantID: tenantID, ClientID: cl.ID, Subject: string(cl.Properties.Username), Reason: reason,
+		Meta: map[string]any{
+			"reason_code": int(code.Code),
+			"detail":      msg,
+			"remote":      cl.Net.Remote,
+		},
+	})
+}
+
+// noteTenant remembers the tenant a CONNECT authenticated as, for the audit
+// of a refusal after that. OnConnectAuthenticate forgets it as it returns.
+func (h *hook) noteTenant(cl *mqtt.Client, tenantID string) {
+	if h.b.auditing() {
+		h.connecting.Store(cl, tenantID)
+	}
+}
+
+// auditDenied records a PUBLISH (op ACLOpPublish, name a namespaced topic)
+// or a SUBSCRIBE filter (ACLOpSubscribe) the grants refused. Never a
+// delivery. The Recorder collapses repeats.
+func (h *hook) auditDenied(cl *mqtt.Client, op, name string) {
+	if !h.b.auditing() {
+		return
+	}
+
+	st := h.b.state.get(cl)
+	if st == nil {
+		return
+	}
+
+	rel, ok := topic.Strip(st.tenantID, name)
+	if !ok {
+		rel = name
+	}
+
+	h.b.emit(audit.Event{
+		Action: audit.ActionACLDenied, Outcome: audit.OutcomeDenied,
+		TenantID: st.tenantID, ClientID: st.rawID, Subject: principalOf(st),
+		Meta: map[string]any{audit.MetaOp: op, audit.MetaTopic: rel},
+	})
+}
+
+// auditSubscribeDenials records the filters of a SUBSCRIBE (namespaced, ""
+// for one mochi refuses as invalid) the grants will refuse, with the same
+// check mochi's OnACLCheck makes right after. OnACLCheck cannot tell a
+// SUBSCRIBE from a delivery, and only the SUBSCRIBE is audited.
+func (h *hook) auditSubscribeDenials(cl *mqtt.Client, filters packets.Subscriptions) {
+	if !h.b.auditing() {
+		return
+	}
+
+	for _, f := range filters {
+		if f.Filter != "" && !h.aclCheck(cl, f.Filter, false) {
+			h.auditDenied(cl, ACLOpSubscribe, f.Filter)
+		}
+	}
+}
+
+// auditTakeover records a connection displaced by another CONNECT for its
+// client ID: on this node (prev, by st), or on another node (st nil).
+func (b *Broker) auditTakeover(tenantID, rawID string, prev, st *clientState) {
+	if !b.auditing() {
+		return
+	}
+
+	meta := map[string]any{}
+
+	var who string
+
+	if prev != nil {
+		who = principalOf(prev)
+		meta["previous_remote"] = prev.cl.Net.Remote
+	}
+
+	if st != nil {
+		meta["remote"] = st.cl.Net.Remote
+		meta["by"] = "same_node"
+	} else {
+		meta["by"] = "other_node"
+	}
+
+	b.emit(audit.Event{
+		Action: audit.ActionTakeover, Outcome: audit.OutcomeSuccess,
+		TenantID: tenantID, ClientID: rawID, Subject: who, Meta: meta,
+	})
 }

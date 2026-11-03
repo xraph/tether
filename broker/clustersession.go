@@ -1790,7 +1790,7 @@ func (n *clusterNode) lose(s *session, deleted bool) {
 	}
 
 	s.lost, s.deleted = true, deleted
-	cl, acked := s.cl, s.ack.ch
+	cl, acked, st := s.cl, s.ack.ch, s.st
 	n.sessMu.Unlock()
 
 	n.takeovers.Add(1)
@@ -1798,6 +1798,8 @@ func (n *clusterNode) lose(s *session, deleted bool) {
 	code := packets.ErrSessionTakenOver
 	if deleted {
 		code = packets.ErrAdministrativeAction
+	} else if b := n.b; b != nil {
+		b.auditTakeover(s.tenantID, s.rawID, st, nil)
 	}
 
 	n.log.Info("tether: session moved off this node, disconnecting", slog.String("client", s.nsID), slog.Bool("deleted", deleted))

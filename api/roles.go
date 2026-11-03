@@ -9,6 +9,7 @@ import (
 
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/perm"
 )
 
@@ -47,12 +48,13 @@ func (a *API) registerRoles(r forge.Router) error {
 	topics := r.Group("/v1/tenants/:tenantId/roles/:roleSlug/topics", forge.WithGroupTags("roles"))
 
 	return errors.Join(
-		roles.POST("", a.createRole, forge.WithName("createRole"), forge.WithSummary("Create a role")),
+		roles.POST("", audited(a, roleCreated, a.createRole), forge.WithName("createRole"), forge.WithSummary("Create a role")),
 		roles.GET("", a.listRoles, forge.WithName("listRoles"), forge.WithSummary("List a tenant's roles")),
-		roles.DELETE("/:roleSlug", a.deleteRole, forge.WithName("deleteRole"),
+		roles.DELETE("/:roleSlug", audited(a, roleDeleted, a.deleteRole), forge.WithName("deleteRole"),
 			forge.WithSummary("Delete a role that no device holds")),
 		topics.GET("", a.getTopics, forge.WithName("getRoleTopics"), forge.WithSummary("Get a role's topic grants")),
-		topics.PUT("", a.setTopics, forge.WithName("setRoleTopics"), forge.WithSummary("Replace a role's topic grants")),
+		topics.PUT("", audited(a, topicsSet, a.setTopics), forge.WithName("setRoleTopics"),
+			forge.WithSummary("Replace a role's topic grants")),
 	)
 }
 
@@ -124,6 +126,24 @@ func (a *API) setTopics(c forge.Context, req *setTopicsRequest) (*acl.Rules, err
 	}
 
 	return a.rules(c, req.TenantID, req.RoleSlug)
+}
+
+// roleCreated describes POST /v1/tenants/:tenantId/roles.
+func roleCreated(req *createRoleRequest) audit.Event {
+	return audit.Event{Action: audit.ActionRoleCreate, TenantID: req.TenantID, Meta: audit.Target(req.Slug)}
+}
+
+// roleDeleted describes DELETE .../roles/:roleSlug.
+func roleDeleted(req *topicsPath) audit.Event {
+	return audit.Event{Action: audit.ActionRoleDelete, TenantID: req.TenantID, Meta: audit.Target(req.RoleSlug)}
+}
+
+// topicsSet describes PUT .../roles/:roleSlug/topics.
+func topicsSet(req *setTopicsRequest) audit.Event {
+	ev := audit.Event{Action: audit.ActionRoleTopics, TenantID: req.TenantID, Meta: audit.Target(req.RoleSlug)}
+	ev.Meta["publish"], ev.Meta["subscribe"] = req.Publish, req.Subscribe
+
+	return ev
 }
 
 // rules reads a role's grants, as non-nil lists so the JSON has [] for none.

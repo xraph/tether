@@ -8,6 +8,7 @@ import (
 	"github.com/xraph/forge"
 
 	"github.com/xraph/tether"
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/id"
 	"github.com/xraph/tether/service"
 	"github.com/xraph/tether/tenant"
@@ -48,16 +49,28 @@ func (a *API) registerTenants(r forge.Router) error {
 		g.POST("", a.createTenant, forge.WithName("createTenant"), forge.WithSummary("Create a tenant")),
 		g.GET("", a.listTenants, forge.WithName("listTenants"), forge.WithSummary("List tenants")),
 		g.GET("/:tenantId", a.getTenant, forge.WithName("getTenant"), forge.WithSummary("Get a tenant")),
-		g.PATCH("/:tenantId", a.updateTenant, forge.WithName("updateTenant"),
+		g.PATCH("/:tenantId", audited(a, tenantUpdated, a.updateTenant), forge.WithName("updateTenant"),
 			forge.WithSummary("Update a tenant's name, enabled flag or limits")),
-		g.DELETE("/:tenantId", a.deleteTenant, forge.WithName("deleteTenant"),
+		g.DELETE("/:tenantId", audited(a, tenantDeleted, a.deleteTenant), forge.WithName("deleteTenant"),
 			forge.WithSummary("Delete a tenant that has no devices")),
 	)
 }
 
+// createTenant records its own audit event: the tenant is known only once
+// it exists, and the response is written here, not returned.
 func (a *API) createTenant(c forge.Context, req *createTenantRequest) (*empty, error) {
+	ev := audit.Event{Action: audit.ActionTenantCreate, Meta: map[string]any{"app_id": req.AppID, "external_id": req.ExternalID}}
+
+	err := a.create(c, req, &ev)
+	a.record(c, ev, err)
+
+	return written(err)
+}
+
+// create creates the tenant and writes it, and names it in ev.
+func (a *API) create(c forge.Context, req *createTenantRequest, ev *audit.Event) error {
 	if err := validateLimits(req.Limits); err != nil {
-		return nil, mapError(err)
+		return mapError(err)
 	}
 
 	t, err := a.Tenants.Create(c.Context(), service.CreateTenantInput{
@@ -67,10 +80,13 @@ func (a *API) createTenant(c forge.Context, req *createTenantRequest) (*empty, e
 		Limits:     req.Limits,
 	})
 	if err != nil {
-		return nil, a.fail("create tenant", err)
+		return a.fail("create tenant", err)
 	}
 
-	return written(c.JSON(http.StatusCreated, t))
+	ev.TenantID = t.ID.String()
+	ev.Meta[audit.MetaTarget] = ev.TenantID
+
+	return c.JSON(http.StatusCreated, t)
 }
 
 func (a *API) listTenants(c forge.Context, req *pageRequest) (*list[*tenant.Tenant], error) {
@@ -140,6 +156,21 @@ func (a *API) deleteTenant(c forge.Context, req *tenantPath) (*empty, error) {
 	a.Broker.UpdateTenant(&gone)
 
 	return written(c.NoContent(http.StatusNoContent))
+}
+
+// tenantUpdated describes PATCH /v1/tenants/:tenantId.
+func tenantUpdated(req *updateTenantRequest) audit.Event {
+	ev := audit.Event{Action: audit.ActionTenantUpdate, TenantID: req.TenantID, Meta: audit.Target(req.TenantID)}
+	if req.Enabled != nil {
+		ev.Meta["enabled"] = *req.Enabled
+	}
+
+	return ev
+}
+
+// tenantDeleted describes DELETE /v1/tenants/:tenantId.
+func tenantDeleted(req *tenantPath) audit.Event {
+	return audit.Event{Action: audit.ActionTenantDelete, TenantID: req.TenantID, Meta: audit.Target(req.TenantID)}
 }
 
 // tenant loads the tenant a path names: malformed is 400, unknown is 404.

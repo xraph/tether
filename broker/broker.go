@@ -24,6 +24,7 @@ import (
 	"github.com/mochi-mqtt/server/v2/packets"
 
 	"github.com/xraph/tether"
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/limits"
 )
@@ -49,6 +50,11 @@ type Deps struct {
 	// Entitlement decides at CONNECT whether the tenant's plan lets it in
 	// (entitle.go). Nil checks nothing.
 	Entitlement Entitlement
+
+	// Audit hears about connects, disconnects, refused CONNECTs, denied
+	// PUBLISHes and SUBSCRIBEs and session takeovers (never single messages
+	// or deliveries). Its Emit must not block. Nil records nothing.
+	Audit audit.Emitter
 
 	// Cluster makes the broker one node of a cell. Nil runs it alone,
 	// exactly as without clustering. With a cluster mochi's storage hook is

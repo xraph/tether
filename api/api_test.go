@@ -64,6 +64,13 @@ func newEnv(t *testing.T) *env {
 func newEnvWith(t *testing.T, adjust func(*api.Services)) *env {
 	t.Helper()
 
+	return newEnvMW(t, adjust)
+}
+
+// newEnvMW is newEnvWith with middleware on the admin routes.
+func newEnvMW(t *testing.T, adjust func(*api.Services), mw ...forge.Middleware) *env {
+	t.Helper()
+
 	st := memory.New()
 	t.Cleanup(func() { _ = st.Close() })
 
@@ -109,7 +116,12 @@ func newEnvWith(t *testing.T, adjust func(*api.Services)) *env {
 		adjust(&services)
 	}
 
-	require.NoError(t, api.Register(router.Group("/tether"), router.Group("/tether"), services))
+	admin := router.Group("/tether")
+	if len(mw) > 0 {
+		admin.Use(mw...)
+	}
+
+	require.NoError(t, api.Register(admin, router.Group("/tether"), services))
 
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

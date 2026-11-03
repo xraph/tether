@@ -11,6 +11,7 @@ import (
 	"github.com/xraph/forge"
 
 	"github.com/xraph/tether"
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/device"
 	"github.com/xraph/tether/service"
 )
@@ -80,21 +81,34 @@ func (a *API) registerDevices(r forge.Router) error {
 			forge.WithSummary("Provision a device and return its credentials once")),
 		g.GET("", a.listDevices, forge.WithName("listDevices"), forge.WithSummary("List a tenant's devices")),
 		g.GET("/:deviceId", a.getDevice, forge.WithName("getDevice"), forge.WithSummary("Get a device")),
-		g.DELETE("/:deviceId", a.deleteDevice, forge.WithName("deleteDevice"),
+		g.DELETE("/:deviceId", audited(a, deviceEvent(audit.ActionDeviceDelete), a.deleteDevice), forge.WithName("deleteDevice"),
 			forge.WithSummary("Revoke a device's key and delete the device")),
-		g.POST("/:deviceId/rotate", a.rotateDevice, forge.WithName("rotateDevice"),
+		g.POST("/:deviceId/rotate", audited(a, deviceEvent(audit.ActionDeviceRotate), a.rotateDevice), forge.WithName("rotateDevice"),
 			forge.WithSummary("Rotate a device's key and return the new password once")),
-		g.POST("/:deviceId/revoke", a.revokeDevice, forge.WithName("revokeDevice"),
+		g.POST("/:deviceId/revoke", audited(a, deviceEvent(audit.ActionDeviceRevoke), a.revokeDevice), forge.WithName("revokeDevice"),
 			forge.WithSummary("Revoke a device's key and keep the device")),
-		g.PUT("/:deviceId/roles", a.setDeviceRoles, forge.WithName("setDeviceRoles"),
+		g.PUT("/:deviceId/roles", audited(a, rolesSetEvent, a.setDeviceRoles), forge.WithName("setDeviceRoles"),
 			forge.WithSummary("Replace a device's roles")),
 	)
 }
 
+// provisionDevice records its own audit event: the device it made is the
+// event's subject, and the response is written here, not returned.
 func (a *API) provisionDevice(c forge.Context, req *provisionRequest) (*empty, error) {
+	ev := audit.Event{Action: audit.ActionDeviceProvision, TenantID: req.TenantID, ClientID: req.ClientID}
+
+	err := a.provision(c, req, &ev)
+	a.record(c, ev, err)
+
+	return written(err)
+}
+
+// provision provisions the device and writes the credentials, and names the
+// device in ev.
+func (a *API) provision(c forge.Context, req *provisionRequest, ev *audit.Event) error {
 	tid, err := parseTenantID(req.TenantID)
 	if err != nil {
-		return nil, mapError(err)
+		return mapError(err)
 	}
 
 	creds, err := a.Devices.Provision(c.Context(), tid, service.ProvisionInput{
@@ -104,10 +118,13 @@ func (a *API) provisionDevice(c forge.Context, req *provisionRequest) (*empty, e
 		ExpiresAt: req.ExpiresAt,
 	})
 	if err != nil {
-		return nil, a.fail("provision device", err)
+		return a.fail("provision device", err)
 	}
 
-	return written(a.writeCredentials(c, http.StatusCreated, creds))
+	ev.Subject = creds.Device.ID.String()
+	ev.Meta = audit.Target(ev.Subject)
+
+	return a.writeCredentials(c, http.StatusCreated, creds)
 }
 
 func (a *API) listDevices(c forge.Context, req *listDevicesRequest) (*list[*device.Device], error) {
@@ -220,6 +237,22 @@ func (a *API) setDeviceRoles(c forge.Context, req *setRolesRequest) (*device.Dev
 	}
 
 	return d, nil
+}
+
+// deviceEvent describes a change to the device a path names: the device is
+// both its subject and its target.
+func deviceEvent(action string) func(*devicePath) audit.Event {
+	return func(req *devicePath) audit.Event {
+		return audit.Event{Action: action, TenantID: req.TenantID, Subject: req.DeviceID, Meta: audit.Target(req.DeviceID)}
+	}
+}
+
+// rolesSetEvent describes PUT .../devices/:deviceId/roles.
+func rolesSetEvent(req *setRolesRequest) audit.Event {
+	ev := deviceEvent(audit.ActionDeviceRoles)(&devicePath{TenantID: req.TenantID, DeviceID: req.DeviceID})
+	ev.Meta["roles"] = req.Roles
+
+	return ev
 }
 
 // device loads the device a path names. The service looks it up inside the
