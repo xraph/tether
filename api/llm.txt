@@ -31,7 +31,7 @@ All under `/v1/tenants`. Lists are `{"items": [...]}` (`[]`, never null), paged 
 | `DELETE /:tenantId/roles/:roleSlug` | 204. 404 for no such role (or one of another tenant); 409 while a device holds it or another role names it as its parent, and then nothing changes. |
 | `GET\|PUT /:tenantId/roles/:roleSlug/topics` | `{publish: [...], subscribe: [...]}`; PUT replaces both lists, so both are required (`[]` clears one; a missing or null list is 400 and nothing changes). Invalid filter 400, unknown role 404. |
 | `GET /:tenantId/clients` | `broker.ClientInfo` list |
-| `POST /:tenantId/clients/:clientId/kick`, `DELETE /:tenantId/sessions/:clientId` | 204 |
+| `POST /:tenantId/clients/:clientId/kick`, `DELETE /:tenantId/sessions/:clientId` | 204. 404 for a client that is not connected (kick) or no session (delete); a clean session whose connection has already closed is none, even while the broker is still finishing the connection, so a DELETE right after a kick is 404 every time. |
 | `GET /:tenantId/retained?filter=` | default filter `#`; invalid filter 400 |
 | `DELETE /:tenantId/retained?topic=` | 204; nothing retained there is 404 |
 | `GET /:tenantId/stats` | `{connected, sessions, subscriptions, retained, messages_in, messages_out}` on this node |

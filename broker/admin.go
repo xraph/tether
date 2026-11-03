@@ -820,7 +820,10 @@ const sessionEndWait = 2 * time.Second
 // mochi never finished (it skips OnDisconnect when writing the CONNACK
 // fails) is deleted once the wait runs out.
 //
-// It returns tether.ErrNotFound when there is no such session. A delayed
+// It returns tether.ErrNotFound when there is no such session, which
+// includes a session that ends with its connection (5.0 expiry 0, 3.1.1
+// clean) whose connection had closed before the call, even while mochi is
+// still finishing with it. A delayed
 // will (5.0 Will Delay Interval) already queued by mochi is still sent; in
 // cluster mode a will the session's record still holds goes out at once,
 // since the session has ended (ruling R42).
@@ -870,19 +873,31 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 
 	log := b.log.With(slog.String("client", nsID), slog.String("tenant", tenantID))
 
-	if !cl.Closed() {
+	closedBefore := cl.Closed()
+	if !closedBefore {
 		log.Info("tether: disconnecting client to delete its session")
 		disconnect(srv, b.log, cl, nsID, packets.ErrAdministrativeAction)
 	}
 
 	// The storage hook writes the session's record in its OnDisconnect;
 	// ended is closed after that (lastHook).
-	if st != nil && !waitEnded(st, b.endWait) {
+	ended := st == nil || waitEnded(st, b.endWait)
+	if !ended {
 		if !cl.Closed() {
 			return deleteConflict(clientID, "the connection is still open")
 		}
 
 		log.Warn("tether: connection never finished closing, deleting its session anyway")
+	}
+
+	// A session that ends with its connection, whose connection had ended
+	// before this delete began, was over already: there is none to delete.
+	// Mochi removes it from its clients only after every OnDisconnect has
+	// run, so it may still be listed here, and without this check the same
+	// delete answered "not found" or "deleted" depending on whether mochi
+	// had got that far.
+	if closedBefore && ended && endsWithConnection(cl) && !cl.IsTakenOver() {
+		return noSession(clientID)
 	}
 
 	if b.beforePurge != nil {
@@ -903,6 +918,17 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 	log.Info("tether: session deleted")
 
 	return nil
+}
+
+// endsWithConnection reports whether cl's session ends when its connection
+// does, by the rule mochi uses to remove it then: a 5.0 session expiry of 0,
+// or a 3.1.1 clean session.
+func endsWithConnection(cl *mqtt.Client) bool {
+	if cl.Properties.ProtocolVersion == 5 {
+		return cl.Properties.Props.SessionExpiryInterval == 0
+	}
+
+	return cl.Properties.Clean
 }
 
 // waitEnded waits up to d for mochi to finish with st's connection.

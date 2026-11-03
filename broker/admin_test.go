@@ -13,6 +13,7 @@ import (
 
 	pahopackets "github.com/eclipse/paho.golang/packets"
 	"github.com/eclipse/paho.golang/paho"
+	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	mochipackets "github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/assert"
@@ -1475,6 +1476,64 @@ func TestDeleteSessionConflictsWithConnectInFlight(t *testing.T) {
 	require.NoError(t, b.DeleteSession(tenantA, "keeper"))
 	assert.Equal(t, byte(0x98), disconnectedWith(t, r.c))
 	assert.Empty(t, b.Clients(tenantA))
+}
+
+// holdDisconnect is a mochi hook that holds each OnDisconnect until release
+// closes. Added after Start, it runs after the broker's own hooks, and mochi
+// removes a clean session from its clients only once every OnDisconnect has
+// returned.
+type holdDisconnect struct {
+	mqtt.HookBase
+
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (h *holdDisconnect) ID() string { return "hold-disconnect" }
+
+func (h *holdDisconnect) Provides(b byte) bool { return b == mqtt.OnDisconnect }
+
+func (h *holdDisconnect) OnDisconnect(*mqtt.Client, error, bool) {
+	h.reached <- struct{}{}
+
+	<-h.release
+}
+
+// A clean session whose connection has already ended is gone, so deleting
+// it is "not found", even while mochi is still finishing the connection and
+// lists the client. The admin API's TestClientsAndStats got 204 on CI for a
+// DELETE right after a kick: the client had seen its connection close, the
+// broker's OnDisconnect had run, and mochi had not removed it yet.
+func TestDeleteSessionOfEndedCleanSessionNotFound(t *testing.T) {
+	ta := newTenant(tenant.Limits{})
+	b := startBroker(t, map[string]*auth.Identity{"a": ident(ta, "a")}, nil)
+	tenantA := ta.ID.String()
+
+	hold := &holdDisconnect{reached: make(chan struct{}, 1), release: make(chan struct{})}
+	require.NoError(t, b.server.AddHook(hold, nil))
+
+	var once sync.Once
+
+	release := func() { once.Do(func() { close(hold.release) }) }
+	t.Cleanup(release)
+
+	_, _, err := connect5(t, b.Addr().String(), "pump-1", "a", true)
+	require.NoError(t, err)
+	require.NoError(t, b.Kick(tenantA, "pump-1"))
+
+	select {
+	case <-hold.reached:
+	case <-time.After(waitTimeout):
+		t.Fatal("the kicked connection never reached OnDisconnect")
+	}
+
+	require.Equal(t, []string{"pump-1"}, clientIDs(b, tenantA), "mochi still lists the ended session")
+	require.ErrorIs(t, b.DeleteSession(tenantA, "pump-1"), tether.ErrNotFound)
+
+	release()
+
+	require.Eventually(t, func() bool { return len(clientIDs(b, tenantA)) == 0 }, waitTimeout, 10*time.Millisecond)
+	require.ErrorIs(t, b.DeleteSession(tenantA, "pump-1"), tether.ErrNotFound)
 }
 
 // Fix round 1: mochi skips OnDisconnect when writing the CONNACK fails, so
