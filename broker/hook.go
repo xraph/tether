@@ -528,7 +528,7 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 			h.b.log.Debug("tether: no write deadline on the connection taken over", slog.String("client", cl.ID), slog.Any("error", err))
 		}
 
-		h.b.auditTakeover(st.tenantID, st.rawID, prev, st)
+		h.b.auditTakeover(st.tenantID, st.rawID, prev, st, "")
 	}
 }
 
@@ -705,7 +705,7 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 				return pk
 			}
 
-			h.auditConnect(cl, st, pk.SessionPresent)
+			h.auditConnect(cl, st, pk)
 
 			if h.b.cluster != nil && h.b.state.owner(cl.ID) != st {
 				// A concurrent CONNECT on this node took the ID after this
@@ -1502,9 +1502,13 @@ func principalOf(st *clientState) string {
 	return st.username
 }
 
-// auditConnect records a connection that got its success CONNACK.
-func (h *hook) auditConnect(cl *mqtt.Client, st *clientState, sessionPresent bool) {
-	if !h.b.auditing() {
+// auditConnect records a connection that got its success CONNACK. A CONNACK
+// mochi refused itself (the server's client limit, say) is not one: success
+// is reason code 0 for 5.0 and return code 0 for 3.1.1, so anything else
+// (every 5.0 failure is 0x80 or more, every 3.1.1 one 0x01 to 0x05) is
+// skipped.
+func (h *hook) auditConnect(cl *mqtt.Client, st *clientState, pk packets.Packet) {
+	if !h.b.auditing() || pk.ReasonCode != packets.CodeSuccess.Code {
 		return
 	}
 
@@ -1514,7 +1518,7 @@ func (h *hook) auditConnect(cl *mqtt.Client, st *clientState, sessionPresent boo
 		Meta: map[string]any{
 			"protocol":        int(cl.Properties.ProtocolVersion),
 			"clean_start":     cl.Properties.Clean,
-			"session_present": sessionPresent,
+			"session_present": pk.SessionPresent,
 			"remote":          cl.Net.Remote,
 		},
 	})
@@ -1626,8 +1630,11 @@ func (h *hook) auditSubscribeDenials(cl *mqtt.Client, filters packets.Subscripti
 }
 
 // auditTakeover records a connection displaced by another CONNECT for its
-// client ID: on this node (prev, by st), or on another node (st nil).
-func (b *Broker) auditTakeover(tenantID, rawID string, prev, st *clientState) {
+// client ID: on this node (prev, by st), or on another node (st nil), where
+// cause (Meta "cause") says how this node found out: "taken_over" when it
+// read the new owner, "cas_lost" when a session write lost and the read
+// after it failed or found no key as well as another owner.
+func (b *Broker) auditTakeover(tenantID, rawID string, prev, st *clientState, cause string) {
 	if !b.auditing() {
 		return
 	}
@@ -1646,6 +1653,10 @@ func (b *Broker) auditTakeover(tenantID, rawID string, prev, st *clientState) {
 		meta["by"] = "same_node"
 	} else {
 		meta["by"] = "other_node"
+	}
+
+	if cause != "" {
+		meta["cause"] = cause
 	}
 
 	b.emit(audit.Event{

@@ -1,11 +1,14 @@
 package broker
 
 import (
+	"slices"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/eclipse/paho.golang/paho"
+	mqtt "github.com/mochi-mqtt/server/v2"
+	"github.com/mochi-mqtt/server/v2/packets"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -156,6 +159,64 @@ func TestAuditACLDeny(t *testing.T) {
 	assert.Len(t, spy.of(audit.ActionACLDenied), 2)
 }
 
+// TestAuditDeliveryDenialNotRecorded: a delivery the grants refuse is
+// counted but never audited. With grants that never change a delivery
+// matching a granted subscription is always granted, so the grants shrink
+// under the subscription here without the prune a reload would run.
+func TestAuditDeliveryDenialNotRecorded(t *testing.T) {
+	tn := newTenant(tenant.Limits{})
+	spy, acls := &auditSpy{}, &aclSpy{}
+	rules := map[string]acl.Rules{
+		"sub": {Subscribe: []string{"a/#"}},
+		"pub": {Publish: []string{"a/#"}},
+	}
+	b := startBrokerWith(t, testConfig(), map[string]*auth.Identity{"sub": ident(tn, "sub"), "pub": ident(tn, "pub")}, rules,
+		func(b *Broker) {
+			b.deps.Audit = spy
+			b.aclObserver = acls.observe
+		})
+
+	sub, _, err := connect5(t, b.Addr().String(), "s1", "sub", true)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0x01}, subscribe5(t, sub, "a/#"))
+
+	st := b.state.owner(namespacedID(tn.ID.String(), "s1"))
+	require.NotNil(t, st)
+	st.grants.Store(b.compile(acl.Rules{Subscribe: []string{"a/ok"}}, nil, "s1", "sub", b.log))
+
+	pub, _, err := connect5(t, b.Addr().String(), "p1", "pub", true)
+	require.NoError(t, err)
+
+	require.Equal(t, byte(0), publish5(t, pub, "a/secret", "no"))
+	require.Equal(t, byte(0), publish5(t, pub, "a/ok", "yes"))
+
+	// Deliveries to s1 run in order, so a/ok arriving means the a/secret
+	// check ran first.
+	assert.Equal(t, message{Topic: "a/ok", Payload: "yes"}, recvMsg(t, sub))
+	assert.True(t, slices.Contains(acls.all(), aclCheck{Topic: namespacedID(tn.ID.String(), "a/secret"), Write: false}),
+		"the delivery of a/secret was checked")
+
+	assert.Empty(t, spy.of(audit.ActionACLDenied), "a delivery denial is never audited")
+}
+
+// TestAuditConnectOnlyOnSuccess: a CONNACK with any code but 0 is not a
+// connection, whatever state the hook holds.
+func TestAuditConnectOnlyOnSuccess(t *testing.T) {
+	spy := &auditSpy{}
+	h := &hook{b: &Broker{deps: Deps{Audit: spy}}}
+	st := &clientState{tenantID: newTenant(tenant.Limits{}).ID.String(), rawID: "c1", username: "dev"}
+	cl := &mqtt.Client{}
+
+	for _, code := range []byte{packets.ErrServerBusy.Code, packets.ErrNotAuthorized.Code, packets.Err3ServerUnavailable.Code} {
+		h.auditConnect(cl, st, packets.Packet{ReasonCode: code})
+	}
+
+	assert.Empty(t, spy.of(audit.ActionConnect))
+
+	h.auditConnect(cl, st, packets.Packet{ReasonCode: packets.CodeSuccess.Code})
+	assert.Len(t, spy.of(audit.ActionConnect), 1)
+}
+
 func TestAuditTakeover(t *testing.T) {
 	t.Run("single node", func(t *testing.T) {
 		tn := newTenant(tenant.Limits{})
@@ -177,6 +238,36 @@ func TestAuditTakeover(t *testing.T) {
 		spy.await(t, audit.ActionConnect, 2)
 		spy.await(t, audit.ActionDisconnect, 1)
 		assert.Len(t, spy.of(audit.ActionTakeover), 1)
+	})
+
+	t.Run("same node in a cell", func(t *testing.T) {
+		spy := &auditSpy{}
+		t1 := newTenant(tenant.Limits{})
+		all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+		c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+			fakePerms{rules: map[string]acl.Rules{"u1": all}}, withAudit(spy))
+
+		old, _, err := connect5(t, c.addr(0), "c1", "u1", false)
+		require.NoError(t, err)
+
+		_, _, err = connect5(t, c.addr(0), "c1", "u1", false)
+		require.NoError(t, err)
+
+		select {
+		case d := <-old.disconnects:
+			assert.Equal(t, byte(0x8E), d.ReasonCode)
+		case <-time.After(waitTimeout):
+			t.Fatal("the old connection was not taken over")
+		}
+
+		ev := spy.await(t, audit.ActionTakeover, 1)[0]
+		assert.Equal(t, "same_node", ev.Meta["by"])
+		assert.Equal(t, "n1", ev.Node)
+
+		spy.await(t, audit.ActionConnect, 2)
+		spy.await(t, audit.ActionDisconnect, 1)
+		time.Sleep(200 * time.Millisecond)
+		assert.Len(t, spy.of(audit.ActionTakeover), 1, "one takeover, one event")
 	})
 
 	t.Run("other node", func(t *testing.T) {
@@ -210,6 +301,7 @@ func TestAuditTakeover(t *testing.T) {
 		assert.Equal(t, "c1", ev.ClientID)
 		assert.Equal(t, "n1", ev.Node, "recorded where the displaced connection was")
 		assert.Equal(t, "other_node", ev.Meta["by"])
+		assert.Contains(t, []any{"taken_over", "cas_lost"}, ev.Meta["cause"])
 		assert.Equal(t, "akey_u1", ev.Subject)
 
 		conn := spies[1].await(t, audit.ActionConnect, 1)[0]

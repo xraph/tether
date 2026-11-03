@@ -1730,7 +1730,7 @@ func (n *clusterNode) persist(ctx context.Context, s *session, ttl time.Duration
 		// another owner or epoch means the session moved.
 		cur, ok := n.ownWrite(ctx, s)
 		if !ok || attempt >= ownWriteRetries {
-			n.lose(s, false)
+			n.lose(s, false, takeoverCASLost)
 
 			return errSessionLost
 		}
@@ -1777,10 +1777,22 @@ func (n *clusterNode) ownWrite(ctx context.Context, s *session) (uint64, bool) {
 	return rev, true
 }
 
+// Causes of a cross-node takeover, the audit event's Meta "cause".
+const (
+	// takeoverTakenOver: the owned-keys watch saw the key move, and a read
+	// of it named another owner or epoch (verifyOwner).
+	takeoverTakenOver = "taken_over"
+	// takeoverCASLost: a session write lost its CAS, and the read after it
+	// failed, found no key or found another owner (persist).
+	takeoverCASLost = "cas_lost"
+)
+
 // lose marks s lost and disconnects its connection: 0x8E when another node
 // took it, 0x98 when its key was deleted. The disconnect waits for the
-// connection's CONNACK, so the DISCONNECT never comes first.
-func (n *clusterNode) lose(s *session, deleted bool) {
+// connection's CONNACK, so the DISCONNECT never comes first. cause says
+// how the loss was found (takeoverTakenOver, takeoverCASLost), for the
+// audit of a takeover.
+func (n *clusterNode) lose(s *session, deleted bool, cause string) {
 	n.sessMu.Lock()
 
 	if s.lost || s.ended {
@@ -1799,7 +1811,7 @@ func (n *clusterNode) lose(s *session, deleted bool) {
 	if deleted {
 		code = packets.ErrAdministrativeAction
 	} else if b := n.b; b != nil {
-		b.auditTakeover(s.tenantID, s.rawID, st, nil)
+		b.auditTakeover(s.tenantID, s.rawID, st, nil, cause)
 	}
 
 	n.log.Info("tether: session moved off this node, disconnecting", slog.String("client", s.nsID), slog.Bool("deleted", deleted))
@@ -1894,7 +1906,7 @@ func (n *clusterNode) verifyOwner(nsID, tenantID, clientID string) {
 		}
 
 		unlock()
-		n.lose(s, deleted)
+		n.lose(s, deleted, takeoverTakenOver)
 
 		return
 	}
