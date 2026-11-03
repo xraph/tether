@@ -805,8 +805,8 @@ func TestReconnectAfterExpiryStartsFresh(t *testing.T) {
 	require.NoError(t, err)
 	subscribeQoS(t, sb, "will/#", 1, false)
 
-	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 2, delay: 5})
-	r := rawConnectWill(t, c.addr(0), willSpec{id: "r", topic: "will/r", qos: 1, expiry: 2, delay: 5})
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 5, delay: 10})
+	r := rawConnectWill(t, c.addr(0), willSpec{id: "r", topic: "will/r", qos: 1, expiry: 5, delay: 10})
 
 	for _, conn := range []net.Conn{x, r} {
 		_, err = (&packets.Subscribe{
@@ -837,6 +837,8 @@ func TestReconnectAfterExpiryStartsFresh(t *testing.T) {
 		})
 	}
 
+	// The expiry leaves the holder's timer seconds to run, so it is still
+	// pending when holdWill stops it, even on a loaded machine.
 	px := holdWill(t, a, tid, "x")
 	pr := holdWill(t, a, tid, "r")
 
@@ -847,8 +849,8 @@ func TestReconnectAfterExpiryStartsFresh(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ca.SessionPresent, "r came back inside its expiry")
 
-	// x a second after its expiry, before the holder fired.
-	time.Sleep(time.Until(gone.Add(3 * time.Second)))
+	// x a second after its expiry (5s), before the holder fired.
+	time.Sleep(time.Until(gone.Add(6 * time.Second)))
 
 	xb, ca, err := connect5(t, c.addr(1), "x", "u1", false)
 	require.NoError(t, err)
