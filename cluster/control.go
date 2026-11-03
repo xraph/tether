@@ -115,8 +115,8 @@ type Control struct {
 	quit     chan struct{} // closed by Stop
 	quitOnce sync.Once
 
-	// heartbeat is the idle heartbeat of the consumer's pull requests, 0 for
-	// pullHeartbeat. Tests shorten it.
+	// heartbeat is the idle heartbeat of the consumer's pull requests:
+	// Config.PullHeartbeat (DefaultPullHeartbeat when 0). Tests shorten it.
 	heartbeat time.Duration
 	// resetAttempts is the consumer's MaxResetAttempts, 0 for
 	// consumerResetAttempts; stallAfter is how long it may deliver nothing
@@ -135,6 +135,8 @@ func NewControl(c *Conn, cfg Config) *Control {
 		logger:   c.logger.With("control", cfg.ControlStream()),
 		handlers: make(map[string][]func([]byte)),
 		quit:     make(chan struct{}),
+
+		heartbeat: pullHeartbeatOr(cfg.PullHeartbeat, DefaultPullHeartbeat),
 	}
 }
 
@@ -370,7 +372,7 @@ func (c *Control) open(ctx context.Context, start uint64) (*controlRun, error) {
 		return nil, c.wrapErr("control bus: create consumer", err)
 	}
 
-	msgs, err := cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(c.heartbeat)))
+	msgs, err := cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(c.heartbeat, DefaultPullHeartbeat)))
 
 	r := &controlRun{c: c, st: st, cons: cons, msgs: msgs, stop: make(chan struct{}), stall: newStallWatch(c.stallAfter)}
 	r.last.Store(start - 1)

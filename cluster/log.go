@@ -90,9 +90,12 @@ type Log struct {
 
 	// consumers counts the server consumers this Log created, for tests.
 	consumers atomic.Int64
-	// heartbeat is the idle heartbeat of the pull requests of readers and
-	// replays, 0 for pullHeartbeat. Tests shorten it.
-	heartbeat time.Duration
+	// heartbeat, when set, is the idle heartbeat of the pull requests of
+	// readers and replays both. Tests shorten it. Otherwise readers use
+	// readerHeartbeat (Config.PullHeartbeat, DefaultPullHeartbeat when 0) and
+	// replays replayPullHeartbeat.
+	heartbeat       time.Duration
+	readerHeartbeat time.Duration
 	// resetAttempts is the MaxResetAttempts of the ordered consumers of
 	// readers and replays, 0 for consumerResetAttempts. Tests set -1, nats.go's
 	// endless loop, to reproduce a stall.
@@ -139,6 +142,8 @@ func NewLog(c *Conn, cfg Config) *Log {
 		name:      cfg.LogStream(),
 		logger:    c.logger.With("log", cfg.LogStream()),
 		replayers: make(map[string][]*replayer),
+
+		readerHeartbeat: pullHeartbeatOr(cfg.PullHeartbeat, DefaultPullHeartbeat),
 	}
 }
 

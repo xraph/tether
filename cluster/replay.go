@@ -341,7 +341,7 @@ func (r *replayer) open() (jetstream.Consumer, jetstream.MessagesContext, error)
 		return nil, nil, err
 	}
 
-	msgs, err := r.l.messages(cons)
+	msgs, err := r.l.messages(cons, replayPullHeartbeat)
 	if err != nil {
 		r.l.dropConsumer(cons)
 

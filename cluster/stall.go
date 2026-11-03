@@ -18,8 +18,15 @@ const (
 	// failure to the owner, which starts a new consumer under a new name, and
 	// the meta layer places that one on a live server.
 	consumerResetAttempts = 1
-	// pullHeartbeat is the idle heartbeat of the pull requests of the log's
-	// readers and replays and of the control bus. A pull that never reaches
+	// pullExpiry is how long a pull request waits on the server (nats.go's
+	// default, which the iterators keep); a pull heartbeat may be at most half
+	// of it (maxPullHeartbeat), or nats.go refuses it.
+	pullExpiry       = 30 * time.Second
+	maxPullHeartbeat = pullExpiry / 2
+	// replayPullHeartbeat is the idle heartbeat of the pull requests of
+	// replays; readers and the control bus use Config.PullHeartbeat
+	// (DefaultPullHeartbeat, 2 s), since they are many and long-lived. A pull
+	// that never reaches
 	// its consumer (it got to the client's server before the new consumer's
 	// interest did, and the server answered it 503, which nats.go's iterator
 	// ignores, or it was lost on a route) gets no heartbeats either, and
@@ -27,9 +34,10 @@ const (
 	// consumer recreates itself and pulls anew. Left to nats.go the heartbeat
 	// is half the 30 s pull expiry (its ordered default of 5 s is parsed and
 	// then dropped, jetstream/ordered.go:259 and :275), so such a consumer
-	// delivered nothing for 30 s. At 1 s it is about 2 s, for one heartbeat a
-	// second per idle consumer.
-	pullHeartbeat = time.Second
+	// delivered nothing for 30 s. At 1 s it is about 2 s: a replay is short
+	// and its stall watch (defaultReplayStallAfter) sits under the broker's
+	// 10 s replay call, so it needs the quick recovery.
+	replayPullHeartbeat = time.Second
 	// defaultStallAfter is how long a consumer loop may go without a message
 	// while its stream holds more for it before the stall watch ends it.
 	defaultStallAfter = 30 * time.Second
@@ -156,11 +164,11 @@ func jitter(d time.Duration) time.Duration {
 	return d - time.Duration(q) + time.Duration(rand.Int64N(2*q)) // #nosec G404 -- spreads checks, nothing secret
 }
 
-// pullHeartbeatOr is d, or pullHeartbeat when d is not positive.
-func pullHeartbeatOr(d time.Duration) time.Duration {
+// pullHeartbeatOr is d, or def when d is not positive.
+func pullHeartbeatOr(d, def time.Duration) time.Duration {
 	if d > 0 {
 		return d
 	}
 
-	return pullHeartbeat
+	return def
 }

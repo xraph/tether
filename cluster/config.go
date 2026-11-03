@@ -32,6 +32,9 @@ const (
 	// outlast one; at the old 10 s lease an ordinary server loss fenced the
 	// whole cell.
 	DefaultLease = 24 * time.Second
+	// DefaultPullHeartbeat is the idle heartbeat of the pull requests of a
+	// node's log readers and control bus (Config.PullHeartbeat).
+	DefaultPullHeartbeat = 2 * time.Second
 	// DefaultLogMaxAge is how long the QoS 1 and 2 log keeps a message: the
 	// broker's default session expiry cap, 7 days.
 	DefaultLogMaxAge = 7 * 24 * time.Hour
@@ -81,6 +84,16 @@ type Config struct {
 	// stays away longer loses what it missed past that age, whatever its
 	// session expiry says. 0 means DefaultLogMaxAge.
 	LogMaxAge time.Duration `yaml:"log_max_age" json:"log_max_age"`
+	// PullHeartbeat is the idle heartbeat of the pull requests of the node's
+	// long-lived consumers, its log readers (one per tenant with clients on
+	// the node) and its control bus. A pull that never reaches its consumer
+	// is noticed after two missed heartbeats, and the consumer is then made
+	// again, so a lost pull costs about twice this. Each pending pull costs
+	// one heartbeat message per interval while idle, and every one of them
+	// recreates its consumer after a server pause of twice this, all at
+	// once. Between 0 (exclusive) and half the 30 s pull expiry.
+	// DefaultPullHeartbeat in DefaultConfig. Replays always use 1 s.
+	PullHeartbeat time.Duration `yaml:"pull_heartbeat" json:"pull_heartbeat"`
 }
 
 // EmbeddedConfig configures the nats-server that embedded mode runs.
@@ -123,6 +136,8 @@ func DefaultConfig() Config {
 		Heartbeat: DefaultHeartbeat,
 		Lease:     DefaultLease,
 		LogMaxAge: DefaultLogMaxAge,
+
+		PullHeartbeat: DefaultPullHeartbeat,
 	}
 }
 
@@ -169,6 +184,10 @@ func (c Config) Validate() error {
 
 	if c.Replicas < 0 || c.Replicas > maxReplicas {
 		return fmt.Errorf("cluster: replicas %d must be 0 (auto) to %d", c.Replicas, maxReplicas)
+	}
+
+	if c.PullHeartbeat <= 0 || c.PullHeartbeat > maxPullHeartbeat {
+		return fmt.Errorf("cluster: pull_heartbeat %s must be above 0 and at most %s, half the pull expiry", c.PullHeartbeat, maxPullHeartbeat)
 	}
 
 	if c.LogMaxAge < 0 {

@@ -114,7 +114,7 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 		return nil, err
 	}
 
-	msgs, err := l.messages(cons)
+	msgs, err := l.messages(cons, l.readerHeartbeat)
 	if err != nil {
 		l.dropConsumer(cons)
 
@@ -295,9 +295,10 @@ func (l *Log) consumer(ctx context.Context, tenant string, start uint64, inactiv
 	return cons, nil
 }
 
-// messages starts the iterator of cons, with the Log's pull heartbeat.
-func (l *Log) messages(cons jetstream.Consumer) (jetstream.MessagesContext, error) {
-	return cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(l.heartbeat)))
+// messages starts the iterator of cons with pull heartbeat hb, or the Log's
+// test override.
+func (l *Log) messages(cons jetstream.Consumer, hb time.Duration) (jetstream.MessagesContext, error) {
+	return cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(l.heartbeat, hb)))
 }
 
 // dropConsumer deletes cons on the server, best effort: the server would

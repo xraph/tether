@@ -114,12 +114,15 @@ func (p *pullDropProxy) filter(client io.Reader, server io.Writer) {
 }
 
 // A replay or a reader whose first pull request is lost gets its messages
-// once the consumer misses two idle heartbeats and starts over. With nats.go's
-// default heartbeat for an ordered consumer, 5 s, that was 10 s of silence
-// with nothing wrong, which is what CI kept running into: the pull reached
-// the client's server before the new consumer's interest had, a window that
-// is milliseconds on a quiet machine and seconds on a loaded runner. The
-// Log's pull heartbeat (pullHeartbeat, 1 s) makes it about 2 s.
+// once the consumer misses two idle heartbeats and starts over. Left to
+// nats.go the heartbeat of an ordered consumer was 15 s (its 5 s default is
+// parsed and then not passed on, jetstream/ordered.go:259 against :275), so
+// that was 30 s of silence with nothing wrong, which is what CI kept running
+// into: the pull reached the client's server before the new consumer's
+// interest had, a window that is milliseconds on a quiet machine and seconds
+// on a loaded runner. A replay pulls with a 1 s heartbeat
+// (replayPullHeartbeat) and gets it in about 2 s; a reader with
+// Config.PullHeartbeat (2 s by default) in about 4 s.
 func TestLostPullRecoveredPromptly(t *testing.T) {
 	url := clustertest.Start(t, 1)[0]
 	proxy := newPullDropProxy(t, strings.TrimPrefix(url, "nats://"))
@@ -152,11 +155,16 @@ func TestLostPullRecoveredPromptly(t *testing.T) {
 	}
 
 	// Two missed heartbeats and a new consumer: a lost pull costs about two
-	// heartbeats, so this leaves room for a loaded machine while failing at
-	// nats.go's default.
-	const bound = 5 * time.Second
+	// heartbeats. Each bound leaves more than twice that for a loaded
+	// machine, and both fail at nats.go's 30 s.
+	const (
+		replayBound = 5 * time.Second
+		readerBound = 9 * time.Second
+	)
 
 	t.Run("replay", func(t *testing.T) {
+		t.Logf("replay pull heartbeat %s", replayPullHeartbeat)
+
 		proxy.drop.Store(1)
 
 		before := proxy.dropped.Load()
@@ -177,12 +185,16 @@ func TestLostPullRecoveredPromptly(t *testing.T) {
 			t.Fatal("no pull request was dropped, so this tested nothing")
 		}
 
-		if took > bound {
+		t.Logf("replayed %s after the lost pull", took.Round(time.Millisecond))
+
+		if took > replayBound {
 			t.Fatalf("the replay waited %s after its first pull was lost", took.Round(time.Millisecond))
 		}
 	})
 
 	t.Run("reader", func(t *testing.T) {
+		t.Logf("reader pull heartbeat %s", l.readerHeartbeat)
+
 		proxy.drop.Store(1)
 
 		before := proxy.dropped.Load()
@@ -211,7 +223,9 @@ func TestLostPullRecoveredPromptly(t *testing.T) {
 			t.Fatal("no pull request was dropped, so this tested nothing")
 		}
 
-		if took > bound {
+		t.Logf("read %s after the lost pull", took.Round(time.Millisecond))
+
+		if took > readerBound {
 			t.Fatalf("the reader waited %s after its first pull was lost", took.Round(time.Millisecond))
 		}
 	})
