@@ -353,6 +353,7 @@ tether:
 | `tether.base_path` | `/tether` | Prefix for every REST route |
 | `tether.disable_routes` | `false` | Mounts no REST routes. The broker still runs |
 | `tether.grove_database` | empty | Which grove database to use when the container holds more than one |
+| `tether.disable_migrate` | `false` | Skips Tether's own table migration at startup, for when you run it some other way. Keysmith and warden still migrate theirs |
 | `tether.dashboard_operators` | `false` | Makes every signed-in dashboard user an operator, with every tenant in reach |
 | `tether.broker.tcp_address` | `:1883` | Plain MQTT. Empty turns it off |
 | `tether.broker.tls` | off | MQTT over TLS: `address`, `cert_file` and `key_file` |

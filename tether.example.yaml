@@ -49,6 +49,11 @@ tether:
   # Empty uses the default database. The binary has only one.
   grove_database: ""
 
+  # Set to true to stop Tether creating or upgrading its tables at startup,
+  # when you run its migrations some other way. Keysmith and warden still
+  # migrate their own.
+  disable_migrate: false
+
   # Who may do what on Tether's dashboard pages. With false, a signed-in
   # dashboard user sees only the tenant their session names (the org their
   # identity provider puts on the session) and can't create, change or

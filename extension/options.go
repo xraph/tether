@@ -70,7 +70,9 @@ func WithJWT(cfg auth.JWTConfig) Option {
 }
 
 // WithStore uses s for tenants and devices instead of a grove database from
-// the container. The extension migrates it on Start and never closes it.
+// the container. The extension migrates it on Start (unless WithDisableMigrate)
+// and never closes it. A WithStore store never goes to the central migrator,
+// since its database need not be the one the migrator runs on.
 func WithStore(s store.Store) Option {
 	return func(e *Extension) { e.store = s }
 }
@@ -80,6 +82,14 @@ func WithStore(s store.Store) Option {
 // grove database is used.
 func WithGroveDatabase(name string) Option {
 	return func(e *Extension) { e.config.GroveDatabase = name }
+}
+
+// WithDisableMigrate stops Start from migrating the store. Use it when the
+// host runs the store's grove group (postgres.Migrations or
+// sqlite.Migrations) some other way. The disable_migrate config key sets the
+// same thing.
+func WithDisableMigrate() Option {
+	return func(e *Extension) { e.config.DisableMigrate = true }
 }
 
 // WithAdminMiddleware wraps the admin routes in mw, in order. This is how

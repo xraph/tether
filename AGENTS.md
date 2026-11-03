@@ -51,6 +51,12 @@ Sentinel errors live in the root `errors.go` and read `errors.New("tether: ...")
 
 Logging goes through `github.com/xraph/go-utils/log`, which is forge's logger. Mochi wants an `*slog.Logger`, so give it one.
 
+### Migrations
+
+The SQL stores keep their schema in grove migration groups, `postgres.Migrations` and `sqlite.Migrations`, both named `tether`. Each migration is its own file named `<14 digit version>_<name>.go`, and its `init` calls `Migrations.Add(up, down)`, so the version and the name come from the file name. To change the schema, add a file with a later version. Don't rename, renumber or edit a shipped one: grove matches applied rows on group and version, and `legacy_migrations_test.go` in each store checks that a database migrated before the per-file layout still has nothing to run. The SQL drivers have no schema builders yet, so the bodies are raw SQL through `db.Exec`.
+
+Everything goes through grove's orchestrator, which takes a lock first (an advisory lock on Postgres, a lock row on SQLite). `Store.Migrate` builds a new executor and orchestrator per call. The extension is a `forge.MigratableExtension`, and when the app runs central migrations with grove's registry in the container it hands its group over in `Register` and Start skips its own run. `WithDisableMigrate` turns the Start run off. The one migration that isn't a grove group is keysmith's, and on Postgres the binary runs it under its own advisory lock until keysmith ships a locked one.
+
 ### Auth and permissions
 
 The way an MQTT client proves who it is stays the same everywhere. The username is the keysmith key ID (`akey_...`) and the password is the raw key. Device keys use the keysmith prefix `tdk`, the environment `live`, and carry the device ID in the metadata key `tether_device_id`.
