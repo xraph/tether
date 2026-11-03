@@ -172,8 +172,9 @@ tether:
       connection_minutes: "tether.connection.minutes"
 
   # Refuse a CONNECT with 0x97 when the tenant's Ledger plan lacks any of
-  # these features, and disconnect its clients with 0x97 at the next check.
-  # Turning it on makes the binary run Ledger too.
+  # these features, disconnect its clients with 0x97 at the next check, and
+  # answer its HTTP publishes with 403. Every tenant needs a Ledger
+  # subscription first. Turning it on makes the binary run Ledger too.
   entitlements:
     enabled: false
     features: ["tether.access"]
@@ -200,12 +201,15 @@ tether:
     events: [connect, disconnect, auth_failure, acl_deny, takeover, admin]
 
     # Events waiting for Chronicle. When the queue is full, new events are
-    # dropped and counted in tether_audit_dropped_total.
+    # dropped and counted in forge_tether_audit_dropped_total; events
+    # Chronicle refuses are counted in forge_tether_audit_failures_total.
+    # Watch both if you rely on the trail.
     queue_size: 10000
     writers: 4
 
-    # Repeats of one ACL denial within this window become one event, with
-    # the number of repeats.
+    # Repeats of one ACL denial, or of one refused CONNECT (same tenant,
+    # reason, remote host and username), within this window become one
+    # event, with the number of repeats.
     deny_window: 1m
 
 # The dashboard has its own section (dashboard:), and its auth is off by

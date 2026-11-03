@@ -125,7 +125,7 @@ Tether listens to Keysmith and Warden, so the changes you make reach live connec
 | Disable a tenant | Every connection of that tenant is closed |
 | Change a tenant's limits | Applied from the next message |
 
-Limits live on the tenant, under `limits`: `max_connections`, `messages_per_second`, `burst`, `max_session_expiry` and `max_sessions`. Zero means unlimited (for the session expiry, the broker's default), and in JSON the session expiry is a duration in nanoseconds. `max_sessions` counts open connections plus the sessions persistent clients left behind, so one tenant can't fill the node with offline sessions, though a device coming back to its own session is never refused by it. The message rate is per tenant per node. A tenant's `max_session_expiry` can only lower the broker's cap: a 5.0 client that asks for more is told the shorter value in its CONNACK, and a 3.1.1 persistent session simply gets the cap.
+Limits live on the tenant, under `limits`: `max_connections`, `messages_per_second`, `burst`, `max_session_expiry` and `max_sessions`. Zero means unlimited (for the session expiry, the broker's default), and in JSON the session expiry is a duration in nanoseconds. `max_sessions` counts open connections plus the sessions persistent clients left behind, so one tenant can't fill the node with offline sessions, though a device coming back to its own session is never refused by it. In a cell the connection and rate limits cover the whole cell. `max_connections` counts the connections the other nodes report, and each node spends a share of the tenant's message rate that follows where its connections are, rebalanced every 10 seconds, so a burst can run a little over while the shares catch up. `max_sessions` stays per node. A tenant's `max_session_expiry` can only lower the broker's cap: a 5.0 client that asks for more is told the shorter value in its CONNACK, and a 3.1.1 persistent session simply gets the cap.
 
 ## Users and apps over JWT
 
@@ -299,6 +299,8 @@ NATS caps every message at its `max_payload`, 1 MiB unless you change it. Tether
 
 A node that can't renew its lease for half of it fences itself: it drops its clients and refuses new ones until NATS answers again, so it never acts on sessions the rest of the cell may already have taken over. The extension's health check fails while that lasts, when the node's NATS connection is down, or once JetStream hasn't answered for half the lease, and it shows up in `/_/health`. Only the JetStream meta leader answers that check, so it goes quiet on every node during a leader election (4 to 9 seconds on nats-server 2.15). The half-lease grace keeps a readiness probe from pulling the whole cell out for one. `forge_tether_cluster_fenced` reads 1 at the same time.
 
+Cell-wide limits come from a load report each node publishes every `load_interval` (2 s, at most a third of the lease). A node that stops cleanly takes its report down on the way out, so its devices can reconnect to the others straight away, and one that dies drops out after three intervals. Nodes from before this release publish no report. While you upgrade a cell node by node, the connections on the old ones don't count against the cell's limits until they're upgraded too.
+
 ### PostgreSQL for a cell across hosts
 
 By default the binary keeps tenants, devices, keys and roles in a SQLite file. That's fine for one node, or for a cell on one machine. Once the nodes live on different hosts they need a database they can all reach, so switch the driver and give every node the same PostgreSQL:
@@ -347,9 +349,9 @@ Every minute, each node sends Ledger how much each tenant grew since the last va
 
 | Feature key | Counts |
 | --- | --- |
-| `tether.messages.in` | PUBLISH packets a client sent that passed the ACL and the rate limit |
+| `tether.messages.in` | PUBLISH packets a client sent that passed the ACL and the rate limit, plus messages a device sent through `POST /tether/v1/publish` |
 | `tether.messages.out` | PUBLISH packets written to a client, `$SYS` ones included |
-| `tether.bytes.in` | Payload bytes of those messages in. Topics and properties don't count |
+| `tether.bytes.in` | Payload bytes of those messages in, HTTP publishes included. Topics and properties don't count |
 | `tether.bytes.out` | Payload bytes of those messages out |
 | `tether.connection.minutes` | Whole minutes of open connections, summed. The remainder carries to the next window |
 
@@ -359,9 +361,11 @@ Every delta goes to Ledger with an idempotency key made of the node, the broker'
 
 ### What a tenant sees when it isn't entitled
 
-With entitlements on, a CONNECT asks Ledger whether the tenant's plan includes every feature in `entitlements.features` (by default just `tether.access`, a boolean feature on your plan). A tenant missing one is refused with CONNACK 0x97, quota exceeded. MQTT 3.1.1 has no such code, so a 3.1.1 client gets 0x03, server unavailable. Each node checks its live tenants again every minute, and a tenant that has lost its plan has every connection on that node closed with 0x97 (a 5.0 client gets a DISCONNECT carrying it first).
+With entitlements on, a CONNECT asks Ledger whether the tenant's plan includes every feature in `entitlements.features` (by default just `tether.access`, a boolean feature on your plan). A tenant missing one is refused with CONNACK 0x97, quota exceeded. MQTT 3.1.1 has no such code, so a 3.1.1 client gets 0x03, server unavailable. Each node checks its live tenants again every minute, and a tenant that has lost its plan has every connection on that node closed with 0x97 (a 5.0 client gets a DISCONNECT carrying it first). HTTP publishes follow the same rule: `POST /tether/v1/publish` from a tenant that isn't entitled gets 403 `not entitled`, and 503 when the check fails.
 
-Soft limits keep running: Ledger answers a soft-limit feature over its limit as allowed. For a hard cap on traffic, list the metered feature too, say `tether.messages.in` with a hard limit on the plan, and the tenant is cut off once Ledger counts past it. It isn't instant. Usage reaches Ledger once a minute and the check runs once a minute, so expect a tenant to run a minute or two of traffic past its cap before you see it disconnected.
+That means every tenant needs a Ledger subscription before you turn entitlements on, on a plan that has the features you listed. You make plans and subscriptions through Ledger's dashboard pages or its Go API (`CreatePlan`, `ActivatePlan`, `CreateSubscription`), under the tenant's `app_id` and `external_id`. Turn entitlements on first and every tenant is refused, since none of them has a plan yet.
+
+Soft limits keep running: Ledger answers a soft-limit feature over its limit as allowed. For a hard cap on traffic, list the metered feature too, say `tether.messages.in` with a hard limit on the plan, and the tenant is cut off once Ledger counts past it. You need metering on as well for that: without it Ledger never hears about the traffic, and the cap never fills. It isn't instant. Usage reaches Ledger once a minute and the check runs once a minute, so expect a tenant to run a minute or two of traffic past its cap before you see it disconnected.
 
 A tenant whose answer Tether already holds connects at normal speed, and the answer is refreshed in the background. Only a tenant Tether has never asked about waits on Ledger, for two seconds at most (`check_timeout`). When Ledger is unreachable, a tenant keeps its last answer for ten minutes (`fail_open`), and a tenant with no answer yet is let in for as long as the node's checks have been failing for under ten minutes. Past that, new CONNECTs get 0x88, server unavailable. An outage never disconnects anyone, and Tether's health check doesn't look at Ledger or Chronicle, so a Ledger outage won't make your load balancer pull every node.
 
@@ -375,11 +379,13 @@ With audit on, Chronicle gets an event for each of these:
 - a session taken over by another connection (`mqtt.session.takeover`)
 - every change made through the REST admin API or the dashboard, with who made it (`admin.tenant.create`, `admin.device.revoke` and so on)
 
-It never records a message or a delivery. You can narrow the list with `audit.events` (`connect`, `disconnect`, `auth_failure`, `acl_deny`, `takeover`, `admin`). A bad password is refused before Tether knows which tenant the client belongs to, so that event carries the username and no tenant.
+It never records a message or a delivery. You can narrow the list with `audit.events` (`connect`, `disconnect`, `auth_failure`, `acl_deny`, `takeover`, `admin`). A bad password is refused before Tether knows which tenant the client belongs to, so that event carries the username and no tenant. The same goes for any event whose tenant Tether can't look up, and for a tenant create that failed: they land in Chronicle's stream with no tenant, with the Tether tenant ID (empty when there's none) in the `tether_tenant` metadata.
 
-The broker never waits on Chronicle. Events go on a queue of 10,000 and four writers take them off it. If a flood outruns Chronicle's database and the queue fills, new events are dropped and counted in `forge_tether_audit_dropped_total`, so watch that counter if you rely on the trail. A device hammering a topic it isn't allowed on doesn't fill the queue either: repeats of the same denial within a minute (`deny_window`) become one more event at the end of the window, with `suppressed` set to how many there were. At shutdown the queue drains after the broker stops, so the last disconnects make it in.
+The actor on an admin change is the subject your auth middleware put on the request, as a Forge auth context (Forge's auth extension and Authsome both do this). The binary's admin token records `admin-token`. With no auth context, the actor is empty.
 
-Three metrics come with these parts, none with a tenant label: `forge_tether_metering_errors_total` (deltas Ledger didn't take and tenants the meter couldn't look up), `forge_tether_entitlement_checks_total{result}` with `allowed`, `denied` or `error`, and `forge_tether_audit_dropped_total`.
+The broker never waits on Chronicle. Events go on a queue of 10,000 and four writers take them off it. If a flood outruns Chronicle's database and the queue fills, new events are dropped and counted in `forge_tether_audit_dropped_total`. An event Chronicle itself refuses, or doesn't answer for, is lost too and counted in `forge_tether_audit_failures_total`. If you rely on the trail, watch both. Admin changes share that queue with the connection events, so a flood can push them out as well. A device hammering a topic it isn't allowed on doesn't fill the queue either: repeats of the same denial within a minute (`deny_window`) become one more event at the end of the window, with `suppressed` set to how many there were. Refused CONNECTs collapse the same way, by tenant, reason, remote host (the port doesn't count) and username, so a bot spraying passwords from one address costs you one event per username a minute plus the count. At shutdown the queue drains after the broker stops, so the last disconnects make it in.
+
+Four metrics come with these parts, none with a tenant label: `forge_tether_metering_errors_total` (deltas Ledger didn't take and tenants the meter couldn't look up; a deleted tenant's leftover usage is dropped and logged once, not counted), `forge_tether_entitlement_checks_total{result}` with `allowed`, `denied` or `error`, `forge_tether_audit_dropped_total` and `forge_tether_audit_failures_total`.
 
 ## Configuration
 
@@ -427,7 +433,7 @@ tether:
 | `tether.jwt` | off | Authsome JWT clients. See [Users and apps over JWT](#users-and-apps-over-jwt) |
 | `tether.cluster` | off | Run the node in a cell. See [Run a cell](#run-a-cell) and the commented block in [`tether.example.yaml`](tether.example.yaml) |
 | `tether.metering` | off | Send each tenant's usage to Ledger every `interval` (`60s`), under the keys in `features`. See [Billing and audit](#billing-and-audit) |
-| `tether.entitlements` | off | Refuse and disconnect, with 0x97, a tenant whose plan lacks one of `features` (`[tether.access]`). Also `interval` (`60s`), `check_timeout` (`2s`) and `fail_open` (`10m`) |
+| `tether.entitlements` | off | Refuse and disconnect, with 0x97, a tenant whose plan lacks one of `features` (`[tether.access]`), and answer its HTTP publishes with 403. Also `interval` (`60s`), `check_timeout` (`2s`) and `fail_open` (`10m`) |
 | `tether.audit` | off | Record the audit trail in Chronicle. Also `events` (every kind), `queue_size` (`10000`), `writers` (`4`) and `deny_window` (`1m`) |
 
 Environment variables aren't a config source, with three exceptions. `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. `TETHER_DATABASE_DSN` sets `server.database.dsn` and beats the file. `TETHER_NODE_ID` sets `tether.cluster.node_id`, and `--node-id` beats it. The `dashboard:` section of the same file belongs to the Forge dashboard.
@@ -438,7 +444,7 @@ In your own app the `tether:` block goes under `extensions.tether` (or a top-lev
 
 Everything in [Why Tether?](#why-tether) works on one node and in a cell. What isn't there yet:
 
-- More than one cell. A cell is one NATS deployment; spreading tenants over several cells comes later. Inside a cell, rate and connection limits still count per node.
+- More than one cell. A cell is one NATS deployment; spreading tenants over several cells comes later. Inside a cell, `max_sessions` still counts per node.
 - Per-tenant caps on retained messages and subscriptions. A tenant can hold as many of either as its devices' grants allow, bounded only by the packet and topic limits.
 - Webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication.
 
