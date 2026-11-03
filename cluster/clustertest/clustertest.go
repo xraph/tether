@@ -244,6 +244,53 @@ func waitMeta(t testing.TB, c *Cluster) {
 	t.Fatalf("clustertest: no JetStream meta leader with %d peers after %s", len(c.Servers), readyWait)
 }
 
+// WaitInterest waits until every running server has interest in each
+// subject in the global account, so that a publish to it through any server
+// reaches a subscriber: for a stream's subject, its leader. A stream that was
+// just made does not have that yet. Its leader subscribes when it is elected
+// and the other servers learn of it over the routes a moment later, and a
+// publish through one of them meanwhile gets no responders (on a loaded
+// runner, for longer than nats.go's own retries of a JetStream publish).
+func (c *Cluster) WaitInterest(t testing.TB, subjects ...string) {
+	t.Helper()
+
+	deadline := time.Now().Add(readyWait)
+
+	for {
+		missing := ""
+
+		for _, s := range c.Servers {
+			if !s.Running() {
+				continue
+			}
+
+			acc := s.GlobalAccount()
+
+			for _, subj := range subjects {
+				if !acc.SubscriptionInterest(subj) {
+					missing = fmt.Sprintf("%s on %s", subj, s.Name())
+
+					break
+				}
+			}
+
+			if missing != "" {
+				break
+			}
+		}
+
+		if missing == "" {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("clustertest: no interest in %s after %s", missing, readyWait)
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // freePortLow and freePortHigh bound the ports FreePorts hands out. The range
 // lies below the ephemeral ranges the kernel takes a port from for a bind to
 // port 0 or an outgoing connection (32768 to 60999 on Linux, 49152 and up on

@@ -143,6 +143,10 @@ func buildCell(t *testing.T, nats *clustertest.Cluster, nodes int, cfg Config, i
 		cancel()
 		require.NoError(t, err)
 
+		if i == 0 {
+			c.nats.WaitInterest(t, cellSubjects(ccfg)...)
+		}
+
 		c.conns = append(c.conns, conn)
 
 		cl := &Cluster{Conn: conn, Config: ccfg}
@@ -173,6 +177,19 @@ func buildCell(t *testing.T, nats *clustertest.Cluster, nodes int, cfg Config, i
 	}
 
 	return c
+}
+
+// cellSubjects is a subject of each stream and bucket Provision makes for
+// the cell (the log's "d.>", the control bus's "ctl.>" and the three
+// buckets), for clustertest's WaitInterest. A cell is ready for its nodes
+// once every server routes a write to all of them: until then the first
+// session write, heartbeat or append through a server the interest has not
+// reached gets no responders, and a CONNECT is refused.
+func cellSubjects(cfg cluster.Config) []string {
+	return []string{
+		"d.x", "ctl.x",
+		"$KV." + cfg.SessionsBucket() + ".x", "$KV." + cfg.RetainedBucket() + ".x", "$KV." + cfg.MembersBucket() + ".x",
+	}
 }
 
 // addr is node i's MQTT address.

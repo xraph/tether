@@ -126,6 +126,10 @@ func startLiveCellWith(t *testing.T, nodes, proxied int, before func(*Broker)) *
 		cancel()
 		require.NoError(t, err)
 
+		if i == 0 {
+			c.nats.WaitInterest(t, cellSubjects(ccfg)...)
+		}
+
 		c.conns = append(c.conns, conn)
 		m := cluster.NewMembers(conn, ccfg)
 

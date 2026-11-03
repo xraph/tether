@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
@@ -303,6 +304,12 @@ func dial5(t *testing.T, addr string, cp *paho.Connect) (*client5, *paho.Connack
 
 	ca, err := c.Connect(ctx, cp)
 	if err != nil {
+		if ca != nil {
+			// paho reports a refusal by its reason string alone, which the
+			// broker leaves empty.
+			err = fmt.Errorf("%w (CONNACK reason code 0x%02x)", err, ca.ReasonCode)
+		}
+
 		return nil, ca, err
 	}
 
