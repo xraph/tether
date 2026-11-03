@@ -18,7 +18,7 @@ const (
 	logDuplicateWindow = 2 * time.Minute
 	// controlMaxAge is how long a control message stays in its stream.
 	controlMaxAge = time.Hour
-	// limitMarkerTTL is how long the sessions and retained buckets keep the
+	// limitMarkerTTL is how long the sessions, retained and load buckets keep the
 	// marker an expired key leaves behind. Per-key TTL needs it, and watchers
 	// see the expiry through it.
 	limitMarkerTTL = time.Minute
@@ -35,6 +35,7 @@ const (
 //   - tether-sessions-<cell>: history 1, limit markers, LimitMarkerTTL 1 minute.
 //   - tether-retained-<cell>: limit markers, LimitMarkerTTL 1 minute.
 //   - tether-members-<cell>: history 1.
+//   - tether-load-<cell>: history 1, limit markers, LimitMarkerTTL 1 minute.
 //
 // Every one gets c.Replicas() replicas, except that with automatic replicas
 // (Config.Replicas 0) one that exists with more keeps them: a node that
@@ -123,6 +124,14 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 			History:     1,
 			Storage:     jetstream.FileStorage,
 			Replicas:    replicas,
+		},
+		{
+			Bucket:         cfg.LoadBucket(),
+			Description:    "tether per-node load reports",
+			History:        1,
+			Storage:        jetstream.FileStorage,
+			Replicas:       replicas,
+			LimitMarkerTTL: limitMarkerTTL,
 		},
 	}
 

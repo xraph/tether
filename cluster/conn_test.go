@@ -212,6 +212,7 @@ func TestProvisionIdempotent(t *testing.T) {
 				{cfg.SessionsBucket(), true},
 				{cfg.RetainedBucket(), true},
 				{cfg.MembersBucket(), false},
+				{cfg.LoadBucket(), true},
 			} {
 				kv, kerr := js.KeyValue(ctx, b.name)
 				if kerr != nil {

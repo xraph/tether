@@ -73,6 +73,7 @@ func cellSubjects(cfg Config) []string {
 	return []string{
 		"d.x", "ctl.x",
 		"$KV." + cfg.SessionsBucket() + ".x", "$KV." + cfg.RetainedBucket() + ".x", "$KV." + cfg.MembersBucket() + ".x",
+		"$KV." + cfg.LoadBucket() + ".x",
 	}
 }
 

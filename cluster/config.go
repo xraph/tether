@@ -35,6 +35,9 @@ const (
 	// DefaultPullHeartbeat is the idle heartbeat of the pull requests of a
 	// node's log readers and control bus (Config.PullHeartbeat).
 	DefaultPullHeartbeat = 2 * time.Second
+	// DefaultLoadInterval is how often a node publishes its load report
+	// (Config.LoadInterval).
+	DefaultLoadInterval = 2 * time.Second
 	// DefaultLogMaxAge is how long the QoS 1 and 2 log keeps a message: the
 	// broker's default session expiry cap, 7 days.
 	DefaultLogMaxAge = 7 * 24 * time.Hour
@@ -94,6 +97,12 @@ type Config struct {
 	// once. Between 0 (exclusive) and half the 30 s pull expiry.
 	// DefaultPullHeartbeat in DefaultConfig. Replays always use 1 s.
 	PullHeartbeat time.Duration `yaml:"pull_heartbeat" json:"pull_heartbeat"`
+	// LoadInterval is how often a node publishes its load report (per-tenant
+	// connection counts and usage) to the cell. A report lives three times
+	// this long, so a node that stops reporting drops out of its peers' view
+	// on its own. Above 0 and at most Lease/2. DefaultLoadInterval in
+	// DefaultConfig.
+	LoadInterval time.Duration `yaml:"load_interval" json:"load_interval"`
 }
 
 // EmbeddedConfig configures the nats-server that embedded mode runs.
@@ -138,6 +147,7 @@ func DefaultConfig() Config {
 		LogMaxAge: DefaultLogMaxAge,
 
 		PullHeartbeat: DefaultPullHeartbeat,
+		LoadInterval:  DefaultLoadInterval,
 	}
 }
 
@@ -188,6 +198,10 @@ func (c Config) Validate() error {
 
 	if c.PullHeartbeat <= 0 || c.PullHeartbeat > maxPullHeartbeat {
 		return fmt.Errorf("cluster: pull_heartbeat %s must be above 0 and at most %s, half the pull expiry", c.PullHeartbeat, maxPullHeartbeat)
+	}
+
+	if c.LoadInterval <= 0 || c.LoadInterval > c.Lease/2 {
+		return fmt.Errorf("cluster: load_interval %s must be above 0 and at most half the lease (%s)", c.LoadInterval, c.Lease/2)
 	}
 
 	if c.LogMaxAge < 0 {
@@ -333,3 +347,6 @@ func (c Config) RetainedBucket() string { return "tether-retained-" + strings.To
 
 // MembersBucket is the KV bucket of live nodes, keyed by node ID.
 func (c Config) MembersBucket() string { return "tether-members-" + strings.ToLower(c.Cell) }
+
+// LoadBucket is the KV bucket of per-node load reports, keyed by node ID.
+func (c Config) LoadBucket() string { return "tether-load-" + strings.ToLower(c.Cell) }
