@@ -100,6 +100,8 @@ func buildCell(t *testing.T, nats *clustertest.Cluster, nodes int, cfg Config, i
 	}
 
 	c := &testCell{nats: nats}
+	c.trackState(t)
+
 	urls := c.nats.URLs()
 
 	t.Cleanup(func() {
@@ -304,7 +306,8 @@ func eventually(t *testing.T, what string, cond func() bool) {
 	eventuallyWithin(t, waitTimeout, what, cond)
 }
 
-// eventuallyWithin is eventually bounded by d.
+// eventuallyWithin is eventually bounded by d. A timeout inside a test with
+// a running cell also prints the cell's delivery state (cellState).
 func eventuallyWithin(t *testing.T, d time.Duration, what string, cond func() bool) {
 	t.Helper()
 
@@ -312,9 +315,96 @@ func eventuallyWithin(t *testing.T, d time.Duration, what string, cond func() bo
 
 	for !cond() {
 		if time.Now().After(deadline) {
+			if cellState != nil {
+				t.Fatalf("timed out waiting for %s\n%s", what, cellState())
+			}
+
 			t.Fatalf("timed out waiting for %s", what)
 		}
 
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// cellState, while a test's cell runs, describes where its deliveries
+// stand: every node's log readers and every session it serves. The tests of
+// this package run one at a time, so one variable is enough.
+var cellState func() string
+
+// trackState makes the cell's state what a timed-out wait prints, until the
+// test ends.
+func (c *testCell) trackState(t *testing.T) {
+	cellState = c.state
+	t.Cleanup(func() { cellState = nil })
+}
+
+// state describes, per node, the log readers (tenant, position, live
+// position, last message) and the sessions (mode 0 live, 1 replay, 2
+// waiting; position; flip floor; queued replay packets; pinned; lost or
+// ended), with the node's delivery counters.
+func (c *testCell) state() string {
+	var b strings.Builder
+
+	for i, node := range c.nodes {
+		n := node.cluster
+		if n == nil {
+			continue
+		}
+
+		fmt.Fprintf(&b, "node %d: log delivered %d, appends %d, replays done %d, replay retries %d, repins %d\n",
+			i, n.logDelivered.Load(), n.appends.Load(), n.replaysDone.Load(), n.replayRetries.Load(), n.repins.Load())
+
+		type readerState struct {
+			tenant  string
+			pos     uint64
+			stopped bool
+		}
+
+		n.readersMu.Lock()
+		readers := make([]readerState, 0, len(n.readers))
+
+		for tenantID, e := range n.readers {
+			rs := readerState{tenant: tenantID, stopped: e.stopped}
+			if e.r != nil {
+				rs.pos = e.r.Position()
+			}
+
+			readers = append(readers, rs)
+		}
+		n.readersMu.Unlock()
+
+		for _, rs := range readers {
+			live, last := uint64(0), uint64(0)
+
+			if tt := n.trackIfAny(rs.tenant); tt != nil {
+				live, last = tt.livePos.Load(), tt.lastMsg.Load()
+			}
+
+			fmt.Fprintf(&b, "  reader %s: position %d, live %d, last message %d, stopped %v\n", rs.tenant, rs.pos, live, last, rs.stopped)
+		}
+
+		type sessState struct {
+			s           *session
+			lost, ended bool
+		}
+
+		n.sessMu.Lock()
+		sessions := make([]sessState, 0, len(n.sess))
+
+		for _, s := range n.sess {
+			sessions = append(sessions, sessState{s: s, lost: s.lost, ended: s.ended})
+		}
+		n.sessMu.Unlock()
+
+		for _, ss := range sessions {
+			s := ss.s
+
+			s.mu.Lock()
+			fmt.Fprintf(&b, "  session %s: mode %d, pos %d, flip floor %d, queued %d, pinned %v, replay seen %d, lost %v, ended %v\n",
+				s.nsID, s.mode, s.pos, s.flipFloor, len(s.queued), s.pinned, s.replaySeen, ss.lost, ss.ended)
+			s.mu.Unlock()
+		}
+	}
+
+	return b.String()
 }

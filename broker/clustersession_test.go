@@ -843,9 +843,13 @@ func slowDeliveryState(b *Broker, tenantID, clientID string, got int64) string {
 	sess := "no session"
 
 	if s := n.sessionByID(nsID); s != nil {
+		n.sessMu.Lock()
+		lost, ended := s.lost, s.ended
+		n.sessMu.Unlock()
+
 		s.mu.Lock()
 		sess = fmt.Sprintf("mode %d (0 live, 1 replay, 2 waiting), pos %d, flip floor %d, queued %d, pinned %v, lost %v, ended %v",
-			s.mode, s.pos, s.flipFloor, len(s.queued), s.pinned, s.lost, s.ended)
+			s.mode, s.pos, s.flipFloor, len(s.queued), s.pinned, lost, ended)
 		s.mu.Unlock()
 	}
 

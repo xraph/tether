@@ -67,6 +67,8 @@ func startLiveCellWith(t *testing.T, nodes, proxied int, before func(*Broker)) *
 	cfg := testConfig()
 
 	c := &liveCell{testCell: &testCell{nats: clustertest.StartCluster(t, 3), t1: t1, t2: t2}}
+	c.trackState(t)
+
 	urls := c.nats.URLs()
 
 	t.Cleanup(func() {
