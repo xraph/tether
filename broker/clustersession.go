@@ -1367,6 +1367,17 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 			return
 		}
 
+		s.mu.Lock()
+		delay, at := s.willDelay, s.willAt
+		s.mu.Unlock()
+
+		if delay > 0 {
+			// The record keeps the will: its key outlives the will's due
+			// time, so the settle that publishes it still finds the key
+			// when the delay is cut short by the session's expiry.
+			ttl = n.willKeyTTL(ttl, time.Until(at.Add(delay)))
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), sessionWriteWait)
 		defer cancel()
 
@@ -1379,10 +1390,6 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 			n.log.Warn("tether: final session write failed; the next owner replays from the last cursor written",
 				slog.String("client", s.nsID), slog.Any("error", err))
 		}
-
-		s.mu.Lock()
-		delay, at := s.willDelay, s.willAt
-		s.mu.Unlock()
 
 		if delay > 0 && !errors.Is(err, errSessionLost) && !errors.Is(err, errFenced) {
 			// The record keeps the will (snapshot): it goes out when the

@@ -678,6 +678,31 @@ func expiryLeft(rec *cluster.SessionRecord, discAt, now time.Time) time.Duration
 	return left.Truncate(time.Second) + time.Second
 }
 
+// willKeyGrace is how long a session key that holds a delayed will lives
+// past the will's due time: twice the time a silent node takes to be
+// declared dead (Lease + 2 s). The will goes out only once a settle of the
+// key wins its CAS, and a key that has expired reads as a will a reconnect
+// cancelled, so the key must outlive the timer of the node holding the will
+// (a delay at or past the session's expiry is cut short by it, which put the
+// key's TTL and the timer on the same instant) and, if that node dies, the
+// reclaim by its leader. The settle ends the session, so the grace only
+// shows when the holder is slow, fenced or dead.
+func (n *clusterNode) willKeyGrace() time.Duration {
+	lease := n.Config.Lease
+	if lease <= 0 {
+		lease = cluster.DefaultLease
+	}
+
+	return 2 * (lease + 2*time.Second)
+}
+
+// willKeyTTL is the TTL of a session key whose will is due after wait, when
+// left of the session's expiry remains: left, unless the will is due less
+// than willKeyGrace before the key would expire.
+func (n *clusterNode) willKeyTTL(left, wait time.Duration) time.Duration {
+	return max(left, wait+n.willKeyGrace())
+}
+
 // reclaim settles the keys this node owns but no session of it serves (at
 // the unfence, and once at Start): written back offline with their wills
 // published, or held while a delayed will waits. A pass that met errors runs
@@ -855,7 +880,7 @@ func (b *Broker) reclaimKey(node string, e cluster.SessionEntry, msgID string) e
 			next.Owner = n.Config.NodeID
 			next.DisconnectedAt = discAt
 
-			_, err := n.Sessions.Expire(ctx, e.Tenant, e.ClientID, rev, &next, expiryLeft(rec, discAt, now))
+			_, err := n.Sessions.Expire(ctx, e.Tenant, e.ClientID, rev, &next, n.willKeyTTL(expiryLeft(rec, discAt, now), wait))
 			if errors.Is(err, cluster.ErrLostCAS) {
 				return nil
 			}

@@ -636,6 +636,141 @@ func TestLocalWillsReachCell(t *testing.T) {
 	require.Nil(t, rec.Will)
 }
 
+// awaitWills reads sub until a message has arrived on every topic of want,
+// failing on a second copy of one or on any other topic, and returns when
+// each arrived.
+func awaitWills(t *testing.T, sub *client5, want ...string) map[string]time.Time {
+	t.Helper()
+
+	got := make(map[string]time.Time, len(want))
+
+	for len(got) < len(want) {
+		m := recvLive(t, sub)
+		require.Contains(t, want, m.Topic)
+		require.NotContains(t, got, m.Topic, "a will published twice")
+
+		got[m.Topic] = time.Now()
+	}
+
+	return got
+}
+
+// MQTT 5 publishes a will when its delay ends or when its session does,
+// whichever comes first: a will delay at or past the session expiry is cut
+// short by the expiry, and the will goes out then, once, from the node that
+// held it. The key that holds the will outlives that moment, so the settle
+// still finds it. A reconnect before the expiry still cancels it.
+func TestDelayedWillAtSessionExpiry(t *testing.T) {
+	c := startLiveCell(t, 2)
+	a := c.nodes[0]
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 2, delay: 5})
+	y := rawConnectWill(t, c.addr(0), willSpec{id: "y", topic: "will/y", qos: 1, expiry: 2, delay: 2})
+	r := rawConnectWill(t, c.addr(0), willSpec{id: "r", topic: "will/r", qos: 1, expiry: 2, delay: 5})
+
+	gone := time.Now()
+
+	require.NoError(t, x.Close())
+	require.NoError(t, y.Close())
+	require.NoError(t, r.Close())
+
+	eventually(t, "r's will held in its record", func() bool {
+		rec, rerr := c.record(t, 1, "r")
+
+		return rerr == nil && rec.Owner == "n1" && rec.Will != nil && !rec.DisconnectedAt.IsZero()
+	})
+
+	// r comes back on the other node before its session expires: session
+	// present, and its will is cancelled.
+	time.Sleep(time.Until(gone.Add(time.Second)))
+
+	rb, ca, err := connect5(t, c.addr(1), "r", "u1", false)
+	require.NoError(t, err)
+	require.True(t, ca.SessionPresent)
+
+	got := awaitWills(t, sb, "will/x", "will/y")
+
+	for topic, at := range got {
+		since := at.Sub(gone)
+		require.GreaterOrEqual(t, since, 1800*time.Millisecond, topic+" before its session expired")
+		require.Less(t, since, 4500*time.Millisecond, topic+" well after its session expired")
+	}
+
+	// Past x's and r's full will delay: nothing more.
+	time.Sleep(time.Until(gone.Add(5500 * time.Millisecond)))
+	noMoreMsgs(t, sb)
+	requireConnected(t, rb)
+
+	require.Equal(t, uint64(2), a.cluster.willsSent.Load())
+	require.GreaterOrEqual(t, a.cluster.willsCancelled.Load(), uint64(1))
+	require.Empty(t, a.cluster.pendingWills())
+
+	for _, id := range []string{"x", "y"} {
+		eventually(t, id+"'s session gone", func() bool {
+			_, rerr := c.record(t, 1, id)
+
+			return errors.Is(rerr, tether.ErrNotFound)
+		})
+	}
+}
+
+// The same rule when the node holding the delayed will dies: the key outlives
+// the session's expiry until the dead node's leader settles it, and the
+// leader publishes the will once. x had disconnected and its node held its
+// will; z was still connected, so the leader holds its will (ruling R32) and
+// publishes it when z's session expires.
+func TestDeadNodeDelayedWillAtSessionExpiry(t *testing.T) {
+	c := startLiveCell(t, 2)
+	b := c.nodes[1]
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 2, delay: 5})
+	z := rawConnectWill(t, c.addr(0), willSpec{id: "z", topic: "will/z", qos: 1, expiry: 2, delay: 30})
+
+	require.NoError(t, x.Close())
+
+	eventually(t, "x's will held in its record", func() bool {
+		rec, rerr := c.record(t, 1, "x")
+
+		return rerr == nil && rec.Owner == "n1" && rec.Will != nil && !rec.DisconnectedAt.IsZero()
+	})
+
+	cut := c.cut()
+
+	requireClosed(t, z)
+
+	// x's session expired while its node was going dead; B settles it once
+	// it sees the node dead.
+	m := recvLive(t, sb)
+	require.Equal(t, "will/x", m.Topic)
+	require.GreaterOrEqual(t, time.Since(cut), liveDead-500*time.Millisecond)
+
+	// z's session was taken over connected, so its expiry runs from the
+	// takeover.
+	m = recvLive(t, sb)
+	require.Equal(t, "will/z", m.Topic)
+	require.GreaterOrEqual(t, time.Since(cut), liveDead+1500*time.Millisecond)
+
+	noMoreMsgs(t, sb)
+	require.Equal(t, uint64(2), b.cluster.willsSent.Load())
+	require.Empty(t, b.cluster.pendingWills())
+
+	for _, id := range []string{"x", "z"} {
+		eventually(t, id+"'s session gone", func() bool {
+			_, rerr := c.record(t, 1, id)
+
+			return errors.Is(rerr, tether.ErrNotFound)
+		})
+	}
+}
+
 // A node that is fenced only briefly is never declared dead: once unfenced it
 // settles the keys it dropped meanwhile itself, and publishes their wills
 // once.
