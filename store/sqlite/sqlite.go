@@ -93,8 +93,10 @@ func stamp(t, fallback time.Time) time.Time {
 
 // ── Lifecycle ───────────────────────────────────────────
 
-// Migrate creates or upgrades the schema with the grove orchestrator. It is
-// safe to call repeatedly.
+// Migrate creates or upgrades the schema by running Migrations through grove's
+// orchestrator, which holds a lock row while it works. It is safe to call
+// repeatedly and from several processes at once. Each call builds its own
+// executor, because grove's executor keeps the locked connection on itself.
 func (s *Store) Migrate(ctx context.Context) error {
 	executor, err := migrate.NewExecutorFor(s.sdb)
 	if err != nil {

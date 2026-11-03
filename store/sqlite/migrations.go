@@ -1,14 +1,17 @@
 package sqlite
 
-import (
-	"context"
+import "github.com/xraph/grove/migrate"
 
-	"github.com/xraph/grove/migrate"
-)
-
-// Migrations is the grove migration group for the Tether store (SQLite). Store.Migrate
-// runs it, and a host that manages migrations through the grove extension can
-// register it there instead.
+// Migrations is the grove migration group for the Tether store (SQLite).
+// Store.Migrate runs it through grove's orchestrator, and a host that runs
+// its migrations centrally (the grove extension's WithMigrations, or the
+// shared MigrationRegistry) can hand it the group instead.
+//
+// Each migration lives in its own file named <version>_<name>.go and joins
+// the group with Migrations.Add, which reads the version and the name from
+// that file name. Never rename one of those files: the orchestrator knows a
+// migration by its group and version, and a database that already recorded
+// 20261022000001 must find it under that version again.
 //
 // Timestamps are INTEGER unix microseconds, not TEXT. modernc.org/sqlite
 // writes a time.Time as a formatted string whose layout depends on the DSN,
@@ -18,70 +21,7 @@ import (
 // There is deliberately no foreign key from tether_devices to tether_tenants:
 // the store contract says CreateDevice does not check the tenant and
 // DeleteTenant does not cascade, and the service layer enforces both.
-var Migrations = newMigrations()
-
-func newMigrations() *migrate.Group {
-	g := migrate.NewGroup("tether")
-
-	g.MustRegister(
-		&migrate.Migration{
-			Name:    "create_tenants",
-			Version: "20261022000001",
-			Up: func(ctx context.Context, exec migrate.Executor) error {
-				_, err := exec.Exec(ctx, `
-CREATE TABLE IF NOT EXISTS tether_tenants (
-    id          TEXT PRIMARY KEY,
-    app_id      TEXT NOT NULL,
-    external_id TEXT NOT NULL,
-    name        TEXT NOT NULL DEFAULT '',
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    limits      TEXT NOT NULL DEFAULT '{}',
-    created_at  INTEGER NOT NULL,
-    updated_at  INTEGER NOT NULL,
-
-    UNIQUE (app_id, external_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_tether_tenants_created ON tether_tenants (created_at, id);
-`)
-
-				return err
-			},
-			Down: func(ctx context.Context, exec migrate.Executor) error {
-				_, err := exec.Exec(ctx, `DROP TABLE IF EXISTS tether_tenants`)
-
-				return err
-			},
-		},
-		&migrate.Migration{
-			Name:    "create_devices",
-			Version: "20261022000002",
-			Up: func(ctx context.Context, exec migrate.Executor) error {
-				_, err := exec.Exec(ctx, `
-CREATE TABLE IF NOT EXISTS tether_devices (
-    id         TEXT PRIMARY KEY,
-    tenant_id  TEXT NOT NULL,
-    name       TEXT NOT NULL DEFAULT '',
-    key_id     TEXT NOT NULL UNIQUE,
-    client_id  TEXT NOT NULL DEFAULT '',
-    roles      TEXT NOT NULL DEFAULT 'null',
-    metadata   TEXT NOT NULL DEFAULT 'null',
-    created_at INTEGER NOT NULL,
-    updated_at INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_tether_devices_tenant ON tether_devices (tenant_id, created_at, id);
-`)
-
-				return err
-			},
-			Down: func(ctx context.Context, exec migrate.Executor) error {
-				_, err := exec.Exec(ctx, `DROP TABLE IF EXISTS tether_devices`)
-
-				return err
-			},
-		},
-	)
-
-	return g
-}
+//
+// The SQL drivers have no schema builders yet, so the migrations are raw SQL
+// through db.Exec.
+var Migrations = migrate.NewGroup("tether")

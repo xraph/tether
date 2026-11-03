@@ -13,6 +13,8 @@ Import: github.com/xraph/tether/store/postgres
 
 - `Ping` and `Close` pass through to grove. After `Close`, `Ping` fails.
 
+Migrations: `Migrations` is a `*migrate.Group` named `tether`. Each migration is its own file, `<14 digit version>_<name>.go`, whose `init` calls `Migrations.Add(up, down)`; grove reads the version and name from the file name. Add a migration by adding a file with a later version. Never rename or renumber an existing one: the orchestrator matches applied rows on group and version, and `TestMigrationsKeepTheirVersionsAndNames` plus `TestMigrateOnALegacyDatabaseIsANoOp` (a database migrated by the old struct-literal group, kept in `legacy_migrations_test.go`) pin the shipped ones: `20261022000001 create_tenants`, `20261022000002 create_devices`. They are raw SQL through `db.Exec` (the SQL drivers have no schema builders yet) and run in a transaction with their `grove_migrations` row. `Migrate` builds a fresh executor and orchestrator per call, so concurrent calls from separate pools queue on grove's advisory lock (`TestConcurrentMigrateOnAFreshDatabase`). Use a direct connection or a session-mode pooler: transaction-mode pgbouncer breaks the session advisory lock.
+
 Schema (`Migrations`):
 - `tether_tenants(id PK, app_id, external_id, name, enabled, limits JSONB, created_at, updated_at)`, `UNIQUE (app_id, external_id)`.
 - `tether_devices(id PK, tenant_id, name, key_id UNIQUE, client_id, roles JSONB, metadata JSONB, created_at, updated_at)`, index `(tenant_id, created_at, id)`.

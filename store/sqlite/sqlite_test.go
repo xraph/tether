@@ -30,8 +30,16 @@ var _ store.Store = (*sqlite.Store)(nil)
 func openStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 
+	return openStoreAt(t, filepath.Join(t.TempDir(), "tether.db"))
+}
+
+// openStoreAt opens a store with its own pool on the file at path and closes
+// it when the test ends.
+func openStoreAt(t *testing.T, path string) *sqlite.Store {
+	t.Helper()
+
 	sdb := sqlitedriver.New()
-	require.NoError(t, sdb.Open(t.Context(), sqlite.DSN(filepath.Join(t.TempDir(), "tether.db"))))
+	require.NoError(t, sdb.Open(t.Context(), sqlite.DSN(path)))
 
 	db, err := grove.Open(sdb)
 	require.NoError(t, err)
