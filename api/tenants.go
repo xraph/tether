@@ -51,7 +51,7 @@ func (a *API) registerTenants(r forge.Router) error {
 		g.GET("/:tenantId", a.getTenant, forge.WithName("getTenant"), forge.WithSummary("Get a tenant")),
 		g.PATCH("/:tenantId", audited(a, tenantUpdated, a.updateTenant), forge.WithName("updateTenant"),
 			forge.WithSummary("Update a tenant's name, enabled flag or limits")),
-		g.DELETE("/:tenantId", audited(a, tenantDeleted, a.deleteTenant), forge.WithName("deleteTenant"),
+		g.DELETE("/:tenantId", a.deleteTenant, forge.WithName("deleteTenant"),
 			forge.WithSummary("Delete a tenant that has no devices")),
 	)
 }
@@ -59,7 +59,9 @@ func (a *API) registerTenants(r forge.Router) error {
 // createTenant records its own audit event: the tenant is known only once
 // it exists, and the response is written here, not returned.
 func (a *API) createTenant(c forge.Context, req *createTenantRequest) (*empty, error) {
-	ev := audit.Event{Action: audit.ActionTenantCreate, Meta: map[string]any{"app_id": req.AppID, "external_id": req.ExternalID}}
+	ev := audit.Event{Action: audit.ActionTenantCreate, Meta: map[string]any{
+		audit.MetaAppID: req.AppID, audit.MetaExternalID: req.ExternalID,
+	}}
 
 	err := a.create(c, req, &ev)
 	a.record(c, ev, err)
@@ -138,16 +140,31 @@ func (a *API) updateTenant(c forge.Context, req *updateTenantRequest) (*tenant.T
 	return updated, nil
 }
 
+// deleteTenant records its own audit event: the tenant's host pair goes on
+// it before the delete, since the audit writer can no longer look it up.
 func (a *API) deleteTenant(c forge.Context, req *tenantPath) (*empty, error) {
+	ev := tenantDeleted(req)
+
+	err := a.removeTenant(c, req, &ev)
+	a.record(c, ev, err)
+
+	return written(err)
+}
+
+// removeTenant deletes the tenant and ends its connections, and puts its
+// host pair on ev.
+func (a *API) removeTenant(c forge.Context, req *tenantPath, ev *audit.Event) error {
 	tn, err := a.tenant(c, req.TenantID)
 	if err != nil {
-		return nil, err
+		return err
 	}
+
+	ev.Meta[audit.MetaAppID], ev.Meta[audit.MetaExternalID] = tn.AppID, tn.ExternalID
 
 	// Delete refuses while the tenant has devices, and then nothing changed:
 	// connections are only touched once the tenant is really gone.
 	if err := a.Tenants.Delete(c.Context(), tn.ID); err != nil {
-		return nil, a.fail("delete tenant", err)
+		return a.fail("delete tenant", err)
 	}
 
 	gone := *tn
@@ -155,7 +172,7 @@ func (a *API) deleteTenant(c forge.Context, req *tenantPath) (*empty, error) {
 
 	a.Broker.UpdateTenant(&gone)
 
-	return written(c.NoContent(http.StatusNoContent))
+	return c.NoContent(http.StatusNoContent)
 }
 
 // tenantUpdated describes PATCH /v1/tenants/:tenantId.

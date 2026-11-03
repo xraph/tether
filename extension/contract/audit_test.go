@@ -107,6 +107,10 @@ func TestCommandsAudited(t *testing.T) {
 	assert.NotEmpty(t, kick.Reason)
 
 	assert.Equal(t, "writer", spy.of(audit.ActionRoleCreate)[0].Meta[audit.MetaTarget])
+
+	del := spy.of(audit.ActionTenantDelete)[0]
+	assert.Equal(t, testApp, del.Meta[audit.MetaAppID], "read before the delete")
+	assert.Equal(t, "acme", del.Meta[audit.MetaExternalID])
 	assert.Equal(t, "a/b", spy.of(audit.ActionRetainedDelete)[0].Meta[audit.MetaTarget])
 }
 

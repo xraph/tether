@@ -44,13 +44,13 @@ Every route that calls the broker (clients, kick, sessions, retained, stats, pub
 
 With `Services.Audit` set, every state-changing route records one `audit.Event` once its handler returned; reads and `POST /v1/publish` record nothing. `(*Services).Emit(ev, err)` does the stamping for both this package and the dashboard contract: Outcome success, or failure with `err.Error()` (the mapped HTTP error) as Reason, and Node from `Broker.NodeID()`. Actor is the `Subject` of forge's `extensions/auth` `AuthContext`, read from the forge context (`auth.GetAuthContext`, where forge's auth middleware puts it) and then the request context (`auth.GetAuthContextFromStdContext`); empty when the admin middleware sets neither.
 
-Most routes are wrapped where they're registered (`audited(a, describe, handler)`, generic over the request and response types); the describe function builds the event from the request alone. POST tenants and POST devices record their own event, since the tenant or device they make is only known after they ran and they write their own response. A request forge refuses before the handler (a body that doesn't bind) is not recorded. Path IDs go in as sent, so a malformed one shows up in a failure event as the caller wrote it.
+Most routes are wrapped where they're registered (`audited(a, describe, handler)`, generic over the request and response types); the describe function builds the event from the request alone. POST tenants and POST devices record their own event, since the tenant or device they make is only known after they ran and they write their own response. DELETE tenants records its own too, with the tenant's `app_id` and `external_id` read before the delete, because the audit writer can't look a deleted tenant up. A request forge refuses before the handler (a body that doesn't bind) is not recorded. Path IDs go in as sent, so a malformed one shows up in a failure event as the caller wrote it.
 
 | Route | Action | Target |
 |---|---|---|
 | `POST /v1/tenants` | `admin.tenant.create` | TenantID and `target` the new tenant; Meta `app_id`, `external_id` |
 | `PATCH /:tenantId` | `admin.tenant.update` | `target` the tenant; Meta `enabled` when the body set it |
-| `DELETE /:tenantId` | `admin.tenant.delete` | `target` the tenant |
+| `DELETE /:tenantId` | `admin.tenant.delete` | `target` the tenant; Meta `app_id`, `external_id` read before the delete |
 | `POST .../devices` | `admin.device.provision` | Subject and `target` the new device, ClientID the pinned client ID |
 | `POST .../rotate`, `.../revoke`, `DELETE .../devices/:deviceId` | `admin.device.rotate`, `revoke`, `delete` | Subject and `target` the device |
 | `PUT .../devices/:deviceId/roles` | `admin.device.roles` | Subject and `target` the device; Meta `roles` |

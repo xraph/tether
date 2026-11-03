@@ -334,16 +334,33 @@ func (r *Recorder) write() {
 	}
 }
 
-// record looks ev's tenant up and hands both to the sink. A failed lookup
-// still records, with the Tether ID alone: a deleted tenant's last events
-// matter most.
+// pairOf is the host pair an event carries in Meta, empty when it has
+// none.
+func pairOf(ev Event) (appID, externalID string) {
+	if s, ok := ev.Meta[MetaAppID].(string); ok {
+		appID = s
+	}
+
+	if s, ok := ev.Meta[MetaExternalID].(string); ok {
+		externalID = s
+	}
+
+	return appID, externalID
+}
+
+// record looks ev's tenant up and hands both to the sink. An event that
+// carries the pair in Meta (MetaAppID, MetaExternalID) needs no lookup. A
+// failed lookup still records, with the Tether ID alone: a deleted tenant's
+// last events matter most.
 func (r *Recorder) record(ev Event) {
 	ctx, cancel := context.WithTimeout(r.base, writeTimeout)
 	defer cancel()
 
 	t := Tenant{ID: ev.TenantID}
 
-	if ev.TenantID != "" && r.tenants != nil {
+	if app, ext := pairOf(ev); app != "" && ext != "" {
+		t.AppID, t.ExternalID = app, ext
+	} else if ev.TenantID != "" && r.tenants != nil {
 		got, err := r.tenants.Get(ctx, ev.TenantID)
 		if err == nil {
 			t = got

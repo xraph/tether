@@ -342,15 +342,20 @@ func TestRecorderTenantPair(t *testing.T) {
 	r.Emit(audit.Event{Action: audit.ActionConnect, TenantID: "t1", ClientID: "a"})
 	r.Emit(audit.Event{Action: audit.ActionConnect, TenantID: "t2", ClientID: "b"})
 	r.Emit(audit.Event{Action: audit.ActionTenantDelete, TenantID: "missing"})
+	r.Emit(audit.Event{Action: audit.ActionTenantDelete, TenantID: "gone",
+		Meta: map[string]any{audit.MetaAppID: "app_g", audit.MetaExternalID: "org_g"}})
 	stop(t, r)
 
 	evs, tens := sink.events(), sink.tenants()
-	require.Len(t, evs, 3)
+	require.Len(t, evs, 4)
 
 	for i, ev := range evs {
 		switch ev.TenantID {
 		case "missing":
 			require.Equal(t, audit.Tenant{ID: "missing"}, tens[i])
+		case "gone":
+			require.Equal(t, audit.Tenant{ID: "gone", AppID: "app_g", ExternalID: "org_g"}, tens[i],
+				"a pair on the event wins over the lookup")
 		default:
 			require.Equal(t, audit.Tenant{ID: ev.TenantID, AppID: "app-" + ev.TenantID, ExternalID: "ext-" + ev.TenantID}, tens[i])
 		}

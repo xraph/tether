@@ -171,6 +171,13 @@ func TestAdminAuditCoversEveryChange(t *testing.T) {
 	}
 
 	assert.Len(t, spy.of(audit.ActionDeviceRoles), 2)
+
+	// The deleted tenant's pair is on its event: the audit writer can no
+	// longer look it up.
+	del := spy.of(audit.ActionTenantDelete)[0]
+	assert.Equal(t, audit.OutcomeSuccess, del.Outcome)
+	assert.Equal(t, testApp, del.Meta[audit.MetaAppID])
+	assert.Equal(t, "aorg_1", del.Meta[audit.MetaExternalID])
 	assert.Equal(t, "reader", spy.of(audit.ActionRoleCreate)[0].Meta[audit.MetaTarget])
 	assert.Equal(t, "a/b", spy.of(audit.ActionRetainedDelete)[0].Meta[audit.MetaTarget])
 	assert.Equal(t, audit.OutcomeFailure, spy.of(audit.ActionSessionDelete)[0].Outcome)

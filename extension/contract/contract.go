@@ -113,7 +113,7 @@ func Register(disp *dispatcher.Dispatcher, reg dashcontract.Registry, wreg dashc
 		// Every command is audited once it ran (audit.go).
 		dispatcher.RegisterCommand(disp, ContributorName, "tenants.create", 1, operatorOnly(g, audited(sp, tenantCreated, tenantsCreateHandler(sp))), opts...),
 		dispatcher.RegisterCommand(disp, ContributorName, "tenants.update", 1, operatorOnly(g, scoped(g, audited(sp, tenantUpdated, tenantsUpdateHandler(sp)))), opts...),
-		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, operatorOnly(g, scoped(g, audited(sp, tenantDeleted, tenantsDeleteHandler(sp)))), opts...),
+		dispatcher.RegisterCommand(disp, ContributorName, "tenants.delete", 1, operatorOnly(g, scoped(g, auditedTenantDelete(sp, tenantsDeleteHandler(sp)))), opts...),
 		dispatcher.RegisterCommand(disp, ContributorName, "devices.provision", 1, scoped(g, audited(sp, deviceProvisioned, devicesProvisionHandler(sp))), secret...),
 		dispatcher.RegisterCommand(disp, ContributorName, "devices.rotate", 1, scoped(g, audited(sp, deviceRotated, devicesRotateHandler(sp))), secret...),
 		dispatcher.RegisterCommand(disp, ContributorName, "devices.revoke", 1, scoped(g, audited(sp, deviceRevoked, devicesRevokeHandler(sp))), opts...),

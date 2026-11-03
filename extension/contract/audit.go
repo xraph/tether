@@ -29,11 +29,37 @@ func audited[I, O any](sp ServicesProvider, describe func(in I, out O) audit.Eve
 	}
 }
 
+// auditedTenantDelete is audited for tenants.delete. The tenant's host pair
+// is read before the delete and carried on the event: once the tenant is
+// gone the audit writer can no longer look it up.
+func auditedTenantDelete(sp ServicesProvider, h handlerFunc[TenantRef, Ack]) handlerFunc[TenantRef, Ack] {
+	return func(ctx context.Context, in TenantRef, p dashcontract.Principal) (Ack, error) {
+		var app, ext string
+
+		if s := sp(); s != nil && s.Audit != nil {
+			if t, err := loadTenant(ctx, s, in.TenantID); err == nil {
+				app, ext = t.AppID, t.ExternalID
+			}
+		}
+
+		describe := func(in TenantRef, out Ack) audit.Event {
+			ev := tenantDeleted(in, out)
+			if app != "" {
+				ev.Meta[audit.MetaAppID], ev.Meta[audit.MetaExternalID] = app, ext
+			}
+
+			return ev
+		}
+
+		return audited(sp, describe, h)(ctx, in, p)
+	}
+}
+
 // The describe functions of the commands, one per input.
 
 func tenantCreated(in CreateTenantInput, out Tenant) audit.Event {
 	ev := audit.Event{Action: audit.ActionTenantCreate, TenantID: out.ID,
-		Meta: map[string]any{"app_id": in.AppID, "external_id": in.ExternalID}}
+		Meta: map[string]any{audit.MetaAppID: in.AppID, audit.MetaExternalID: in.ExternalID}}
 	if out.ID != "" {
 		ev.Meta[audit.MetaTarget] = out.ID
 	}

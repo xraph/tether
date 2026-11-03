@@ -78,6 +78,12 @@ const (
 	// MetaTarget is what an admin change acted on, when the event's
 	// ClientID does not say: a tenant, device or role ID, or a topic.
 	MetaTarget = "target"
+	// MetaAppID and MetaExternalID carry the tenant's host pair on an
+	// event whose tenant may be gone, or not yet in the cache, when a
+	// writer looks it up (admin.tenant.create and admin.tenant.delete).
+	// With both set the Recorder records them and skips the lookup.
+	MetaAppID      = "app_id"
+	MetaExternalID = "external_id"
 )
 
 // Target is the Meta of an admin event whose target is not a client: a
