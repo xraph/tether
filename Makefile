@@ -87,10 +87,16 @@ check:
 	@$(MAKE) lint
 	@echo "$(GREEN)✓ All checks passed$(NC)"
 
-## test (t): Run tests
+## test (t): Run tests (CI's test step runs this target when it exists).
+## -p 2 runs two test binaries at a time instead of one per CPU. The broker,
+## cluster, events, extension and tether-bench tests each start clusters of
+## in-process NATS servers, and four packages of them at once on a four-vCPU
+## runner starve raft elections and route traffic until tests fail at
+## random. The broker package alone runs about five minutes there, so the
+## whole run takes about as long as with four at a time.
 test t:
 	@echo "$(BLUE)Running tests...$(NC)"
-	$(GO) test -v ./...
+	$(GO) test -v -p 2 ./...
 	@echo "$(GREEN)✓ Tests complete$(NC)"
 
 ## test-verbose: Run tests with verbose output
@@ -121,9 +127,10 @@ coverage:
 ## (CI's coverage step runs this target when it exists). Under -race the
 ## broker, cluster and subject packages each take minutes, close to go
 ## test's default 10 minute limit on a small runner, so the limit is raised.
+## -p 2 for the same reason as in test.
 test-coverage:
 	@echo "$(BLUE)Running tests with race detector and coverage...$(NC)"
-	GOWORK=off $(GO) test -race -covermode=atomic -coverprofile=coverage.out -timeout 30m ./...
+	GOWORK=off $(GO) test -race -p 2 -covermode=atomic -coverprofile=coverage.out -timeout 30m ./...
 	@echo "$(GREEN)✓ Coverage written to coverage.out$(NC)"
 
 ## coverage-html: Generate HTML coverage report
