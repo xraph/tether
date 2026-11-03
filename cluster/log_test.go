@@ -835,6 +835,10 @@ func TestReplaySettle(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// The call is done before its consumer closes: until then the next
+		// call could join it.
+		eventually(t, 10*time.Second, "the replay consumer to close", r.isClosed)
+
 		return seqs(col.snapshot())
 	}
 
