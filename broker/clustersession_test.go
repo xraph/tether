@@ -175,13 +175,48 @@ type rawSession struct {
 	held      map[uint16]string
 	delivered map[string]int
 	dups      int
+	// releasedOn records, per payload and packet ID, the connection whose
+	// PUBREL released it. late holds, per connection, the payloads it got
+	// under a packet ID another connection had already released for that
+	// payload; settle decides what they were. stale counts the ones that
+	// came on a connection that lost its session.
+	releasedOn map[string]map[uint16]*rawConn
+	late       map[*rawConn][]string
+	stale      int
 	// onDeliver, when set before connecting, sees every payload handed to
 	// the application, in arrival order.
 	onDeliver func(payload string)
 }
 
 func newRawSession() *rawSession {
-	return &rawSession{held: map[uint16]string{}, delivered: map[string]int{}}
+	return &rawSession{
+		held: map[uint16]string{}, delivered: map[string]int{},
+		releasedOn: map[string]map[uint16]*rawConn{}, late: map[*rawConn][]string{},
+	}
+}
+
+// settle accounts for the late copies (see rawSession.late). A connection
+// that lost its session to another one may have written a PUBLISH before
+// the new owner resent it, and its reader can still hand it over after the
+// flow completed on the new connection: the client reads two sockets in no
+// order, so no broker can prevent that. Those copies, on loser, are stale.
+// A late copy on any other connection is the message sent again after it
+// was released, and counts as a delivery.
+func (s *rawSession) settle(loser *rawConn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for rc, payloads := range s.late {
+		for _, p := range payloads {
+			if rc == loser {
+				s.stale++
+			} else {
+				s.delivered[p]++
+			}
+		}
+	}
+
+	clear(s.late)
 }
 
 func (s *rawSession) count(payload string) int {
@@ -288,6 +323,15 @@ func (rc *rawConn) read() {
 			}
 
 			rc.sess.mu.Lock()
+
+			if payload, ok := rc.sess.held[p.PacketID]; ok {
+				if rc.sess.releasedOn[payload] == nil {
+					rc.sess.releasedOn[payload] = map[uint16]*rawConn{}
+				}
+
+				rc.sess.releasedOn[payload][p.PacketID] = rc
+			}
+
 			delete(rc.sess.held, p.PacketID)
 			rc.sess.mu.Unlock()
 			rc.send(&packets.Pubcomp{PacketID: p.PacketID, Properties: &packets.Properties{}})
@@ -308,6 +352,13 @@ func (rc *rawConn) onPublish(p *packets.Publish) {
 	if p.QoS == 2 {
 		if _, held := s.held[p.PacketID]; held {
 			s.dups++ // a resend of one it has: not delivered again
+		} else if on, ok := s.releasedOn[payload][p.PacketID]; ok && on != rc {
+			// Released on another connection already: settle decides.
+			// Not answered, as a client that moved on would not.
+			s.late[rc] = append(s.late[rc], payload)
+			s.mu.Unlock()
+
+			return
 		} else {
 			s.held[p.PacketID] = payload
 			s.delivered[payload]++
@@ -443,7 +494,10 @@ func (rc *rawConn) subscribe(t *testing.T, filter string, qos byte) {
 // to the client exactly once, across every connection and takeover: the
 // client keeps its QoS 2 state across connections, as MQTT's exactly-once
 // asks of it, and the broker never sends a message it already sent under a
-// new packet ID.
+// new packet ID. The client reads both connections of a round at once, so
+// the loser's last PUBLISH can reach it after the winner resent it under the
+// same packet ID and the flow completed; rawSession.settle sets those aside,
+// and only those.
 func TestConcurrentConnectSameClientID(t *testing.T) {
 	c := startCluster(t, 2)
 	tid := c.t1.ID.String()
@@ -540,6 +594,10 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		code, _ := conns[loser].disconnectedWith()
 		require.Equal(t, byte(0x8E), code, "round %d", round)
 
+		// The loser's reader has handed over everything before its
+		// DISCONNECT.
+		sess.settle(conns[loser])
+
 		rec, err := sessionKey(t, c.nodes[0], tid, "twin")
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("n%d", winner+1), rec.Owner, "round %d: the key names the loser", round)
@@ -568,6 +626,8 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
+	sess.settle(nil)
+
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
@@ -575,8 +635,8 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		require.Equal(t, 1, sess.delivered[p], "message %s delivered %d times", p, sess.delivered[p])
 	}
 
-	t.Logf("%d rounds; %d messages, %d QoS 2 resends recognised, %d acquire retries on n1, %d on n2",
-		rounds, len(all), sess.dups, c.nodes[0].cluster.casRetries.Load(), c.nodes[1].cluster.casRetries.Load())
+	t.Logf("%d rounds; %d messages, %d QoS 2 resends recognised, %d stale copies on losing connections, %d acquire retries on n1, %d on n2",
+		rounds, len(all), sess.dups, sess.stale, c.nodes[0].cluster.casRetries.Load(), c.nodes[1].cluster.casRetries.Load())
 }
 
 // A QoS 2 PUBLISH whose QoS2Out write succeeded reaches the connection with
