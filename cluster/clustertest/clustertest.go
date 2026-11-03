@@ -3,7 +3,9 @@
 package clustertest
 
 import (
+	"crypto/rand"
 	"fmt"
+	"math/big"
 	"net"
 	"net/url"
 	"strings"
@@ -242,9 +244,24 @@ func waitMeta(t testing.TB, c *Cluster) {
 	t.Fatalf("clustertest: no JetStream meta leader with %d peers after %s", len(c.Servers), readyWait)
 }
 
-// FreePorts returns n distinct free loopback TCP ports. They are free when the
-// call returns; another process could take one before you bind it, which is
-// rare enough for tests.
+// freePortLow and freePortHigh bound the ports FreePorts hands out. The range
+// lies below the ephemeral ranges the kernel takes a port from for a bind to
+// port 0 or an outgoing connection (32768 to 60999 on Linux, 49152 and up on
+// macOS and Windows).
+const (
+	freePortLow  = 20000
+	freePortHigh = 32000
+)
+
+// FreePorts returns n distinct free loopback TCP ports. They are free when
+// the call returns, and nothing should take one before you bind it: they are
+// picked at random from below the kernel's ephemeral range (freePortLow to
+// freePortHigh), so the listeners other tests open on port 0 and the
+// connections they make never land on one. A port from the ephemeral range
+// was free for anyone in the gap before the server bound it, and when one
+// went (go test runs packages in parallel, each with servers, brokers and
+// clients of its own) the server never listened and the test waited out
+// readyWait.
 func FreePorts(t testing.TB, n int) []int {
 	t.Helper()
 
@@ -257,20 +274,28 @@ func FreePorts(t testing.TB, n int) []int {
 	}()
 
 	ports := make([]int, 0, n)
+	span := big.NewInt(freePortHigh - freePortLow)
 
-	for range n {
-		l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	for tries := 0; len(ports) < n; tries++ {
+		if tries == 1000 {
+			t.Fatalf("clustertest: no %d free ports between %d and %d", n, freePortLow, freePortHigh)
+		}
+
+		off, err := rand.Int(rand.Reader, span)
 		if err != nil {
 			t.Fatalf("clustertest: free port: %v", err)
 		}
 
-		listeners = append(listeners, l)
-		addr, ok := l.Addr().(*net.TCPAddr)
-		if !ok {
-			t.Fatalf("clustertest: listener address is %T", l.Addr())
+		port := freePortLow + int(off.Int64())
+
+		l, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			// Taken, by another test or another program.
+			continue
 		}
 
-		ports = append(ports, addr.Port)
+		listeners = append(listeners, l)
+		ports = append(ports, port)
 	}
 
 	return ports
