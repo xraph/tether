@@ -115,7 +115,7 @@ func (t *target) dial(ctx context.Context, role string, i, n int, onMsg func(*pa
 		KeepAlive:    keepAlive,
 	})
 	if err != nil {
-		raw.Close()
+		_ = raw.Close()
 
 		if ca != nil {
 			return nil, 0, fmt.Errorf("connack 0x%02x: %w", ca.ReasonCode, err)
@@ -143,7 +143,7 @@ func (c *client) close() {
 
 	discard(c.pc.Disconnect(&paho.Disconnect{ReasonCode: 0}))
 
-	c.raw.Close()
+	_ = c.raw.Close()
 }
 
 // drop kills the connection the way a crash or a cut cable does: no DISCONNECT,
@@ -159,7 +159,7 @@ func (c *client) drop() {
 		discard(tc.SetLinger(0))
 	}
 
-	c.raw.Close()
+	_ = c.raw.Close()
 }
 
 // connStats is what a batch of connection attempts did.

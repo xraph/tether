@@ -48,6 +48,7 @@ func (a *adminClient) do(ctx context.Context, method, path string, body, out any
 		rd = bytes.NewReader(raw)
 	}
 
+	// #nosec G704 -- the operator names the API base URL on the command line.
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, rd)
 	if err != nil {
 		return 0, err
@@ -61,7 +62,7 @@ func (a *adminClient) do(ctx context.Context, method, path string, body, out any
 		req.Header.Set("Content-Type", "application/json")
 	}
 
-	resp, err := a.http.Do(req)
+	resp, err := a.http.Do(req) // #nosec G704 -- as above.
 	if err != nil {
 		return 0, err
 	}

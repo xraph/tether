@@ -104,7 +104,7 @@ func describeMachine(ctx context.Context) machine {
 }
 
 func sysctl(ctx context.Context, name string) string {
-	//nolint:gosec // G204: the names are the ones above, not input.
+	// #nosec G204 -- the names are the ones above, not input.
 	out, err := exec.CommandContext(ctx, "sysctl", "-n", name).Output()
 	if err != nil {
 		return ""
@@ -138,7 +138,7 @@ func rssBytes(ctx context.Context, pids []int) []int64 {
 	out := make([]int64, len(pids))
 
 	for i, pid := range pids {
-		//nolint:gosec // G204: pid is an integer.
+		// #nosec G204 -- pid is an integer.
 		raw, err := exec.CommandContext(ctx, "ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
 		if err != nil {
 			continue
@@ -177,7 +177,7 @@ func cpuSeconds(ctx context.Context, pids []int) []float64 {
 	out := make([]float64, len(pids))
 
 	for i, pid := range pids {
-		//nolint:gosec // G204: pid is an integer.
+		// #nosec G204 -- pid is an integer.
 		raw, err := exec.CommandContext(ctx, "ps", "-o", "time=", "-p", strconv.Itoa(pid)).Output()
 		if err != nil {
 			continue

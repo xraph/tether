@@ -479,7 +479,7 @@ func runStorm(ctx context.Context, t *target, group []*client, window time.Durat
 	sem := make(chan struct{}, parallel)
 
 	for i, old := range byIdx {
-		delay := time.Duration(rand.Float64() * float64(window)) //nolint:gosec // G404: jitter, not security.
+		delay := time.Duration(rand.Float64() * float64(window)) // #nosec G404 -- jitter, not security.
 		node := old.node
 
 		wg.Go(func() {

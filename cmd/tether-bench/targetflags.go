@@ -32,7 +32,7 @@ type cellInfo struct {
 func readCell(path string) (cellInfo, error) {
 	var ci cellInfo
 
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the operator names the cell file on the command line.
 	if err != nil {
 		return ci, err
 	}

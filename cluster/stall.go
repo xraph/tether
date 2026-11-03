@@ -135,5 +135,5 @@ func jitter(d time.Duration) time.Duration {
 		return d
 	}
 
-	return d - time.Duration(q) + time.Duration(rand.Int64N(2*q)) //nolint:gosec // spreads checks, nothing secret
+	return d - time.Duration(q) + time.Duration(rand.Int64N(2*q)) // #nosec G404 -- spreads checks, nothing secret
 }

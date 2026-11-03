@@ -97,7 +97,7 @@ func (c *child) pid() int { return c.cmd.Process.Pid }
 // (it shuts down on it), and either with SIGKILL when that takes too long.
 func (c *child) stop() {
 	if c.stdin != nil {
-		c.stdin.Close()
+		_ = c.stdin.Close()
 	} else {
 		discard(c.cmd.Process.Signal(syscall.SIGTERM))
 	}
@@ -148,7 +148,7 @@ func freePorts(n int) ([]int, error) {
 
 	defer func() {
 		for _, ln := range lns {
-			ln.Close()
+			_ = ln.Close()
 		}
 	}()
 
@@ -176,32 +176,32 @@ func freePorts(n int) ([]int, error) {
 func launch(name, dir string, env []string, exe string, args ...string) (*child, io.ReadCloser, error) {
 	logPath := filepath.Join(dir, name+".log")
 
-	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // #nosec G304 -- under the cell directory the operator chose.
 	if err != nil {
 		return nil, nil, err
 	}
 
-	//nolint:gosec // G204: the cell command chose this executable and these arguments.
+	// #nosec G204 -- the cell command chose this executable and these arguments.
 	cmd := exec.CommandContext(context.Background(), exe, args...)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stderr = logf
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		logf.Close()
+		_ = logf.Close()
 
 		return nil, nil, err
 	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		logf.Close()
+		_ = logf.Close()
 
 		return nil, nil, err
 	}
 
 	if err := cmd.Start(); err != nil {
-		logf.Close()
+		_ = logf.Close()
 
 		return nil, nil, err
 	}
@@ -211,7 +211,7 @@ func launch(name, dir string, env []string, exe string, args ...string) (*child,
 	go func() {
 		discard(cmd.Wait())
 
-		logf.Close()
+		_ = logf.Close()
 		close(c.done)
 	}()
 
@@ -327,7 +327,7 @@ tether:
 
 		go drain(stdout)
 
-		c.stdin.Close()
+		_ = c.stdin.Close()
 		c.stdin = nil
 
 		cp.brokers = append(cp.brokers, c)
@@ -434,7 +434,7 @@ func accepts(ctx context.Context, addr string) bool {
 		return false
 	}
 
-	conn.Close()
+	_ = conn.Close()
 
 	return true
 }
@@ -526,7 +526,7 @@ func runCell(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if err := writeJSON(f, ci); err != nil {
-		f.Close()
+		_ = f.Close()
 
 		return err
 	}

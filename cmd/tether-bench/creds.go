@@ -13,7 +13,7 @@ type cred struct{ User, Pass string }
 // readCreds reads a CSV of device credentials: username and password per row,
 // with an optional header row that names them. Extra columns are ignored.
 func readCreds(path string) ([]cred, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G304 -- the operator names the file on the command line.
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +52,7 @@ func readCreds(path string) ([]cred, error) {
 // writeCreds writes creds as a CSV with a header row. The file holds raw device
 // keys, so it is readable by its owner only.
 func writeCreds(path string, creds []cred) error {
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600) // #nosec G304 -- as above.
 	if err != nil {
 		return err
 	}
