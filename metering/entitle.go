@@ -148,11 +148,19 @@ type Entitlements struct {
 	// slots holds one token per CONNECT-time check in flight.
 	slots chan struct{}
 
+	// life is the background refreshes' context, canceled by Close; bg
+	// waits for them.
+	life context.Context //nolint:containedctx // the lifetime of the background refreshes
+	end  context.CancelFunc
+	bg   sync.WaitGroup
+
 	mu     sync.Mutex
 	states map[string]*entState
 	// nodeOutageSince is when a check of any tenant first failed with no
 	// successful check since; zero while checks answer.
 	nodeOutageSince time.Time
+	// closed is set by Close: no check calls the Checker after it.
+	closed bool
 }
 
 // entState is one tenant's decision. Entitlements.mu guards it.
@@ -218,11 +226,33 @@ func NewEntitlements(cfg EntitlementConfig, tenants Tenants, chk Checker, logger
 		logger = slog.Default()
 	}
 
+	life, end := context.WithCancel(context.Background())
+
 	return &Entitlements{
 		cfg: cfg, tenants: tenants, chk: chk, log: logger,
 		slots:  make(chan struct{}, connectChecks),
 		states: make(map[string]*entState),
+		life:   life, end: end,
 	}
+}
+
+// errClosed is the failure a check records when it would start after Close.
+var errClosed = errors.New("metering: entitlements closed")
+
+// Close ends the background refreshes Allow started: their checks are
+// canceled, and Close returns once they have ended. After it no check calls
+// the Checker: a refresh is not started, and a tenant with nothing
+// remembered gets the outage rules at once, as when every check slot is
+// taken. Run is ended by its own context. Call Close before the Checker's
+// backend stops (the extension calls it at Stop, before the broker and
+// ledger stop). A second call does nothing.
+func (e *Entitlements) Close() {
+	e.mu.Lock()
+	e.closed = true
+	e.mu.Unlock()
+
+	e.end()
+	e.bg.Wait()
 }
 
 // Allow implements broker.Entitlement. A tenant with anything remembered is
@@ -271,6 +301,14 @@ func (e *Entitlements) Allow(ctx context.Context, tenantID string) error {
 
 		done := make(chan struct{})
 		s.inflight = done
+
+		if e.closed {
+			e.recordLocked(tenantID, s, done, result{err: errClosed})
+			err := e.answerLocked(tenantID, s, now)
+			e.mu.Unlock()
+
+			return err
+		}
 
 		if !e.takeSlot() {
 			e.recordLocked(tenantID, s, done, result{err: errCheckBusy})
@@ -339,8 +377,13 @@ func (e *Entitlements) rememberedLocked(s *entState, now time.Time) bool {
 }
 
 // refreshLocked starts a background check of tenantID, which nobody waits
-// for. Without a free slot it records a failed check instead.
+// for, on the Entitlements' lifetime (Close cancels it and waits). Without a
+// free slot it records a failed check instead. After Close it starts nothing.
 func (e *Entitlements) refreshLocked(tenantID string, s *entState) {
+	if e.closed {
+		return
+	}
+
 	done := make(chan struct{})
 	s.inflight = done
 
@@ -350,14 +393,23 @@ func (e *Entitlements) refreshLocked(tenantID string, s *entState) {
 		return
 	}
 
-	go func() {
-		r := e.ask(context.Background(), tenantID, e.cfg.CheckTimeout)
+	// Added under e.mu with closed unset, so Close's Wait sees it.
+	e.bg.Go(func() {
+		r := e.ask(e.life, tenantID, e.cfg.CheckTimeout)
 		e.releaseSlot()
 
 		e.mu.Lock()
+		defer e.mu.Unlock()
+
+		if e.life.Err() != nil {
+			// Closed: a canceled check says nothing about the backend.
+			e.endLocked(s, done)
+
+			return
+		}
+
 		e.recordLocked(tenantID, s, done, r)
-		e.mu.Unlock()
-	}()
+	})
 }
 
 func (e *Entitlements) takeSlot() bool {

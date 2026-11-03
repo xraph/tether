@@ -722,3 +722,49 @@ func TestConnectChecksLimitedTo32(t *testing.T) {
 		t.Fatalf("the 33rd check reached the Checker %d times", n)
 	}
 }
+
+// R17: Close ends a background refresh at once, waits for it, and starts no
+// more, so nothing reaches the Checker after the extension stops.
+func TestCloseEndsBackgroundRefreshes(t *testing.T) {
+	chk := newChecker()
+	cfg := entCfg(50 * time.Millisecond)
+	cfg.CheckTimeout = 5 * time.Second
+	e := newEnt(cfg, chk)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+
+	decided := time.Now()
+	waitFor(t, "the decision to go stale", func() bool { return time.Since(decided) > cfg.Interval })
+
+	chk.set(func(c *fakeChecker) { c.hang = true })
+	n := chk.count(acme.ID)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow with a stale decision: %v", err)
+	}
+
+	waitFor(t, "the background check", func() bool { return chk.count(acme.ID) > n })
+
+	start := time.Now()
+	e.Close()
+
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("Close took %s with a refresh hanging on a %s timeout", d, cfg.CheckTimeout)
+	}
+
+	n = chk.count(acme.ID)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow after Close: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	if got := chk.count(acme.ID); got != n {
+		t.Fatalf("%d checks after Close, want none", got-n)
+	}
+
+	e.Close() // twice is fine
+}
