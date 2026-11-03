@@ -171,6 +171,7 @@ func (m *Members) OnPeerDead(fn func(nodeID string)) {
 // Start writes the first heartbeat, reads the members that exist, and starts
 // the heartbeat, watch and monitor goroutines. It returns once the first
 // heartbeat is acknowledged and the watch has delivered the current members.
+// A first heartbeat that nobody answers is sent again until ctx ends.
 // ctx bounds Start only (10 s when it has no deadline); the goroutines run
 // until Stop. Start can be called once.
 func (m *Members) Start(ctx context.Context) error {
@@ -222,7 +223,11 @@ func (m *Members) start(ctx context.Context) error {
 	m.startedAt = time.Now().UTC()
 	m.mu.Unlock()
 
-	if rerr := m.renew(ctx); rerr != nil {
+	// The first write is retried while nobody answers it: a bucket whose
+	// leader is being elected, or whose leader's interest has not reached
+	// this node's server yet (right after Provision made it), has no
+	// responders for a moment, and that must not keep a node from starting.
+	if rerr := retryPlacement(ctx, m.renew); rerr != nil {
 		return m.wrapErr("first heartbeat", rerr)
 	}
 

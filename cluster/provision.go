@@ -55,8 +55,10 @@ const (
 // Every one gets c.Replicas() replicas, except that with automatic replicas
 // (Config.Replicas 0) one that exists with more keeps them: a node that
 // counted fewer servers (a seed-only route list, a server that advertises
-// nothing) never scales the cell's streams down. The subjects are not
-// namespaced by cell, so two cells cannot share a NATS account.
+// nothing) never scales the cell's streams down. With automatic replicas
+// Provision reads each one first, retrying the way it retries a create, and
+// fails rather than guess when it cannot. The subjects are not namespaced by
+// cell, so two cells cannot share a NATS account.
 func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.Duration) error {
 	if c == nil {
 		return errors.New("cluster: provision: nil connection")
@@ -95,7 +97,12 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	}
 
 	for i := range streams {
-		streams[i].Replicas = keepReplicas(ctx, c, cfg, streams[i].Name, replicas)
+		n, err := keepReplicas(ctx, c, cfg, streams[i].Name, replicas)
+		if err != nil {
+			return fmt.Errorf("cluster: provision stream %s: %w", streams[i].Name, err)
+		}
+
+		streams[i].Replicas = n
 	}
 
 	for _, sc := range streams {
@@ -136,7 +143,12 @@ func Provision(ctx context.Context, c *Conn, cfg Config, maxSessionExpiry time.D
 	}
 
 	for i := range buckets {
-		buckets[i].Replicas = keepReplicas(ctx, c, cfg, kvStreamPrefix+buckets[i].Bucket, replicas)
+		n, err := keepReplicas(ctx, c, cfg, kvStreamPrefix+buckets[i].Bucket, replicas)
+		if err != nil {
+			return fmt.Errorf("cluster: provision bucket %s: %w", buckets[i].Bucket, err)
+		}
+
+		buckets[i].Replicas = n
 	}
 
 	for _, bc := range buckets {
@@ -158,27 +170,45 @@ const kvStreamPrefix = "KV_"
 
 // keepReplicas is the replica count Provision gives the stream named name:
 // want, or with automatic replicas the stream's own count when it exists
-// with more. A stream that cannot be read is given want.
-func keepReplicas(ctx context.Context, c *Conn, cfg Config, name string, want int) int {
+// with more. The read is retried like a create (retryPlacement): a stream
+// whose leader is being elected leaves it unanswered, and taking that for
+// "absent" scaled the cell's streams down to a late node's count. Only a
+// stream that does not exist gets want without a read; one that cannot be
+// read is an error.
+func keepReplicas(ctx context.Context, c *Conn, cfg Config, name string, want int) (int, error) {
 	if cfg.Replicas > 0 {
-		return want
+		return want, nil
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 2*placementAttempt)
-	defer cancel()
+	have := 0
 
-	st, err := c.js.Stream(ctx, name)
+	err := retryPlacement(ctx, func(ctx context.Context) error {
+		st, err := c.js.Stream(ctx, name)
+		if errors.Is(err, jetstream.ErrStreamNotFound) {
+			have = 0
+
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		have = st.CachedInfo().Config.Replicas
+
+		return nil
+	})
 	if err != nil {
-		return want
+		return 0, fmt.Errorf("read the replica count: %w", err)
 	}
 
-	if have := st.CachedInfo().Config.Replicas; have > want {
+	if have > want {
 		c.logger.Info("cluster: keeping the replica count a stream already has", "stream", name, "replicas", have, "counted", want)
 
-		return have
+		return have, nil
 	}
 
-	return want
+	return want, nil
 }
 
 // retryPlacement runs fn until it stops failing with a placement error or an
@@ -208,7 +238,9 @@ func retryPlacement(ctx context.Context, fn func(context.Context) error) error {
 }
 
 // retryable reports whether a failed create is worth another attempt: a
-// placement error, or an attempt nobody answered while ctx still runs.
+// placement error, or an attempt nobody answered while ctx still runs. A
+// publish nobody answered is jetstream.ErrNoStreamResponse, which does not
+// wrap nats.ErrNoResponders.
 func retryable(ctx context.Context, err error) bool {
 	var api *jetstream.APIError
 	if errors.As(err, &api) {
@@ -216,5 +248,6 @@ func retryable(ctx context.Context, err error) bool {
 	}
 
 	return ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) ||
-		errors.Is(err, nats.ErrTimeout) || errors.Is(err, nats.ErrNoResponders))
+		errors.Is(err, nats.ErrTimeout) || errors.Is(err, nats.ErrNoResponders) ||
+		errors.Is(err, jetstream.ErrNoStreamResponse))
 }

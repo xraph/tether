@@ -515,6 +515,39 @@ func TestStartTwiceAndMissingBucket(t *testing.T) {
 	}
 }
 
+// A first heartbeat that gets no responders is sent again. The members
+// bucket has none for a moment while its leader is being elected, or right
+// after Provision made it, before its leader's interest reaches the node's
+// server; on a loaded runner that outlasted nats.go's own two retries and
+// Start failed with "no response from stream", so the node never started.
+func TestStartRetriesUnansweredFirstHeartbeat(t *testing.T) {
+	cell := startMemberCell(t)
+	cfg := memberConfig("n1", cell.urls[0])
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	flaky := &flakyJS{JetStream: c.js, putMisses: 3}
+	c.js = flaky
+
+	m := NewMembers(c, cfg)
+	t.Cleanup(m.Stop)
+
+	if err := m.Start(tctx(t, 10*time.Second)); err != nil {
+		t.Fatalf("Start through three unanswered heartbeats: %v", err)
+	}
+
+	if puts := flaky.putCount(); puts < 4 {
+		t.Fatalf("%d heartbeat writes, want the three unanswered ones and one more", puts)
+	}
+
+	eventually(t, 5*time.Second, "the node to see itself", liveIs(m, "n1"))
+}
+
 func TestFenceOnClosedConnection(t *testing.T) {
 	cell := startMemberCell(t)
 	a := cell.nodeOn(t, "n1", 0)
