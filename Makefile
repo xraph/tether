@@ -123,7 +123,7 @@ coverage:
 ## test's default 10 minute limit on a small runner, so the limit is raised.
 test-coverage:
 	@echo "$(BLUE)Running tests with race detector and coverage...$(NC)"
-	$(GO) test -race -covermode=atomic -coverprofile=coverage.out -timeout 30m ./...
+	GOWORK=off $(GO) test -race -covermode=atomic -coverprofile=coverage.out -timeout 30m ./...
 	@echo "$(GREEN)✓ Coverage written to coverage.out$(NC)"
 
 ## coverage-html: Generate HTML coverage report
