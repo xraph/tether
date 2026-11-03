@@ -1,4 +1,4 @@
-.PHONY: help h test clean fmt lint lint-fix vet tidy deps check coverage all t c f l lf v check-deps chaos
+.PHONY: help h test test-coverage clean fmt lint lint-fix vet tidy deps check coverage all t c f l lf v check-deps chaos
 
 # Default target
 .DEFAULT_GOAL := help
@@ -29,6 +29,7 @@ help h:
 	@echo "  make test (t)       - Run tests"
 	@echo "  make test-verbose   - Run tests with verbose output"
 	@echo "  make test-race      - Run tests with race detector"
+	@echo "  make test-coverage  - Run tests with race detector and coverage (what CI runs)"
 	@echo "  make coverage       - Generate test coverage report"
 	@echo "  make coverage-html  - Generate HTML coverage report"
 	@echo "  make chaos          - Run the chaos suite (real NATS and broker processes, several minutes)"
@@ -115,6 +116,15 @@ coverage:
 	$(GO) test -coverprofile=coverage.out ./...
 	$(GO) tool cover -func=coverage.out
 	@echo "$(GREEN)✓ Coverage report generated: coverage.out$(NC)"
+
+## test-coverage: Run the tests with the race detector and write coverage.out
+## (CI's coverage step runs this target when it exists). Under -race the
+## broker, cluster and subject packages each take minutes, close to go
+## test's default 10 minute limit on a small runner, so the limit is raised.
+test-coverage:
+	@echo "$(BLUE)Running tests with race detector and coverage...$(NC)"
+	$(GO) test -race -covermode=atomic -coverprofile=coverage.out -timeout 30m ./...
+	@echo "$(GREEN)✓ Coverage written to coverage.out$(NC)"
 
 ## coverage-html: Generate HTML coverage report
 coverage-html: coverage
