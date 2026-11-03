@@ -9,16 +9,31 @@
 #
 # The admin token does not live here. Set TETHER_ADMIN_TOKEN in the
 # environment, or start with --insecure-admin to leave the admin API and the
-# dashboard open (for a laptop, not for a server).
+# dashboard open (for a laptop, not for a server). The PostgreSQL connection
+# string can stay out of this file too: see server.database.dsn below.
 
 # Settings that only a standalone process needs.
 server:
   # Where the admin API, the device publish endpoint and the dashboard listen.
   http_address: ":8080"
 
-  # The SQLite file for tenants, devices, keys and roles. Its directory is
-  # created when it is missing.
+  # The SQLite file for tenants, devices, keys and roles, used when the
+  # database driver is sqlite. Its directory is created when it is missing.
   sqlite_path: "./data/tether.db"
+
+  # Where tenants, devices, keys and roles live.
+  database:
+    # sqlite keeps them in the file above, which suits one node or a cell on
+    # one machine. postgres keeps them in a PostgreSQL that every node of the
+    # cell reaches, which is what a cell across hosts needs.
+    driver: sqlite
+
+    # The PostgreSQL connection string, a postgres:// URL or key=value pairs.
+    # Needed with driver: postgres, and an error with driver: sqlite. It holds
+    # the password, so prefer the TETHER_DATABASE_DSN environment variable,
+    # which wins over this key. Example:
+    #   postgres://tether:secret@db.internal:5432/tether?sslmode=require
+    dsn: ""
 
 # Tether's own settings. The same keys work under extensions.tether when you
 # mount the extension in your own Forge app.
@@ -95,9 +110,10 @@ tether:
   # block is absent. Every node of a cell needs the same cell name and its own
   # node_id (--node-id or TETHER_NODE_ID set it from outside the file).
   #
-  # The binary keeps tenants, keys and roles in SQLite, so the nodes of one
-  # cell must share the same sqlite_path, which means one host. Across hosts,
-  # mount the extension in your own app on PostgreSQL.
+  # The nodes of a cell share tenants, keys and roles. On SQLite that means
+  # the same sqlite_path, so one host. Across hosts, set
+  # server.database.driver: postgres and point every node at the same
+  # database.
   # cluster:
   #   enabled: true
   #   node_id: "n1"

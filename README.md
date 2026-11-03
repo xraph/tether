@@ -24,7 +24,7 @@ export TETHER_ADMIN_TOKEN="$(openssl rand -hex 32)"
 ./tether
 ```
 
-That starts MQTT on port 1883 and the admin API on port 8080. Everything it stores goes under `./data`: a SQLite file for tenants, devices, keys and roles, and a Badger directory for sessions and retained messages. Ctrl-C shuts it down cleanly.
+That starts MQTT on port 1883 and the admin API on port 8080. Everything it stores goes under `./data`: a SQLite file for tenants, devices, keys and roles (PostgreSQL works too, see [below](#postgresql-for-a-cell-across-hosts)), and a Badger directory for sessions and retained messages. Ctrl-C shuts it down cleanly.
 
 Forget the token and it won't start:
 
@@ -256,7 +256,7 @@ Start each node in its own terminal, with the same `TETHER_ADMIN_TOKEN` in all t
 ./tether --config node3.yaml --node-id n3
 ```
 
-Give them a second or two between starts. The three share `./data/tether.db`, and SQLite won't let three processes switch a brand new file to WAL mode at the same moment. Don't leave it much longer than that, though: a node waits for the other two before it serves anything, because JetStream needs all three to place the cell's streams, and it gives up after about 30 seconds. Each node keeps its own JetStream data under `./data/nats/<node id>`. `--node-id` can also come from `TETHER_NODE_ID`.
+Give them a second or two between starts. The three share `./data/tether.db`, and SQLite won't let three processes switch a brand new file to WAL mode at the same moment (PostgreSQL has no such wait). Don't leave it much longer than that, though: a node waits for the other two before it serves anything, because JetStream needs all three to place the cell's streams, and it gives up after about 30 seconds. Each node keeps its own JetStream data under `./data/nats/<node id>`. `--node-id` can also come from `TETHER_NODE_ID`.
 
 Now run the [quick start](#quick-start) walkthrough against any node (change `8080` to `8081` in the `api` helper) and point the two clients at different nodes:
 
@@ -274,7 +274,7 @@ The routes listen on loopback here, so nothing off the machine can reach them. I
 
 The user and password only decide who gets in. Route and client traffic still crosses the wire in plain text, and embedded mode has no TLS option, so keep those ports on a network you trust.
 
-One catch with the binary: it keeps tenants, keys and roles in SQLite, and the nodes of a cell have to share them, so a cell of binaries lives on one host. To spread a cell across machines, mount the extension in your own app on PostgreSQL (see [Use it with Forge](#use-it-with-forge)) with the same `cluster:` block, or `extension.WithCluster(cluster.Config{...})` in code.
+One catch, and it only applies to SQLite: the nodes of a cell have to share their tenants, keys and roles, and a SQLite file can't be shared between machines. To spread a cell across hosts, point every node at one PostgreSQL. [PostgreSQL for a cell across hosts](#postgresql-for-a-cell-across-hosts) has the details.
 
 ### NATS you run
 
@@ -296,6 +296,30 @@ NATS caps every message at its `max_payload`, 1 MiB unless you change it. Tether
 
 A node that can't renew its lease for half of it fences itself: it drops its clients and refuses new ones until NATS answers again, so it never acts on sessions the rest of the cell may already have taken over. The extension's health check fails while that lasts, when the node's NATS connection is down, or once JetStream hasn't answered for half the lease, and it shows up in `/_/health`. Only the JetStream meta leader answers that check, so it goes quiet on every node during a leader election (4 to 9 seconds on nats-server 2.15). The half-lease grace keeps a readiness probe from pulling the whole cell out for one. `forge_tether_cluster_fenced` reads 1 at the same time.
 
+### PostgreSQL for a cell across hosts
+
+By default the binary keeps tenants, devices, keys and roles in a SQLite file. That's fine for one node, or for a cell on one machine. Once the nodes live on different hosts they need a database they can all reach, so switch the driver and give every node the same PostgreSQL:
+
+```yaml
+server:
+  database:
+    driver: postgres
+```
+
+The connection string goes in the environment, next to the admin token:
+
+```bash
+export TETHER_ADMIN_TOKEN=...
+export TETHER_DATABASE_DSN='postgres://tether:secret@db.internal:5432/tether?sslmode=require'
+./tether --config node.yaml --node-id n1
+```
+
+You can put `dsn:` under `server.database` instead, but the variable wins when both are set, and it keeps the password out of anything you commit. A `postgres://` URL and key=value pairs both work, and so do pool settings like `pool_max_conns` (the default is 20 connections). Tether never prints the DSN. When it can't connect it names the user, host and database, and leaves the password out.
+
+Create the database and a role that owns it first. Tether makes the tables itself, for Tether, keysmith and warden, before the node starts serving. Nodes can start at the same moment: they take turns on the schema, and whichever gets there second finds it already done. Nothing is copied over from an existing SQLite file, so a node you switch starts with an empty database.
+
+With `driver: postgres` the `server.sqlite_path` key is ignored and no SQLite file is made. Setting a DSN while the driver is `sqlite` is an error, since silently running on a local file would split a cell's state across hosts. We test against PostgreSQL 16.
+
 ## Configuration
 
 The binary reads `--config <path>`, or `./tether.yaml` when that exists, and the defaults when it doesn't. A key you leave out keeps its default. [`tether.example.yaml`](tether.example.yaml) lists every key with a comment, and a test checks that it matches the defaults.
@@ -304,6 +328,9 @@ The binary reads `--config <path>`, or `./tether.yaml` when that exists, and the
 server:
   http_address: ":8080"
   sqlite_path: "./data/tether.db"
+  database:
+    driver: sqlite
+    dsn: ""
 
 tether:
   base_path: "/tether"
@@ -320,7 +347,9 @@ tether:
 | Key | Default | What it does |
 | --- | --- | --- |
 | `server.http_address` | `:8080` | Admin API, device publish endpoint and dashboard contract |
-| `server.sqlite_path` | `./data/tether.db` | Tenants, devices, keys and roles. The binary only does SQLite |
+| `server.sqlite_path` | `./data/tether.db` | The SQLite file for tenants, devices, keys and roles. Used when the driver is `sqlite` |
+| `server.database.driver` | `sqlite` | `sqlite` or `postgres`. See [PostgreSQL for a cell across hosts](#postgresql-for-a-cell-across-hosts) |
+| `server.database.dsn` | empty | The PostgreSQL connection string, needed with `postgres`. `TETHER_DATABASE_DSN` overrides it |
 | `tether.base_path` | `/tether` | Prefix for every REST route |
 | `tether.disable_routes` | `false` | Mounts no REST routes. The broker still runs |
 | `tether.grove_database` | empty | Which grove database to use when the container holds more than one |
@@ -336,7 +365,7 @@ tether:
 | `tether.jwt` | off | Authsome JWT clients. See [Users and apps over JWT](#users-and-apps-over-jwt) |
 | `tether.cluster` | off | Run the node in a cell. See [Run a cell](#run-a-cell) and the commented block in [`tether.example.yaml`](tether.example.yaml) |
 
-Environment variables aren't a config source, with two exceptions. `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. `TETHER_NODE_ID` sets `tether.cluster.node_id`, and `--node-id` beats it. The `dashboard:` section of the same file belongs to the Forge dashboard.
+Environment variables aren't a config source, with three exceptions. `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. `TETHER_DATABASE_DSN` sets `server.database.dsn` and beats the file. `TETHER_NODE_ID` sets `tether.cluster.node_id`, and `--node-id` beats it. The `dashboard:` section of the same file belongs to the Forge dashboard.
 
 In your own app the `tether:` block goes under `extensions.tether` (or a top-level `tether`) in the Forge config, and `WithConfig` and `WithBrokerConfig` layer over it.
 
