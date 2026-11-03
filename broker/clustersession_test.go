@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -166,6 +167,38 @@ func TestReplayHandsOverToLiveInOrder(t *testing.T) {
 	}
 }
 
+// sessionExpired is true from the instant the expiry interval has run since
+// the disconnect, and never for a record that has no disconnect time or no
+// expiry.
+func TestSessionExpired(t *testing.T) {
+	disc := time.Date(2026, time.March, 1, 12, 0, 0, 0, time.UTC)
+	maxExpiry := time.Duration(math.MaxUint32) * time.Second
+
+	tests := []struct {
+		name string
+		rec  *cluster.SessionRecord
+		now  time.Time
+		want bool
+	}{
+		{"nil record", nil, disc.Add(time.Hour), false},
+		{"zero DisconnectedAt", &cluster.SessionRecord{ExpirySeconds: 10}, disc.Add(time.Hour), false},
+		{"expiry 0", &cluster.SessionRecord{DisconnectedAt: disc}, disc.Add(time.Hour), false},
+		{"one nanosecond before the boundary", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: 10}, disc.Add(10*time.Second - time.Nanosecond), false},
+		{"exactly at the boundary", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: 10}, disc.Add(10 * time.Second), true},
+		{"one nanosecond after the boundary", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: 10}, disc.Add(10*time.Second + time.Nanosecond), true},
+		{"disconnected just now", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: 10}, disc, false},
+		{"MaxUint32 an hour after", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: math.MaxUint32}, disc.Add(time.Hour), false},
+		{"MaxUint32 one nanosecond before", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: math.MaxUint32}, disc.Add(maxExpiry - time.Nanosecond), false},
+		{"MaxUint32 exactly at the boundary", &cluster.SessionRecord{DisconnectedAt: disc, ExpirySeconds: math.MaxUint32}, disc.Add(maxExpiry), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, sessionExpired(tc.rec, tc.now))
+		})
+	}
+}
+
 // rawSession is the shared state of one MQTT client across its connections:
 // the QoS 2 packet IDs it has received and not yet been released from
 // (method B of MQTT's exactly-once delivery), and how often each payload was
@@ -176,22 +209,30 @@ type rawSession struct {
 	delivered map[string]int
 	dups      int
 	// releasedOn records, per payload and packet ID, the connection whose
-	// PUBREL released it. late holds, per connection, the payloads it got
-	// under a packet ID another connection had already released for that
-	// payload; settle decides what they were. stale counts the ones that
-	// came on a connection that lost its session.
+	// PUBREL released it. Every round dials new connections, so the
+	// releaser also names the round. late holds, per connection, the
+	// payloads it got under a packet ID another connection had already
+	// released for that payload, with that connection; settle decides what
+	// they were. stale counts the ones it set aside.
 	releasedOn map[string]map[uint16]*rawConn
-	late       map[*rawConn][]string
+	late       map[*rawConn][]lateCopy
 	stale      int
 	// onDeliver, when set before connecting, sees every payload handed to
 	// the application, in arrival order.
 	onDeliver func(payload string)
 }
 
+// lateCopy is a QoS 2 PUBLISH that arrived under a packet ID already released
+// for its payload, on the connection releasedBy.
+type lateCopy struct {
+	payload    string
+	releasedBy *rawConn
+}
+
 func newRawSession() *rawSession {
 	return &rawSession{
 		held: map[uint16]string{}, delivered: map[string]int{},
-		releasedOn: map[string]map[uint16]*rawConn{}, late: map[*rawConn][]string{},
+		releasedOn: map[string]map[uint16]*rawConn{}, late: map[*rawConn][]lateCopy{},
 	}
 }
 
@@ -199,19 +240,24 @@ func newRawSession() *rawSession {
 // that lost its session to another one may have written a PUBLISH before
 // the new owner resent it, and its reader can still hand it over after the
 // flow completed on the new connection: the client reads two sockets in no
-// order, so no broker can prevent that. Those copies, on loser, are stale.
-// A late copy on any other connection is the message sent again after it
-// was released, and counts as a delivery.
-func (s *rawSession) settle(loser *rawConn) {
+// order, so no broker can prevent that. Those copies are stale, but only
+// when they came on loser after the release on winner (this round's), and
+// only one per payload: a loser had one PUBLISH of it in flight. Any other
+// late copy is the message sent again after it was released, and counts as a
+// delivery. A settle with no loser, at the end, sets nothing aside.
+func (s *rawSession) settle(loser, winner *rawConn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for rc, payloads := range s.late {
-		for _, p := range payloads {
-			if rc == loser {
+	for rc, copies := range s.late {
+		seen := map[string]bool{}
+
+		for _, c := range copies {
+			if loser != nil && rc == loser && c.releasedBy == winner && !seen[c.payload] {
+				seen[c.payload] = true
 				s.stale++
 			} else {
-				s.delivered[p]++
+				s.delivered[c.payload]++
 			}
 		}
 	}
@@ -355,7 +401,7 @@ func (rc *rawConn) onPublish(p *packets.Publish) {
 		} else if on, ok := s.releasedOn[payload][p.PacketID]; ok && on != rc {
 			// Released on another connection already: settle decides.
 			// Not answered, as a client that moved on would not.
-			s.late[rc] = append(s.late[rc], payload)
+			s.late[rc] = append(s.late[rc], lateCopy{payload: payload, releasedBy: on})
 			s.mu.Unlock()
 
 			return
@@ -596,7 +642,7 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 
 		// The loser's reader has handed over everything before its
 		// DISCONNECT.
-		sess.settle(conns[loser])
+		sess.settle(conns[loser], conns[winner])
 
 		rec, err := sessionKey(t, c.nodes[0], tid, "twin")
 		require.NoError(t, err)
@@ -626,7 +672,7 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	sess.settle(nil)
+	sess.settle(nil, nil)
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
@@ -634,6 +680,8 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 	for _, p := range all {
 		require.Equal(t, 1, sess.delivered[p], "message %s delivered %d times", p, sess.delivered[p])
 	}
+
+	require.LessOrEqual(t, sess.stale, rounds, "more stale copies than rounds")
 
 	t.Logf("%d rounds; %d messages, %d QoS 2 resends recognised, %d stale copies on losing connections, %d acquire retries on n1, %d on n2",
 		rounds, len(all), sess.dups, sess.stale, c.nodes[0].cluster.casRetries.Load(), c.nodes[1].cluster.casRetries.Load())
