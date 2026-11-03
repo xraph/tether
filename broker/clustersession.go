@@ -372,6 +372,11 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		rev       uint64
 		err       error
 		readEpoch uint64 // the epoch the latest attempt read
+		// expired is set when the record the latest attempt read is of a
+		// session whose expiry ran out (sessionExpired): a key holding a
+		// delayed will outlives it while its holder is slow, fenced or
+		// dead (willKeyTTL). Nothing of it is resumed.
+		expired bool
 	)
 
 	build := func(p *cluster.SessionRecord) *cluster.SessionRecord {
@@ -379,6 +384,8 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		if p != nil {
 			readEpoch = p.Epoch
 		}
+
+		expired = !handover && sessionExpired(p, time.Now())
 
 		r := &cluster.SessionRecord{
 			Clean:           cl.Properties.Clean,
@@ -391,7 +398,7 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 			DoneThrough:     livePos,
 		}
 
-		if resume && p != nil && (p.ExpirySeconds > 0 || handover) {
+		if resume && p != nil && !expired && (p.ExpirySeconds > 0 || handover) {
 			r.Subscriptions = p.Subscriptions
 			r.Cursor = p.Cursor
 			r.DoneThrough = p.DoneThrough
@@ -414,7 +421,8 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	var fetched map[uint64]cluster.LogMessage
 
 	if resume && !handover {
-		if pre, _, gerr := n.Sessions.Get(ctx, st.tenantID, st.rawID); gerr == nil && pre.ExpirySeconds > 0 {
+		pre, _, gerr := n.Sessions.Get(ctx, st.tenantID, st.rawID)
+		if gerr == nil && pre.ExpirySeconds > 0 && !sessionExpired(pre, time.Now()) {
 			own, pinned := resendSeqs(pre)
 			if fetched, err = b.fetchLogs(st.tenantID, own, pinned); err != nil {
 				return nil, err
@@ -430,6 +438,15 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 		}
 
 		return nil, fmt.Errorf("tether/broker: acquire session: %w", err)
+	}
+
+	if expired {
+		// The session had ended, so this CONNECT, which won the key from
+		// its record, holds the only copy of the will its end owed; the
+		// holder's timer finds the new epoch and cancels.
+		b.expiredWill(st, old, prev)
+
+		prev = nil
 	}
 
 	// A new epoch: whatever this node noted about the key's previous one is
@@ -503,6 +520,50 @@ func (b *Broker) establish(ctx context.Context, cl *mqtt.Client, st *clientState
 	}
 
 	return s, nil
+}
+
+// sessionExpired reports whether p is the record of a session that ended
+// at now: disconnected, with an expiry, and that expiry run out.
+func sessionExpired(p *cluster.SessionRecord, now time.Time) bool {
+	if p == nil || p.DisconnectedAt.IsZero() || p.ExpirySeconds == 0 {
+		return false
+	}
+
+	return !now.Before(p.DisconnectedAt.Add(time.Duration(p.ExpirySeconds) * time.Second))
+}
+
+// expiredWill publishes the will that prev, the record of an expired session
+// a CONNECT just took, still holds: its delay or its session ran out, so it
+// was owed, and the holder never got to publish it (only a won settle does).
+// Not when this node noted that the session's end owed none (noWill), and
+// under the message ID of an earlier attempt when old, this node's last
+// session under the ID, owes it.
+func (b *Broker) expiredWill(st *clientState, old *session, prev *cluster.SessionRecord) {
+	n := b.cluster
+	nsID := namespacedID(st.tenantID, st.rawID)
+
+	w := prev.Will
+	if w == nil || n.willBarred(nsID, prev.Epoch) {
+		return
+	}
+
+	if !validWill(st.tenantID, w) {
+		n.log.Warn("tether: dropping a will that is not a tenant topic", slog.String("client", nsID), slog.String("topic", w.Topic))
+
+		return
+	}
+
+	var msgID string
+
+	if old != nil && old.epoch.Load() == prev.Epoch {
+		old.mu.Lock()
+		if old.willOwed {
+			msgID = old.willMsgID
+		}
+		old.mu.Unlock()
+	}
+
+	b.goPublishHeld(st.tenantID, st.rawID, w, msgID)
 }
 
 // Acquire retry pacing (ruling R27).

@@ -298,12 +298,7 @@ func (b *Broker) onPeerDead(node string) {
 func (b *Broker) sweepLoop() {
 	n := b.cluster
 
-	period := n.Config.Lease
-	if period <= 0 {
-		period = cluster.DefaultLease
-	}
-
-	tick := time.NewTicker(period)
+	tick := time.NewTicker(n.lease())
 	defer tick.Stop()
 
 	for {
@@ -688,12 +683,17 @@ func expiryLeft(rec *cluster.SessionRecord, discAt, now time.Time) time.Duration
 // reclaim by its leader. The settle ends the session, so the grace only
 // shows when the holder is slow, fenced or dead.
 func (n *clusterNode) willKeyGrace() time.Duration {
-	lease := n.Config.Lease
-	if lease <= 0 {
-		lease = cluster.DefaultLease
+	return 2 * (n.lease() + 2*time.Second)
+}
+
+// lease is the cell's Config.Lease, or cluster.DefaultLease when it is not
+// set.
+func (n *clusterNode) lease() time.Duration {
+	if n.Config.Lease <= 0 {
+		return cluster.DefaultLease
 	}
 
-	return 2 * (lease + 2*time.Second)
+	return n.Config.Lease
 }
 
 // willKeyTTL is the TTL of a session key whose will is due after wait, when

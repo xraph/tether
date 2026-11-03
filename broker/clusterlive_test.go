@@ -684,9 +684,10 @@ func TestDelayedWillAtSessionExpiry(t *testing.T) {
 		return rerr == nil && rec.Owner == "n1" && rec.Will != nil && !rec.DisconnectedAt.IsZero()
 	})
 
-	// r comes back on the other node before its session expires: session
-	// present, and its will is cancelled.
-	time.Sleep(time.Until(gone.Add(time.Second)))
+	// r comes back on the other node well before its session expires
+	// (a slow CONNECT at load must still land inside it): session present,
+	// and its will is cancelled.
+	time.Sleep(time.Until(gone.Add(500 * time.Millisecond)))
 
 	rb, ca, err := connect5(t, c.addr(1), "r", "u1", false)
 	require.NoError(t, err)
@@ -769,6 +770,110 @@ func TestDeadNodeDelayedWillAtSessionExpiry(t *testing.T) {
 			return errors.Is(rerr, tether.ErrNotFound)
 		})
 	}
+}
+
+// holdWill stops the timer of the delayed will node holds for clientID, as
+// a holder that is slow to fire, and returns it for the test to fire.
+func holdWill(t *testing.T, node *Broker, tenantID, clientID string) *pendingWill {
+	t.Helper()
+
+	n := node.cluster
+	nsID := namespacedID(tenantID, clientID)
+
+	n.willsMu.Lock()
+	defer n.willsMu.Unlock()
+
+	pw := n.wills[nsID]
+	require.NotNil(t, pw, "no delayed will held for "+clientID)
+	pw.timer.Stop()
+
+	return pw
+}
+
+// A key that holds a delayed will outlives its session's MQTT expiry while
+// the holder is slow, fenced or dead (willKeyTTL). A CONNECT after the
+// expiry starts a fresh session (session present 0, nothing of the old one
+// carried) and publishes the will, which the session's end owed; the
+// holder's timer then finds the new epoch and cancels. One inside the
+// expiry resumes the session and cancels the will.
+func TestReconnectAfterExpiryStartsFresh(t *testing.T) {
+	c := startLiveCell(t, 2)
+	a, b := c.nodes[0], c.nodes[1]
+	tid := c.t1.ID.String()
+
+	sb, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, sb, "will/#", 1, false)
+
+	x := rawConnectWill(t, c.addr(0), willSpec{id: "x", topic: "will/x", qos: 1, expiry: 2, delay: 5})
+	r := rawConnectWill(t, c.addr(0), willSpec{id: "r", topic: "will/r", qos: 1, expiry: 2, delay: 5})
+
+	for _, conn := range []net.Conn{x, r} {
+		_, err = (&packets.Subscribe{
+			PacketID: 1, Subscriptions: []packets.SubOptions{{Topic: "old/#", QoS: 1}}, Properties: &packets.Properties{},
+		}).WriteTo(conn)
+		require.NoError(t, err)
+		require.Equal(t, packets.SUBACK, readPacket(t, conn).Type)
+	}
+
+	for _, id := range []string{"x", "r"} {
+		eventually(t, id+"'s subscription in its record", func() bool {
+			rec, rerr := c.record(t, 1, id)
+
+			return rerr == nil && len(rec.Subscriptions) == 1
+		})
+	}
+
+	gone := time.Now()
+
+	require.NoError(t, x.Close())
+	require.NoError(t, r.Close())
+
+	for _, id := range []string{"x", "r"} {
+		eventually(t, id+"'s will held in its record", func() bool {
+			rec, rerr := c.record(t, 1, id)
+
+			return rerr == nil && rec.Owner == "n1" && rec.Will != nil && !rec.DisconnectedAt.IsZero()
+		})
+	}
+
+	px := holdWill(t, a, tid, "x")
+	pr := holdWill(t, a, tid, "r")
+
+	// r inside its expiry: session present, its will cancelled.
+	time.Sleep(time.Until(gone.Add(500 * time.Millisecond)))
+
+	rb, ca, err := connect5(t, c.addr(1), "r", "u1", false)
+	require.NoError(t, err)
+	require.True(t, ca.SessionPresent, "r came back inside its expiry")
+
+	// x a second after its expiry, before the holder fired.
+	time.Sleep(time.Until(gone.Add(3 * time.Second)))
+
+	xb, ca, err := connect5(t, c.addr(1), "x", "u1", false)
+	require.NoError(t, err)
+	require.False(t, ca.SessionPresent, "x's session had expired")
+
+	rec, err := c.record(t, 1, "x")
+	require.NoError(t, err)
+	require.Empty(t, rec.Subscriptions, "x's old subscription carried")
+
+	m := recvLive(t, sb)
+	require.Equal(t, "will/x", m.Topic)
+
+	// The slow holder fires at last: both keys moved, both cancelled.
+	cancelled := a.cluster.willsCancelled.Load()
+
+	a.fireWill(px)
+	a.fireWill(pr)
+
+	require.Equal(t, cancelled+2, a.cluster.willsCancelled.Load())
+	noMoreMsgs(t, sb)
+	requireConnected(t, rb)
+	requireConnected(t, xb)
+
+	require.Zero(t, a.cluster.willsSent.Load())
+	require.Equal(t, uint64(1), b.cluster.willsSent.Load())
 }
 
 // A node that is fenced only briefly is never declared dead: once unfenced it
