@@ -19,12 +19,14 @@ import (
 	"github.com/xraph/tether/cluster/clustertest"
 )
 
-// startLogs starts a three-server JetStream cluster, provisions a cell on it
-// and returns one Log per node, node i on server i%3.
+// startLogs starts a three-server JetStream cluster, provisions a cell on it,
+// waits until every server can route a write to the cell's streams, and
+// returns one Log per node, node i on server i%3.
 func startLogs(t *testing.T, nodes int) []*Log {
 	t.Helper()
 
-	urls := clustertest.Start(t, 3)
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
 	out := make([]*Log, 0, nodes)
 
 	for i := range nodes {
@@ -47,6 +49,8 @@ func startLogs(t *testing.T, nodes int) []*Log {
 			if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
 				t.Fatal(err)
 			}
+
+			nc.WaitInterest(t, cellSubjects(cfg)...)
 		}
 
 		out = append(out, NewLog(c, cfg))

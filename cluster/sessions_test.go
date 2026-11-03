@@ -29,13 +29,15 @@ func tctx(t *testing.T, d time.Duration) context.Context {
 	return ctx
 }
 
-// startCell starts a three-server JetStream cluster, provisions a cell on it
-// and returns one Sessions per node, node i on server i%3. Node IDs are n1, n2
+// startCell starts a three-server JetStream cluster, provisions a cell on it,
+// waits until every server can route a write to the cell's streams, and
+// returns one Sessions per node, node i on server i%3. Node IDs are n1, n2
 // and so on.
 func startCell(t *testing.T, nodes int) []*Sessions {
 	t.Helper()
 
-	urls := clustertest.Start(t, 3)
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
 	out := make([]*Sessions, 0, nodes)
 
 	for i := range nodes {
@@ -58,6 +60,8 @@ func startCell(t *testing.T, nodes int) []*Sessions {
 			if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
 				t.Fatal(err)
 			}
+
+			nc.WaitInterest(t, cellSubjects(cfg)...)
 		}
 
 		out = append(out, NewSessions(c, cfg))

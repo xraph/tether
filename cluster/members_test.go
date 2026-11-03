@@ -87,7 +87,8 @@ type memberCell struct {
 func startMemberCell(t *testing.T) *memberCell {
 	t.Helper()
 
-	urls := clustertest.Start(t, 3)
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
 	cfg := memberConfig("setup", urls[0])
 
 	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
@@ -100,6 +101,8 @@ func startMemberCell(t *testing.T) *memberCell {
 	if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
 		t.Fatal(err)
 	}
+
+	nc.WaitInterest(t, cellSubjects(cfg)...)
 
 	return &memberCell{urls: urls}
 }

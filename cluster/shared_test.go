@@ -25,11 +25,13 @@ type sharedNode struct {
 }
 
 // startShared starts a three-server cell and n nodes on it, node i on server
-// i%3, each with a Shared whose ack wait is ackWait.
+// i%3, each with a Shared whose ack wait is ackWait. The nodes start once
+// every server can route a write to the cell's streams.
 func startShared(t *testing.T, n int, ackWait time.Duration) []*sharedNode {
 	t.Helper()
 
-	urls := clustertest.Start(t, 3)
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
 	out := make([]*sharedNode, 0, n)
 
 	for i := range n {
@@ -52,6 +54,8 @@ func startShared(t *testing.T, n int, ackWait time.Duration) []*sharedNode {
 			if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
 				t.Fatal(err)
 			}
+
+			nc.WaitInterest(t, cellSubjects(cfg)...)
 		}
 
 		l := NewLog(c, cfg)
