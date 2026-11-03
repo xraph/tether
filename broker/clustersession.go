@@ -1329,11 +1329,13 @@ func (b *Broker) finish(s *session, cl *mqtt.Client, expire bool) {
 	owed, msgID, delayed := s.willOwed, s.willMsgID, s.willDelay > 0
 	s.mu.Unlock()
 
-	if !owed && !delayed && !lost && !deleting {
+	if !owed && !delayed && !lost {
 		// No will is owed (a normal DISCONNECT, or one already published or
 		// withheld), but the key keeps the CONNECT's will until the write
-		// below clears it, which may fail or be skipped (fenced): this
-		// node's own reclaim must then settle it without the will.
+		// below clears it, which may fail or be skipped (fenced, or a
+		// delete that writes nothing): this node's own reclaim, and the
+		// delete's publish of a held will (R42), must then settle it
+		// without the will.
 		n.markNoWill(s.nsID, s.epoch.Load())
 	}
 
@@ -2049,6 +2051,8 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 		return deleteConflict(clientID, "the client connected again")
 	}
 
+	var willMsgID string
+
 	if s != nil {
 		n.sessMu.Lock()
 		s.deleting = true
@@ -2072,6 +2076,15 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 
 		// mochi skipped OnDisconnect, or it has not run yet: end it here.
 		b.endSession(live, false)
+
+		// A will the session owes (its publish failed, or the node was
+		// fenced) goes out below under the message ID of any earlier
+		// attempt, so the log drops a copy that committed after all.
+		s.mu.Lock()
+		if s.willOwed {
+			willMsgID = s.willMsgID
+		}
+		s.mu.Unlock()
 	}
 
 	if hasLocal {
@@ -2135,16 +2148,19 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 	log.Info("tether: session deleted")
 
 	// Ruling R42: a will the record still held (a delayed will waiting out
-	// its delay, this node's own or one it took over from a dead node) goes
-	// out now, since the session ended: MQTT sends it at the end of the
-	// delay or of the session, whichever comes first. The delete won, so
-	// this node holds its only copy.
+	// its delay, this node's own or one it took over from a dead node, or
+	// one the session here owes) goes out now, since the session ended:
+	// MQTT sends it at the end of the delay or of the session, whichever
+	// comes first. The delete won, so this node holds its only copy. A will
+	// the session here already published, or never owed, is barred
+	// (finish's markNoWill): the record keeps the CONNECT's will because a
+	// deleted session's end writes nothing.
 	if w := rec.Will; w != nil && !n.willBarred(nsID, rec.Epoch) {
 		n.cancelWill(nsID)
 
 		if validWill(tenantID, w) {
 			log.Info("tether: session deleted with its will held, publishing the will")
-			b.goPublishHeld(tenantID, clientID, w, "")
+			b.goPublishHeld(tenantID, clientID, w, willMsgID)
 		}
 	}
 

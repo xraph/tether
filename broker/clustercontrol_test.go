@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -222,6 +223,50 @@ func TestDeleteSessionPublishesHeldWill(t *testing.T) {
 		require.Equal(t, "wills/"+id, m.Topic)
 		require.Equal(t, "gone "+id, m.Payload)
 		require.Empty(t, c.nodes[0].cluster.pendingWills(), "the delay timer still runs")
+	}
+}
+
+// Deleting the session of a connected client publishes its will once: the
+// delete's disconnect fires it (at once, whatever its delay), and the
+// record, which still holds the CONNECT's will, does not send it a second
+// time (R42), on the node that serves it or through the bus.
+func TestDeleteSessionOfConnectedClientWillOnce(t *testing.T) {
+	c := startControlCell(t, 2)
+
+	watcher, _, err := connect5(t, c.addr(1), "will-watch", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, watcher, "wills/#", 1, false)
+
+	tid := c.t1.ID.String()
+
+	for i, tc := range []struct {
+		from  int
+		delay uint32
+	}{{0, 0}, {1, 0}, {0, 60}, {1, 60}} {
+		id := fmt.Sprintf("live%d", i)
+
+		conn := rawConnectWill(t, c.addr(0), willSpec{id: id, topic: "wills/" + id, qos: 1, expiry: 3600, delay: tc.delay})
+		t.Cleanup(func() { _ = conn.Close() })
+
+		require.NoError(t, c.nodes[tc.from].DeleteSession(tid, id))
+
+		m := recvLive(t, watcher)
+		require.Equal(t, "wills/"+id, m.Topic)
+		require.Equal(t, "gone "+id, m.Payload)
+
+		deadline := time.After(time.Second)
+
+	listen:
+		for {
+			select {
+			case m := <-watcher.msgs:
+				if !strings.HasPrefix(m.Topic, probePrefix) {
+					t.Fatalf("unexpected message %q on %q (delete from node %d, delay %d)", m.Payload, m.Topic, tc.from, tc.delay)
+				}
+			case <-deadline:
+				break listen
+			}
+		}
 	}
 }
 
