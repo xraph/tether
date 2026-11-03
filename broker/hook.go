@@ -1573,9 +1573,9 @@ func (h *hook) auditRefusal(cl *mqtt.Client, code packets.Code, reason, msg stri
 		Action: audit.ActionAuthFailed, Outcome: audit.OutcomeFailure,
 		TenantID: tenantID, ClientID: cl.ID, Subject: string(cl.Properties.Username), Reason: reason,
 		Meta: map[string]any{
-			"reason_code": int(code.Code),
-			"detail":      msg,
-			"remote":      cl.Net.Remote,
+			"reason_code":    int(code.Code),
+			"detail":         msg,
+			audit.MetaRemote: cl.Net.Remote,
 		},
 	})
 }

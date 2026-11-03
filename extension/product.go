@@ -36,8 +36,9 @@ var (
 		"or set audit.enabled to false")
 )
 
-// auditDropSync is how often tether_audit_dropped_total catches up with the
-// recorder's count. Stop syncs it once more after the recorder has drained.
+// auditDropSync is how often tether_audit_dropped_total and
+// tether_audit_failures_total catch up with the recorder's counts. Stop syncs
+// them once more after the recorder has drained.
 var auditDropSync = 5 * time.Second
 
 // stopProductWait bounds the recorder's drain when Start fails after it
@@ -68,9 +69,10 @@ type product struct {
 	// for both.
 	runStop context.CancelFunc
 	wg      sync.WaitGroup
-	// dropped is the recorder's count already added to the counter. Only
-	// syncDropped touches it, from one goroutine at a time.
-	dropped uint64
+	// dropped and failed are the recorder's counts already added to their
+	// counters. Only syncDropped and syncFailures touch them, from one
+	// goroutine at a time.
+	dropped, failed uint64
 }
 
 // validateProduct checks the metering, entitlements and audit configs, before
@@ -222,6 +224,7 @@ func (p *product) run(cfg Config, b *broker.Broker) {
 					return
 				case <-tick.C:
 					p.syncDropped()
+					p.syncFailures()
 				}
 			}
 		})
@@ -259,6 +262,7 @@ func (p *product) stopAfterBroker(ctx context.Context, log forge.Logger) {
 		}
 
 		p.syncDropped()
+		p.syncFailures()
 	}
 }
 
@@ -289,6 +293,16 @@ func (p *product) syncDropped() {
 	}
 }
 
+// syncFailures adds what the recorder's sink failed to write since the last
+// sync to tether_audit_failures_total.
+func (p *product) syncFailures() {
+	n := p.rec.Failures()
+	if n > p.failed {
+		p.metrics.auditFailures.Add(float64(n - p.failed))
+		p.failed = n
+	}
+}
+
 // Entitlement check results, the values of MetricEntitlementChecks' result
 // label.
 const (
@@ -303,6 +317,7 @@ type productMetrics struct {
 	meteringErrors forge.Counter
 	checks         *forge.Vec[forge.Counter]
 	auditDropped   forge.Counter
+	auditFailures  forge.Counter
 }
 
 func newProductMetrics(m forge.Metrics, cfg Config) *productMetrics {
@@ -318,6 +333,7 @@ func newProductMetrics(m forge.Metrics, cfg Config) *productMetrics {
 
 	if cfg.Audit.Enabled {
 		pm.auditDropped = m.Counter(MetricAuditDropped)
+		pm.auditFailures = m.Counter(MetricAuditFailures)
 	}
 
 	return pm

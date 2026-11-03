@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"maps"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,9 +16,14 @@ const writeTimeout = 10 * time.Second
 // failureLogEvery is how often a failing sink is logged at most.
 const failureLogEvery = 10 * time.Second
 
-// denyKey is what makes two ACL denials the same one.
+// denyKey is what makes two ACL denials, or two refused CONNECTs, the same
+// one. An ACL denial is keyed by tenant, client, operation and topic; a
+// refused CONNECT (ruling R23) by tenant ("" when the credentials named
+// none), reason, remote host without its port, and username.
 type denyKey struct {
-	tenant, client, op, topic string
+	action, tenant         string
+	client, op, topic      string
+	reason, host, username string
 }
 
 // denyEntry is the open window of one denial: until it closes, more of the
@@ -33,8 +39,10 @@ type denyEntry struct {
 // off it, look the tenant up and hand both to the Sink.
 //
 // An ACL denial of one (tenant, client, operation, topic) is recorded once
-// per DenyWindow. The ones after it within the window are counted, and when
-// the window closes one more event, the latest of them, is recorded with
+// per DenyWindow, and so is a refused CONNECT of one (tenant, reason, remote
+// host, username), so a client spraying credentials costs one event per key
+// and window. The ones after it within the window are counted, and when the
+// window closes one more event, the latest of them, is recorded with
 // Meta["suppressed"] set to the count.
 type Recorder struct {
 	cfg     Config
@@ -171,6 +179,10 @@ func (r *Recorder) Stop(ctx context.Context) error {
 // of time.
 func (r *Recorder) Dropped() uint64 { return r.dropped.Load() }
 
+// Failures is how many events reached the sink and failed there (a
+// Sink.Record error), lost as well. They are not in Dropped.
+func (r *Recorder) Failures() uint64 { return r.failures.Load() }
+
 // Emit queues ev and returns at once. An event of a kind Config.Events does
 // not list is ignored, so is everything while auditing is off. It never
 // waits on the sink.
@@ -187,7 +199,7 @@ func (r *Recorder) Emit(ev Event) {
 		ev.At = r.now()
 	}
 
-	if ev.Action == ActionACLDenied {
+	if ev.Action == ActionACLDenied || ev.Action == ActionAuthFailed {
 		repeat, closed := r.collapse(ev)
 		if closed != nil {
 			r.enqueue(*closed)
@@ -227,15 +239,7 @@ func (r *Recorder) enqueue(ev Event) {
 // bounded by the queue size: past that, a new denial is recorded without
 // one.
 func (r *Recorder) collapse(ev Event) (repeat bool, closed *Event) {
-	k := denyKey{tenant: ev.TenantID, client: ev.ClientID}
-
-	if op, ok := ev.Meta[MetaOp].(string); ok {
-		k.op = op
-	}
-
-	if t, ok := ev.Meta[MetaTopic].(string); ok {
-		k.topic = t
-	}
+	k := keyOf(ev)
 
 	r.dmu.Lock()
 	defer r.dmu.Unlock()
@@ -258,6 +262,44 @@ func (r *Recorder) collapse(ev Event) (repeat bool, closed *Event) {
 	}
 
 	return false, closed
+}
+
+// keyOf is the key ev collapses under: an ACL denial's or a refused
+// CONNECT's.
+func keyOf(ev Event) denyKey {
+	k := denyKey{action: ev.Action, tenant: ev.TenantID}
+
+	if ev.Action == ActionAuthFailed {
+		k.reason, k.username = ev.Reason, ev.Subject
+
+		if remote, ok := ev.Meta[MetaRemote].(string); ok {
+			k.host = remoteHost(remote)
+		}
+
+		return k
+	}
+
+	k.client = ev.ClientID
+
+	if op, ok := ev.Meta[MetaOp].(string); ok {
+		k.op = op
+	}
+
+	if t, ok := ev.Meta[MetaTopic].(string); ok {
+		k.topic = t
+	}
+
+	return k
+}
+
+// remoteHost is remote's host without the port, or remote as it is when it
+// has no port.
+func remoteHost(remote string) string {
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		return host
+	}
+
+	return remote
 }
 
 // summary is the event that closes a window with repeats: the latest of

@@ -29,7 +29,7 @@ const (
 	// "subscribe").
 	MetricACLDenials = "tether_acl_denials_total"
 
-	// The three below exist only while their part is enabled.
+	// The four below exist only while their part is enabled.
 
 	// MetricMeteringErrors counts the meter's failures: a usage value ledger
 	// did not take (a temporary error, retried in the next window, or a
@@ -45,6 +45,12 @@ const (
 	// queue was full, or Stop ran out of time. It catches up with the
 	// recorder every 5 s and once more at Stop.
 	MetricAuditDropped = "tether_audit_dropped_total"
+
+	// MetricAuditFailures counts audit events chronicle refused or did not
+	// answer for: they reached the sink and were lost there. With
+	// MetricAuditDropped it is what the trail is missing. It catches up with
+	// the recorder every 5 s and once more at Stop.
+	MetricAuditFailures = "tether_audit_failures_total"
 
 	// The cell metrics below exist only when the node runs in a cell.
 

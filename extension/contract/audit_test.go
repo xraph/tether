@@ -126,3 +126,37 @@ func TestScopeRefusalNotAudited(t *testing.T) {
 
 	assert.Empty(t, spy.all())
 }
+
+// A failed tenants.create carries no host pair (it goes to the trail with no
+// tenant), and tenants.update has the REST shape: enabled when the change
+// set it, and limits_changed always.
+func TestTenantEventsShape(t *testing.T) {
+	h := newHarness(t, true)
+	spy := &auditSpy{}
+	h.svc.Audit = spy
+
+	a := h.createTenant("acme")
+
+	_, err := h.command("tenants.create", map[string]any{"appId": testApp, "externalId": "acme", "name": "again"})
+	require.Error(t, err)
+
+	created := spy.of(audit.ActionTenantCreate)
+	require.Len(t, created, 2)
+	assert.Equal(t, testApp, created[0].Meta[audit.MetaAppID])
+	assert.Equal(t, "acme", created[0].Meta[audit.MetaExternalID])
+
+	assert.Equal(t, audit.OutcomeFailure, created[1].Outcome)
+	assert.Empty(t, created[1].TenantID)
+	assert.NotContains(t, created[1].Meta, audit.MetaAppID)
+	assert.NotContains(t, created[1].Meta, audit.MetaExternalID)
+
+	h.mustCommand("tenants.update", map[string]any{"tenantId": a, "enabled": false, "limits": map[string]any{"maxConnections": 5}})
+	h.mustCommand("tenants.update", map[string]any{"tenantId": a, "name": "Acme"})
+
+	updated := spy.of(audit.ActionTenantUpdate)
+	require.Len(t, updated, 2)
+	assert.Equal(t, false, updated[0].Meta["enabled"])
+	assert.Equal(t, true, updated[0].Meta["limits_changed"])
+	assert.NotContains(t, updated[1].Meta, "enabled")
+	assert.Equal(t, false, updated[1].Meta["limits_changed"])
+}

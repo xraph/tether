@@ -218,3 +218,42 @@ type failTenants struct{}
 func (failTenants) Get(context.Context, string) (metering.Tenant, error) {
 	return metering.Tenant{}, errors.New("store down")
 }
+
+// failingSink refuses every write.
+type failingSink struct{}
+
+func (failingSink) Record(context.Context, audit.Event, audit.Tenant) error {
+	return errors.New("chronicle down")
+}
+
+// tether_audit_failures_total follows the recorder's sink failures by their
+// growth, apart from the dropped count.
+func TestAuditFailuresFeedTheCounter(t *testing.T) {
+	cfg := audit.DefaultConfig()
+	cfg.Enabled = true
+
+	rec := audit.NewRecorder(cfg, failingSink{}, nil, nil)
+	rec.Start()
+
+	dropped, failed := &addCounter{}, &addCounter{}
+	p := &product{rec: rec, metrics: &productMetrics{auditDropped: dropped, auditFailures: failed}}
+
+	for range 4 {
+		rec.Emit(audit.Event{Action: audit.ActionConnect, Outcome: audit.OutcomeSuccess, TenantID: "t"})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := rec.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	p.syncDropped()
+	p.syncFailures()
+	p.syncFailures()
+
+	if failed.n != 4 || dropped.n != 0 {
+		t.Fatalf("failures counter %v, dropped counter %v; want 4 and 0", failed.n, dropped.n)
+	}
+}

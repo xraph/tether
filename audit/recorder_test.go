@@ -373,3 +373,149 @@ func TestKind(t *testing.T) {
 	require.Equal(t, audit.KindAdmin, audit.Kind(audit.ActionRetainedDelete))
 	require.Empty(t, audit.Kind("mqtt.publish"))
 }
+
+// errSink fails every Record.
+type errSink struct{}
+
+func (errSink) Record(context.Context, audit.Event, audit.Tenant) error {
+	return errors.New("chronicle down")
+}
+
+// TestFailuresCounted: an event the sink refused is counted in Failures, not
+// in Dropped.
+func TestFailuresCounted(t *testing.T) {
+	r := audit.NewRecorder(enabled(), errSink{}, fakeTenants{}, nil)
+	r.Start()
+
+	for range 5 {
+		r.Emit(audit.Event{Action: audit.ActionConnect, TenantID: "t1"})
+	}
+
+	stop(t, r)
+
+	require.Equal(t, uint64(5), r.Failures())
+	require.Zero(t, r.Dropped())
+}
+
+// authFailure is a refused CONNECT from remote, as the broker emits it.
+func authFailure(tenantID, user, reason, remote string, at time.Time) audit.Event {
+	return audit.Event{
+		Action: audit.ActionAuthFailed, Outcome: audit.OutcomeFailure, TenantID: tenantID,
+		ClientID: fmt.Sprintf("c-%d", at.UnixNano()), Subject: user, Reason: reason,
+		Meta: map[string]any{"reason_code": 0x86, audit.MetaRemote: remote}, At: at,
+	}
+}
+
+// TestAuthFailureCollapsed (ruling R23): a credential-spraying client costs
+// one event per (tenant, reason, remote host, username) and window, plus one
+// with the count of the rest. Client IDs and source ports do not matter.
+func TestAuthFailureCollapsed(t *testing.T) {
+	sink := &fakeSink{}
+	cfg := enabled()
+	cfg.Writers = 1 // the sink sees the queue's order
+	cfg.DenyWindow = 200 * time.Millisecond
+
+	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)
+	r.Start()
+	t.Cleanup(func() { stop(t, r) })
+
+	at := time.Now()
+
+	for i := range 50 {
+		r.Emit(authFailure("", "akey_spray", "bad_credentials", fmt.Sprintf("10.0.0.9:%d", 40000+i), at))
+	}
+
+	eventually(t, "the summary of the window", func() bool { return len(sink.events()) == 2 })
+
+	evs := sink.events()
+	require.Equal(t, audit.ActionAuthFailed, evs[0].Action)
+	require.NotContains(t, evs[0].Meta, audit.MetaSuppressed)
+	require.Equal(t, 49, evs[1].Meta[audit.MetaSuppressed])
+	require.Equal(t, "akey_spray", evs[1].Subject)
+
+	// Each of tenant, reason, host and username is its own key.
+	later := time.Now()
+	r.Emit(authFailure("", "akey_spray", "bad_credentials", "10.0.0.10:1", later))
+	r.Emit(authFailure("", "akey_other", "bad_credentials", "10.0.0.9:1", later))
+	r.Emit(authFailure("", "akey_spray", "rate_limited", "10.0.0.9:1", later))
+	r.Emit(authFailure("t1", "akey_spray", "bad_credentials", "10.0.0.9:1", later))
+	r.Emit(authFailure("", "akey_spray", "bad_credentials", "[2001:db8::1]:1", later))
+	r.Emit(authFailure("", "akey_spray", "bad_credentials", "[2001:db8::1]:2", later)) // a repeat
+
+	eventually(t, "five fresh failures", func() bool { return len(sink.events()) == 7 })
+}
+
+// TestAuthFailureWindowEndedBeforeSweep: a failure after a window ended but
+// before the sweep closed it closes the window itself, so the repeats it
+// counted still get their summary.
+func TestAuthFailureWindowEndedBeforeSweep(t *testing.T) {
+	sink := &fakeSink{}
+	cfg := enabled()
+	cfg.DenyWindow = time.Hour
+	cfg.Writers = 1 // the sink sees the queue's order
+
+	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)
+	r.Start()
+
+	fail := func(at time.Time, port int) {
+		r.Emit(authFailure("", "akey_spray", "bad_credentials", fmt.Sprintf("10.0.0.9:%d", port), at))
+	}
+
+	start := time.Now()
+	fail(start, 1)
+
+	for i := range 10 {
+		fail(start.Add(time.Duration(i+1)*time.Minute), i+2)
+	}
+
+	// The sweep ticks every 15 minutes of wall time, so it has not run.
+	fail(start.Add(time.Hour+time.Second), 99)
+
+	eventually(t, "the first failure, the summary and the new one", func() bool { return len(sink.events()) == 3 })
+
+	evs := sink.events()
+	require.NotContains(t, evs[0].Meta, audit.MetaSuppressed)
+	require.Equal(t, 10, evs[1].Meta[audit.MetaSuppressed])
+	require.Equal(t, start.Add(10*time.Minute), evs[1].At, "the summary is the latest repeat")
+	require.NotContains(t, evs[2].Meta, audit.MetaSuppressed)
+
+	// The new window counted nothing, so Stop adds no summary.
+	stop(t, r)
+	require.Len(t, sink.events(), 3)
+}
+
+// TestAuthFailureStopDrainsSummary: one refused CONNECT in a window gets no
+// summary, and Stop records the summary of a window still open.
+func TestAuthFailureStopDrainsSummary(t *testing.T) {
+	sink := &fakeSink{}
+	cfg := enabled()
+	cfg.DenyWindow = time.Hour
+
+	r := audit.NewRecorder(cfg, sink, fakeTenants{}, nil)
+	r.Start()
+
+	at := time.Now()
+	r.Emit(authFailure("", "akey_one", "bad_credentials", "10.0.0.1:1", at))
+
+	for i := range 3 {
+		r.Emit(authFailure("", "akey_spray", "bad_credentials", fmt.Sprintf("10.0.0.9:%d", i), at))
+	}
+
+	stop(t, r)
+
+	evs := sink.events()
+	require.Len(t, evs, 3, "one alone, and the spray's first and summary")
+
+	summaries := 0
+
+	for _, ev := range evs {
+		if n, ok := ev.Meta[audit.MetaSuppressed]; ok {
+			summaries++
+
+			require.Equal(t, 2, n)
+			require.Equal(t, "akey_spray", ev.Subject)
+		}
+	}
+
+	require.Equal(t, 1, summaries)
+}

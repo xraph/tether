@@ -57,18 +57,22 @@ func auditedTenantDelete(sp ServicesProvider, h handlerFunc[TenantRef, Ack]) han
 
 // The describe functions of the commands, one per input.
 
-func tenantCreated(in CreateTenantInput, out Tenant) audit.Event {
-	ev := audit.Event{Action: audit.ActionTenantCreate, TenantID: out.ID,
-		Meta: map[string]any{audit.MetaAppID: in.AppID, audit.MetaExternalID: in.ExternalID}}
+// tenantCreated carries the host pair only for a tenant that was created: a
+// failed create goes to the audit trail with no tenant, so a caller cannot
+// write into another tenant's trail by asking for its pair.
+func tenantCreated(_ CreateTenantInput, out Tenant) audit.Event {
+	ev := audit.Event{Action: audit.ActionTenantCreate, TenantID: out.ID}
 	if out.ID != "" {
-		ev.Meta[audit.MetaTarget] = out.ID
+		ev.Meta = map[string]any{
+			audit.MetaTarget: out.ID, audit.MetaAppID: out.AppID, audit.MetaExternalID: out.ExternalID,
+		}
 	}
 
 	return ev
 }
 
 func tenantUpdated(in UpdateTenantInput, _ Tenant) audit.Event {
-	return audit.Event{Action: audit.ActionTenantUpdate, TenantID: in.TenantID, Meta: audit.Target(in.TenantID)}
+	return audit.TenantUpdated(in.TenantID, in.Enabled, in.Limits != nil)
 }
 
 func tenantDeleted(in TenantRef, _ Ack) audit.Event {

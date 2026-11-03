@@ -48,8 +48,8 @@ Most routes are wrapped where they're registered (`audited(a, describe, handler)
 
 | Route | Action | Target |
 |---|---|---|
-| `POST /v1/tenants` | `admin.tenant.create` | TenantID and `target` the new tenant; Meta `app_id`, `external_id` |
-| `PATCH /:tenantId` | `admin.tenant.update` | `target` the tenant; Meta `enabled` when the body set it |
+| `POST /v1/tenants` | `admin.tenant.create` | TenantID and `target` the new tenant; Meta `app_id`, `external_id` of the tenant created. A failed create has neither TenantID nor pair, so it goes to the trail with no tenant (`TestTenantCreateFailureCarriesNoPair`) |
+| `PATCH /:tenantId` | `admin.tenant.update` | `audit.TenantUpdated`, the dashboard's shape: `target` the tenant; Meta `enabled` when the body set it, `limits_changed` always (`TestTenantUpdateEventShape`) |
 | `DELETE /:tenantId` | `admin.tenant.delete` | `target` the tenant; Meta `app_id`, `external_id` read before the delete |
 | `POST .../devices` | `admin.device.provision` | Subject and `target` the new device, ClientID the pinned client ID |
 | `POST .../rotate`, `.../revoke`, `DELETE .../devices/:deviceId` | `admin.device.rotate`, `revoke`, `delete` | Subject and `target` the device |

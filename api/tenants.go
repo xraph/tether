@@ -57,11 +57,12 @@ func (a *API) registerTenants(r forge.Router) error {
 }
 
 // createTenant records its own audit event: the tenant is known only once
-// it exists, and the response is written here, not returned.
+// it exists, and the response is written here, not returned. Only a created
+// tenant's event carries the host pair: a failed one goes to the audit trail
+// with no tenant, so a caller cannot write into another tenant's trail by
+// asking for its pair.
 func (a *API) createTenant(c forge.Context, req *createTenantRequest) (*empty, error) {
-	ev := audit.Event{Action: audit.ActionTenantCreate, Meta: map[string]any{
-		audit.MetaAppID: req.AppID, audit.MetaExternalID: req.ExternalID,
-	}}
+	ev := audit.Event{Action: audit.ActionTenantCreate, Meta: map[string]any{}}
 
 	err := a.create(c, req, &ev)
 	a.record(c, ev, err)
@@ -87,6 +88,7 @@ func (a *API) create(c forge.Context, req *createTenantRequest, ev *audit.Event)
 
 	ev.TenantID = t.ID.String()
 	ev.Meta[audit.MetaTarget] = ev.TenantID
+	ev.Meta[audit.MetaAppID], ev.Meta[audit.MetaExternalID] = t.AppID, t.ExternalID
 
 	return c.JSON(http.StatusCreated, t)
 }
@@ -175,14 +177,10 @@ func (a *API) removeTenant(c forge.Context, req *tenantPath, ev *audit.Event) er
 	return c.NoContent(http.StatusNoContent)
 }
 
-// tenantUpdated describes PATCH /v1/tenants/:tenantId.
+// tenantUpdated describes PATCH /v1/tenants/:tenantId, in the same shape as
+// the dashboard's tenants.update (audit.TenantUpdated).
 func tenantUpdated(req *updateTenantRequest) audit.Event {
-	ev := audit.Event{Action: audit.ActionTenantUpdate, TenantID: req.TenantID, Meta: audit.Target(req.TenantID)}
-	if req.Enabled != nil {
-		ev.Meta["enabled"] = *req.Enabled
-	}
-
-	return ev
+	return audit.TenantUpdated(req.TenantID, req.Enabled, req.Limits != nil)
 }
 
 // tenantDeleted describes DELETE /v1/tenants/:tenantId.

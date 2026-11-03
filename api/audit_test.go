@@ -183,3 +183,50 @@ func TestAdminAuditCoversEveryChange(t *testing.T) {
 	assert.Equal(t, audit.OutcomeFailure, spy.of(audit.ActionSessionDelete)[0].Outcome)
 	assert.Equal(t, "nobody", spy.of(audit.ActionSessionDelete)[0].ClientID)
 }
+
+// A failed admin.tenant.create carries no host pair, so the audit writer
+// files it with no tenant: a caller can't write into another tenant's trail
+// by asking for its pair. A successful one carries the pair it created.
+func TestTenantCreateFailureCarriesNoPair(t *testing.T) {
+	spy := &auditSpy{}
+	e := newEnvWith(t, func(s *api.Services) { s.Audit = spy })
+
+	tid := e.createTenant("aorg_1", nil)
+
+	body := map[string]any{"app_id": testApp, "external_id": "aorg_1", "name": "again"}
+	expect(t, e.do(http.MethodPost, "/tether/v1/tenants", body), http.StatusConflict)
+
+	evs := spy.of(audit.ActionTenantCreate)
+	require.Len(t, evs, 2)
+
+	assert.Equal(t, audit.OutcomeSuccess, evs[0].Outcome)
+	assert.Equal(t, tid, evs[0].TenantID)
+	assert.Equal(t, testApp, evs[0].Meta[audit.MetaAppID])
+	assert.Equal(t, "aorg_1", evs[0].Meta[audit.MetaExternalID])
+
+	assert.Equal(t, audit.OutcomeFailure, evs[1].Outcome)
+	assert.Empty(t, evs[1].TenantID)
+	assert.NotContains(t, evs[1].Meta, audit.MetaAppID)
+	assert.NotContains(t, evs[1].Meta, audit.MetaExternalID)
+}
+
+// admin.tenant.update has the dashboard's shape: enabled when the change set
+// it, and limits_changed always.
+func TestTenantUpdateEventShape(t *testing.T) {
+	spy := &auditSpy{}
+	e := newEnvWith(t, func(s *api.Services) { s.Audit = spy })
+
+	tid := e.createTenant("aorg_1", nil)
+
+	expect(t, e.do(http.MethodPatch, tenantPath(tid), map[string]any{"enabled": false, "limits": map[string]any{"max_connections": 5}}), http.StatusOK)
+	expect(t, e.do(http.MethodPatch, tenantPath(tid), map[string]any{"name": "renamed"}), http.StatusOK)
+
+	evs := spy.of(audit.ActionTenantUpdate)
+	require.Len(t, evs, 2)
+
+	assert.Equal(t, false, evs[0].Meta["enabled"])
+	assert.Equal(t, true, evs[0].Meta["limits_changed"])
+
+	assert.NotContains(t, evs[1].Meta, "enabled")
+	assert.Equal(t, false, evs[1].Meta["limits_changed"])
+}

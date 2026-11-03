@@ -72,9 +72,13 @@ const (
 	// MetaTopic is the tenant-relative topic of a denied PUBLISH or the
 	// filter of a denied SUBSCRIBE.
 	MetaTopic = "topic"
-	// MetaSuppressed is the number of identical ACL denials the Recorder
-	// counted, and did not record, within one DenyWindow.
+	// MetaSuppressed is the number of identical ACL denials, or refused
+	// CONNECTs, the Recorder counted, and did not record, within one
+	// DenyWindow.
 	MetaSuppressed = "suppressed"
+	// MetaRemote is the network address ("host:port") a refused CONNECT
+	// came from.
+	MetaRemote = "remote"
 	// MetaTarget is what an admin change acted on, when the event's
 	// ClientID does not say: a tenant, device or role ID, or a topic.
 	MetaTarget = "target"
@@ -90,6 +94,29 @@ const (
 // tenant, device or role ID, or a topic.
 func Target(target string) map[string]any {
 	return map[string]any{MetaTarget: target}
+}
+
+// Meta keys of admin.tenant.update.
+const (
+	// MetaEnabled is the enabled flag a tenant update set, present only when
+	// the update set it.
+	MetaEnabled = "enabled"
+	// MetaLimitsChanged is true when a tenant update replaced the limits.
+	MetaLimitsChanged = "limits_changed"
+)
+
+// TenantUpdated is the admin.tenant.update event of tenantID, the one shape
+// the REST API and the dashboard share: enabled when the change set it (nil
+// leaves it out), and limits_changed always.
+func TenantUpdated(tenantID string, enabled *bool, limitsChanged bool) Event {
+	ev := Event{Action: ActionTenantUpdate, TenantID: tenantID, Meta: Target(tenantID)}
+	if enabled != nil {
+		ev.Meta[MetaEnabled] = *enabled
+	}
+
+	ev.Meta[MetaLimitsChanged] = limitsChanged
+
+	return ev
 }
 
 // Event is one thing that happened.
@@ -181,7 +208,8 @@ type Config struct {
 	// Writers is how many goroutines hand events to the sink.
 	Writers int `json:"writers" yaml:"writers"`
 	// DenyWindow is how long one ACL denial of a client, operation and
-	// topic is recorded only once.
+	// topic, and one refused CONNECT of a tenant, reason, remote host and
+	// username, is recorded only once.
 	DenyWindow time.Duration `json:"deny_window" yaml:"deny_window"`
 }
 
