@@ -3,6 +3,7 @@ package metering_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -96,8 +97,16 @@ func entCfg(interval time.Duration, features ...string) metering.EntitlementConf
 	return cfg
 }
 
+// numbered is the i-th of 40 extra tenants every newEnt knows.
+func numbered(i int) string { return fmt.Sprintf("ttnt_n%02d", i) }
+
 func newEnt(cfg metering.EntitlementConfig, chk metering.Checker) *metering.Entitlements {
-	return metering.NewEntitlements(cfg, newTenants(acme, zetaT, betaT), chk, quietLogger())
+	ts := newTenants(acme, zetaT, betaT)
+	for i := range 40 {
+		ts.byID[numbered(i)] = metering.Tenant{ID: numbered(i), AppID: "app_1", ExternalID: "ext-" + numbered(i)}
+	}
+
+	return metering.NewEntitlements(cfg, ts, chk, quietLogger())
 }
 
 // waitTime bounds every waitFor. It is generous: the machine running these
@@ -183,6 +192,7 @@ func TestEntitlementConfigValidate(t *testing.T) {
 		"duplicate key":     func(c *metering.EntitlementConfig) { c.Features = []string{"a", "a"} },
 		"zero interval":     func(c *metering.EntitlementConfig) { c.Interval = 0 },
 		"zero timeout":      func(c *metering.EntitlementConfig) { c.CheckTimeout = 0 },
+		"timeout of 10 s":   func(c *metering.EntitlementConfig) { c.CheckTimeout = 10 * time.Second },
 		"negative failopen": func(c *metering.EntitlementConfig) { c.FailOpen = -time.Second },
 	}
 
@@ -268,7 +278,10 @@ func TestLedgerOutageKeepsLastAnswer(t *testing.T) {
 	chk := newChecker()
 	chk.refuse[betaT.ID+" tether.access"] = "no plan"
 
-	cfg := entCfg(50 * time.Millisecond)
+	// Long enough that the first Allows during the outage are answered
+	// from a fresh decision, and the later ones from a stale one that
+	// starts a refresh into the outage.
+	cfg := entCfg(300 * time.Millisecond)
 	cfg.CheckTimeout = 200 * time.Millisecond
 	cfg.FailOpen = time.Hour
 	e := newEnt(cfg, chk)
@@ -435,4 +448,277 @@ func TestRunEndsWithContext(t *testing.T) {
 
 	waitFor(t, "a check in flight", func() bool { return chk.count(acme.ID) > 0 })
 	stop()
+}
+
+func TestNewEntitlementsPanicsWithoutTenantsOrChecker(t *testing.T) {
+	for name, build := range map[string]func(){
+		"no tenants": func() { metering.NewEntitlements(entCfg(time.Minute), nil, newChecker(), nil) },
+		"no checker": func() { metering.NewEntitlements(entCfg(time.Minute), newTenants(), nil, nil) },
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("%s: NewEntitlements did not panic", name)
+				}
+			}()
+
+			build()
+		}()
+	}
+}
+
+// R14: a tenant with a fresh decision is answered at once while Run's forced
+// check of it hangs.
+func TestFreshDecisionDoesNotWaitForRun(t *testing.T) {
+	const interval = time.Second
+
+	chk := newChecker()
+	cfg := entCfg(interval)
+	cfg.CheckTimeout = 5 * time.Second
+	e := newEnt(cfg, chk)
+
+	var (
+		mu       sync.Mutex
+		liveIDs  []string
+		firstRun = make(chan struct{})
+		once     sync.Once
+	)
+
+	runEnt(t, e, func() []string {
+		once.Do(func() { close(firstRun) })
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		return slices.Clone(liveIDs)
+	}, func(string) {})
+
+	// Decide half an Interval after Run's first tick, so its next tick
+	// lands on a decision half an Interval old.
+	select {
+	case <-firstRun:
+	case <-time.After(waitTime):
+		t.Fatal("Run never ticked")
+	}
+
+	time.Sleep(interval / 2)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+
+	decided := time.Now()
+
+	chk.set(func(c *fakeChecker) { c.hang = true })
+	mu.Lock()
+	liveIDs = []string{acme.ID}
+	mu.Unlock()
+
+	n := chk.count(acme.ID)
+	waitFor(t, "Run's check to hang", func() bool { return chk.count(acme.ID) > n })
+
+	for range 20 {
+		start := time.Now()
+		if err := e.Allow(t.Context(), acme.ID); err != nil {
+			t.Fatalf("Allow while Run's check hangs: %v", err)
+		}
+
+		if d := time.Since(start); d > 100*time.Millisecond {
+			t.Fatalf("Allow took %s with a decision %s old", d, start.Sub(decided))
+		}
+	}
+
+	if age := time.Since(decided); age >= interval {
+		t.Skipf("the machine is too slow: the decision got %s old, it is no longer fresh", age)
+	}
+
+	if got := chk.count(acme.ID); got != n+1 {
+		t.Fatalf("%d checks, want only Run's (%d)", got, n+1)
+	}
+}
+
+// R14: a stale decision is answered at once and starts exactly one
+// background check.
+func TestStaleDecisionRefreshesInBackground(t *testing.T) {
+	chk := newChecker()
+	cfg := entCfg(50 * time.Millisecond)
+	cfg.CheckTimeout = 2 * time.Second
+	e := newEnt(cfg, chk)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow: %v", err)
+	}
+
+	decided := time.Now()
+	waitFor(t, "the decision to go stale", func() bool { return time.Since(decided) > cfg.Interval })
+
+	chk.set(func(c *fakeChecker) { c.hang = true })
+	n := chk.count(acme.ID)
+
+	for range 10 {
+		start := time.Now()
+		if err := e.Allow(t.Context(), acme.ID); err != nil {
+			t.Fatalf("Allow with a stale decision: %v", err)
+		}
+
+		if d := time.Since(start); d > 100*time.Millisecond {
+			t.Fatalf("Allow took %s with a stale decision", d)
+		}
+	}
+
+	waitFor(t, "the background check", func() bool { return chk.count(acme.ID) > n })
+
+	if got := chk.count(acme.ID); got != n+1 {
+		t.Fatalf("%d background checks, want 1", got-n)
+	}
+}
+
+// R14: an undecided tenant waits CheckTimeout at most in all, even when the
+// check it waited for is abandoned and it has to start its own.
+func TestUndecidedWaitIsBoundedInTotal(t *testing.T) {
+	chk := newChecker()
+	chk.hang = true
+
+	cfg := entCfg(time.Minute)
+	cfg.CheckTimeout = 300 * time.Millisecond
+	e := newEnt(cfg, chk)
+
+	actx, cancelA := context.WithCancel(t.Context())
+	defer cancelA()
+
+	go func() { _ = e.Allow(actx, zetaT.ID) }()
+
+	waitFor(t, "the first check", func() bool { return chk.count(zetaT.ID) == 1 })
+
+	errB := make(chan error, 1)
+	startB := time.Now()
+
+	go func() { errB <- e.Allow(t.Context(), zetaT.ID) }()
+
+	// The first caller leaves partway through B's wait.
+	time.Sleep(cfg.CheckTimeout / 2)
+	cancelA()
+
+	select {
+	case err := <-errB:
+		if d := time.Since(startB); d > cfg.CheckTimeout+100*time.Millisecond {
+			t.Fatalf("the waiter took %s, want at most %s", d, cfg.CheckTimeout+100*time.Millisecond)
+		}
+
+		if err != nil {
+			t.Fatalf("undecided tenant early in an outage: %v", err)
+		}
+	case <-time.After(waitTime):
+		t.Fatal("the waiter never returned")
+	}
+}
+
+// R15: an undecided tenant is gated by the node's outage clock, a decided
+// one by its own, and any successful check resets the node's clock.
+func TestNodeOutageClockGatesUndecidedTenants(t *testing.T) {
+	chk := newChecker()
+	cfg := entCfg(20 * time.Millisecond)
+	cfg.CheckTimeout = 50 * time.Millisecond
+	cfg.FailOpen = 300 * time.Millisecond
+	e := newEnt(cfg, chk)
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("Allow before the outage: %v", err)
+	}
+
+	down := errors.New("ledger down")
+	chk.set(func(c *fakeChecker) { c.fail = down })
+
+	// The first failed check starts the node's clock.
+	if err := e.Allow(t.Context(), numbered(0)); err != nil {
+		t.Fatalf("first undecided tenant in the outage: %v", err)
+	}
+
+	outage := time.Now()
+	waitFor(t, "FailOpen to pass", func() bool { return time.Since(outage) > cfg.FailOpen })
+
+	// A tenant seen for the first time now does not get a window of its own.
+	err := e.Allow(t.Context(), numbered(1))
+	if err == nil || errors.Is(err, broker.ErrNotEntitled) || !errors.Is(err, down) {
+		t.Fatalf("new undecided tenant past the node's FailOpen: got %v, want the outage error", err)
+	}
+
+	// acme had a decision and has not checked into the outage yet: its first
+	// failed check starts its own clock, and it stays allowed.
+	for range 3 {
+		if err := e.Allow(t.Context(), acme.ID); err != nil {
+			t.Fatalf("decided tenant on its own clock: %v", err)
+		}
+	}
+
+	n := chk.count(acme.ID)
+	waitFor(t, "acme's check into the outage", func() bool {
+		_ = e.Allow(t.Context(), acme.ID)
+
+		return chk.count(acme.ID) > n
+	})
+
+	if err := e.Allow(t.Context(), acme.ID); err != nil {
+		t.Fatalf("decided tenant early on its own clock: %v", err)
+	}
+
+	// One successful check resets the node's clock.
+	chk.set(func(c *fakeChecker) { c.fail = nil })
+
+	if err := e.Allow(t.Context(), numbered(2)); err != nil {
+		t.Fatalf("Allow once ledger answers: %v", err)
+	}
+
+	chk.set(func(c *fakeChecker) { c.fail = down })
+
+	if err := e.Allow(t.Context(), numbered(3)); err != nil {
+		t.Fatalf("undecided tenant after the clock was reset: %v", err)
+	}
+}
+
+// R16: 32 CONNECT-time checks in flight fill the node; the 33rd is a failed
+// check that never reaches the Checker.
+func TestConnectChecksLimitedTo32(t *testing.T) {
+	chk := newChecker()
+	chk.hang = true
+
+	cfg := entCfg(time.Minute)
+	cfg.CheckTimeout = 5 * time.Second
+	e := newEnt(cfg, chk)
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	for i := range 32 {
+		wg.Go(func() { _ = e.Allow(ctx, numbered(i)) })
+	}
+
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
+
+	waitFor(t, "32 checks in flight", func() bool {
+		n := 0
+		for i := range 32 {
+			n += chk.count(numbered(i))
+		}
+
+		return n == 32
+	})
+
+	start := time.Now()
+
+	if err := e.Allow(t.Context(), numbered(32)); err != nil {
+		t.Fatalf("33rd tenant early in the outage it started: %v", err)
+	}
+
+	if d := time.Since(start); d > 100*time.Millisecond {
+		t.Fatalf("the 33rd Allow took %s, want no wait", d)
+	}
+
+	if n := chk.count(numbered(32)); n != 0 {
+		t.Fatalf("the 33rd check reached the Checker %d times", n)
+	}
 }

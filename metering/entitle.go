@@ -56,8 +56,8 @@ func DefaultEntitlementConfig() EntitlementConfig {
 
 // Validate reports a feature key that is longer than 64 bytes, has a byte
 // outside [-_.a-zA-Z0-9] or is listed twice. When the checks are enabled it
-// also reports an empty feature list and a non-positive interval, check
-// timeout or fail-open.
+// also reports an empty feature list, a non-positive interval, check timeout
+// or fail-open, and a check timeout of MaxCheckTimeout (10 s) or more.
 func (c EntitlementConfig) Validate() error {
 	seen := make(map[string]bool, len(c.Features))
 
@@ -90,32 +90,69 @@ func (c EntitlementConfig) Validate() error {
 		}
 	}
 
+	if c.CheckTimeout >= MaxCheckTimeout {
+		return fmt.Errorf("metering: entitlements.check_timeout must be under %s (the broker's CONNECT bound), got %s",
+			MaxCheckTimeout, c.CheckTimeout)
+	}
+
 	return nil
 }
 
+// MaxCheckTimeout is the bound EntitlementConfig.Validate holds CheckTimeout
+// under: the broker gives a whole CONNECT 10 s, and a check that took all of
+// it would leave nothing for the rest.
+const MaxCheckTimeout = 10 * time.Second
+
 // runParallel is how many tenants Run checks at once.
 const runParallel = 8
+
+// connectChecks is how many CONNECT-time checks (an undecided tenant's
+// blocking check and the background refreshes) may run at once on the node
+// (ruling R16). Run's checks do not count against it.
+const connectChecks = 32
+
+// errCheckBusy is the failure a CONNECT-time check records when the node
+// already runs connectChecks of them.
+var errCheckBusy = errors.New("metering: too many entitlement checks in flight")
+
+// errNoAnswer is the failure an undecided tenant's CONNECT reports when its
+// wait for a check ran out before any check recorded one.
+var errNoAnswer = errors.New("metering: no entitlement answer in time")
 
 // Entitlements answers the broker's CONNECT check (broker.Entitlement) from
 // decisions it keeps per tenant, and Run re-checks the live tenants every
 // Interval, disconnecting a tenant that lost its entitlement.
 //
-// A decision younger than Interval is used as is. An older one, or none, is
-// checked again: every feature, within CheckTimeout, one check per tenant at
-// a time (concurrent CONNECTs of the tenant wait for it and share it). A
-// failed check (no answer) leaves the last decision in place for FailOpen,
-// counted per tenant from its first failed check since its last answer; a
-// tenant with no decision yet is let in meanwhile. Past FailOpen new CONNECTs
-// are refused with an error that is not broker.ErrNotEntitled (0x88). A
-// failed check never disconnects anyone.
+// A tenant with a decision or a failed check younger than Interval plus
+// FailOpen is answered from memory at once (ruling R14). When its last check
+// is older than Interval, a background refresh starts, one per tenant at a
+// time, bounded by CheckTimeout, and the caller does not wait for it. Only a
+// tenant with nothing remembered waits, for CheckTimeout at most in all.
+//
+// A failed check (no answer) leaves a tenant's last decision in place for
+// FailOpen from its own first failed check since its last answer. A tenant
+// with no decision is let in while the node's outage clock (the first failed
+// check of any tenant with no successful check since) is younger than
+// FailOpen, and refused with an error that is not broker.ErrNotEntitled
+// (0x88) after it (ruling R15). A decided tenant past its own FailOpen is
+// refused the same way. A failed check never disconnects anyone.
+//
+// At most 32 CONNECT-time checks run at once on the node; one that cannot
+// start counts as a failed check (ruling R16).
 type Entitlements struct {
 	cfg     EntitlementConfig
 	tenants Tenants
 	chk     Checker
 	log     *slog.Logger
 
+	// slots holds one token per CONNECT-time check in flight.
+	slots chan struct{}
+
 	mu     sync.Mutex
 	states map[string]*entState
+	// nodeOutageSince is when a check of any tenant first failed with no
+	// successful check since; zero while checks answer.
+	nodeOutageSince time.Time
 }
 
 // entState is one tenant's decision. Entitlements.mu guards it.
@@ -126,8 +163,8 @@ type entState struct {
 	known   bool
 	allowed bool
 	refusal error
-	// outageSince is when checks started failing, zero while they answer;
-	// lastErr is the latest failure.
+	// outageSince is when this tenant's checks started failing, zero while
+	// they answer; lastErr is the latest failure.
 	outageSince time.Time
 	lastErr     error
 	// warnedOpen and warnedClosed keep the outage warnings to one each.
@@ -138,12 +175,25 @@ type entState struct {
 	inflight chan struct{}
 }
 
+// result is what one tenant's checks came to.
+type result struct {
+	allowed bool
+	refusal error
+	err     error
+}
+
 var _ broker.Entitlement = (*Entitlements)(nil)
 
 // NewEntitlements returns Entitlements over tenants and chk. A non-positive
 // Interval, CheckTimeout or FailOpen takes its default, as does an empty
-// feature list. A nil logger uses slog.Default().
+// feature list. A nil logger uses slog.Default(). It panics when tenants or
+// chk is nil: that is a wiring mistake, and it shows at construction rather
+// than at the first CONNECT.
 func NewEntitlements(cfg EntitlementConfig, tenants Tenants, chk Checker, logger *slog.Logger) *Entitlements {
+	if tenants == nil || chk == nil {
+		panic("metering: NewEntitlements needs non-nil Tenants and Checker")
+	}
+
 	def := DefaultEntitlementConfig()
 
 	if len(cfg.Features) == 0 {
@@ -168,19 +218,96 @@ func NewEntitlements(cfg EntitlementConfig, tenants Tenants, chk Checker, logger
 		logger = slog.Default()
 	}
 
-	return &Entitlements{cfg: cfg, tenants: tenants, chk: chk, log: logger, states: make(map[string]*entState)}
+	return &Entitlements{
+		cfg: cfg, tenants: tenants, chk: chk, log: logger,
+		slots:  make(chan struct{}, connectChecks),
+		states: make(map[string]*entState),
+	}
 }
 
-// Allow implements broker.Entitlement. It answers from memory when the
-// tenant's decision is younger than Interval, and otherwise checks first,
-// waiting at most CheckTimeout. Not enabled, it lets every tenant in.
+// Allow implements broker.Entitlement. A tenant with anything remembered is
+// answered at once (refreshed in the background when its last check is older
+// than Interval); one with nothing remembered waits for a check, CheckTimeout
+// at most in all. Not enabled, it lets every tenant in.
 func (e *Entitlements) Allow(ctx context.Context, tenantID string) error {
 	if !e.cfg.Enabled {
 		return nil
 	}
 
-	if err := e.decide(ctx, tenantID, false); err != nil {
-		return fmt.Errorf("metering: entitlement of tenant %s: %w", tenantID, err)
+	deadline := time.Now().Add(e.cfg.CheckTimeout)
+
+	for {
+		e.mu.Lock()
+		s := e.stateLocked(tenantID)
+		now := time.Now()
+
+		if e.rememberedLocked(s, now) {
+			if s.inflight == nil && now.Sub(s.checked) >= e.cfg.Interval {
+				e.refreshLocked(tenantID, s)
+			}
+
+			err := e.answerLocked(tenantID, s, now)
+			e.mu.Unlock()
+
+			return err
+		}
+
+		if w := s.inflight; w != nil {
+			e.mu.Unlock()
+
+			if err := waitUntil(ctx, w, deadline); err != nil {
+				return e.gaveUp(ctx, tenantID)
+			}
+
+			continue
+		}
+
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			e.mu.Unlock()
+
+			return e.gaveUp(ctx, tenantID)
+		}
+
+		done := make(chan struct{})
+		s.inflight = done
+
+		if !e.takeSlot() {
+			e.recordLocked(tenantID, s, done, result{err: errCheckBusy})
+			err := e.answerLocked(tenantID, s, now)
+			e.mu.Unlock()
+
+			return err
+		}
+
+		e.mu.Unlock()
+
+		r := e.ask(ctx, tenantID, timeout)
+		e.releaseSlot()
+
+		e.mu.Lock()
+
+		if ctx.Err() != nil {
+			// The caller went away, which says nothing about ledger.
+			e.endLocked(s, done)
+			e.mu.Unlock()
+
+			return fmt.Errorf("metering: entitlement of tenant %s: %w", tenantID, ctx.Err())
+		}
+
+		e.recordLocked(tenantID, s, done, r)
+		err := e.answerLocked(tenantID, s, time.Now())
+		e.mu.Unlock()
+
+		return err
+	}
+}
+
+// gaveUp is Allow's answer for a tenant whose wait ran out: ctx's error when
+// ctx ended, else the outage rules for what is remembered by now.
+func (e *Entitlements) gaveUp(ctx context.Context, tenantID string) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("metering: entitlement of tenant %s: %w", tenantID, ctx.Err())
 	}
 
 	e.mu.Lock()
@@ -189,11 +316,67 @@ func (e *Entitlements) Allow(ctx context.Context, tenantID string) error {
 	return e.answerLocked(tenantID, e.stateLocked(tenantID), time.Now())
 }
 
+// waitUntil waits for w to close, and returns an error when ctx ends or the
+// deadline passes first.
+func waitUntil(ctx context.Context, w <-chan struct{}, deadline time.Time) error {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	select {
+	case <-w:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errNoAnswer
+	}
+}
+
+// rememberedLocked reports whether s holds a decision or a failed check
+// younger than Interval plus FailOpen.
+func (e *Entitlements) rememberedLocked(s *entState, now time.Time) bool {
+	return (s.known || !s.outageSince.IsZero()) && now.Sub(s.checked) < e.cfg.Interval+e.cfg.FailOpen
+}
+
+// refreshLocked starts a background check of tenantID, which nobody waits
+// for. Without a free slot it records a failed check instead.
+func (e *Entitlements) refreshLocked(tenantID string, s *entState) {
+	done := make(chan struct{})
+	s.inflight = done
+
+	if !e.takeSlot() {
+		e.recordLocked(tenantID, s, done, result{err: errCheckBusy})
+
+		return
+	}
+
+	go func() {
+		r := e.ask(context.Background(), tenantID, e.cfg.CheckTimeout)
+		e.releaseSlot()
+
+		e.mu.Lock()
+		e.recordLocked(tenantID, s, done, r)
+		e.mu.Unlock()
+	}()
+}
+
+func (e *Entitlements) takeSlot() bool {
+	select {
+	case e.slots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (e *Entitlements) releaseSlot() { <-e.slots }
+
 // Run checks every tenant live returns once per Interval, until ctx ends, and
 // calls disconnect for a tenant whose check refuses it, once per refusal: a
 // tenant that stays refused is not disconnected again, and one allowed again
 // can be disconnected the next time it loses. A check that fails disconnects
-// nobody. Not enabled, Run returns at once.
+// nobody. Run's checks are not limited by the CONNECT-time limit; it checks
+// 8 tenants at a time. Not enabled, Run returns at once.
 //
 // The extension passes the broker's LiveTenants and DisconnectTenant with
 // 0x97 quota exceeded.
@@ -251,7 +434,7 @@ func (e *Entitlements) sweep(ctx context.Context, tenantIDs []string, disconnect
 func (e *Entitlements) lost(ctx context.Context, tenantID string) bool {
 	start := time.Now()
 
-	if e.decide(ctx, tenantID, true) != nil {
+	if e.forceCheck(ctx, tenantID) != nil {
 		return false
 	}
 
@@ -271,8 +454,46 @@ func (e *Entitlements) lost(ctx context.Context, tenantID string) bool {
 	return true
 }
 
-// prune drops the decisions nobody asked about for longer than Interval plus
-// FailOpen: past that they could not be used even during an outage.
+// forceCheck checks tenantID now for Run. A check already in flight (a
+// CONNECT's or a refresh, each bounded by CheckTimeout) is waited for and
+// taken as this one. It returns ctx's error when ctx ends first.
+func (e *Entitlements) forceCheck(ctx context.Context, tenantID string) error {
+	e.mu.Lock()
+	s := e.stateLocked(tenantID)
+
+	if w := s.inflight; w != nil {
+		e.mu.Unlock()
+
+		select {
+		case <-w:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	done := make(chan struct{})
+	s.inflight = done
+	e.mu.Unlock()
+
+	r := e.ask(ctx, tenantID, e.cfg.CheckTimeout)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if ctx.Err() != nil {
+		e.endLocked(s, done)
+
+		return ctx.Err()
+	}
+
+	e.recordLocked(tenantID, s, done, r)
+
+	return nil
+}
+
+// prune drops the states nobody asked about for longer than Interval plus
+// FailOpen: past that they are not used even during an outage.
 func (e *Entitlements) prune(now time.Time) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -284,183 +505,143 @@ func (e *Entitlements) prune(now time.Time) {
 	}
 }
 
-// decide makes tenantID's state current. Without force a decision (or failed
-// check) younger than Interval is current already; with force only a check
-// that ended while decide waited for it is. A check already in flight is
-// waited for rather than repeated. It returns ctx's error when ctx ends
-// before the state is current.
-func (e *Entitlements) decide(ctx context.Context, tenantID string, force bool) error {
-	waited := false
-
-	for {
-		e.mu.Lock()
-		s := e.stateLocked(tenantID)
-
-		if w := s.inflight; w != nil {
-			e.mu.Unlock()
-
-			select {
-			case <-w:
-				waited = true
-
-				continue
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-
-		if (!force || waited) && !s.checked.IsZero() && time.Since(s.checked) < e.cfg.Interval {
-			e.mu.Unlock()
-
-			return nil
-		}
-
-		done := make(chan struct{})
-		s.inflight = done
-		e.mu.Unlock()
-
-		e.check(ctx, tenantID, s, done)
-
-		return ctx.Err()
+// endLocked ends the in-flight check done of s without recording anything.
+func (e *Entitlements) endLocked(s *entState, done chan struct{}) {
+	if s.inflight == done {
+		s.inflight = nil
 	}
+
+	close(done)
 }
 
-// check runs tenantID's checks and records the outcome in s, unless ctx
-// ended first (the caller went away, which says nothing about the billing
-// system). It ends the in-flight check done.
-func (e *Entitlements) check(ctx context.Context, tenantID string, s *entState, done chan struct{}) {
-	allowed, refusal, err := e.ask(ctx, tenantID)
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	s.inflight = nil
-	close(done)
-
-	if ctx.Err() != nil {
-		return
-	}
+// recordLocked records r as tenantID's latest check, ends the in-flight check
+// done and moves the node's outage clock.
+func (e *Entitlements) recordLocked(tenantID string, s *entState, done chan struct{}, r result) {
+	e.endLocked(s, done)
 
 	now := time.Now()
 	s.checked = now
 
-	if err != nil {
+	if r.err != nil {
+		if e.nodeOutageSince.IsZero() {
+			e.nodeOutageSince = now
+		}
+
 		if s.outageSince.IsZero() {
 			s.outageSince = now
 			e.log.Warn("metering: entitlement check failed, keeping the last decision", "tenant", tenantID,
-				"fail_open", e.cfg.FailOpen, "error", err)
+				"fail_open", e.cfg.FailOpen, "error", r.err)
 		}
 
-		s.lastErr = err
+		s.lastErr = r.err
 
 		return
 	}
+
+	e.nodeOutageSince = time.Time{}
 
 	if !s.outageSince.IsZero() {
 		e.log.Info("metering: entitlement checks answer again", "tenant", tenantID)
 	}
 
-	s.known, s.allowed, s.refusal = true, allowed, refusal
+	s.known, s.allowed, s.refusal = true, r.allowed, r.refusal
 	s.outageSince, s.lastErr = time.Time{}, nil
 	s.warnedOpen, s.warnedClosed = false, false
 
-	if allowed {
+	if r.allowed {
 		s.acted = false
 	}
 }
 
-// ask checks every feature for tenantID within CheckTimeout. It returns
-// allowed when all are, the first refusal as an error wrapping
-// broker.ErrNotEntitled, or err when there was no answer. The checks run on
+// ask checks every feature for tenantID within timeout. The checks run on
 // their own goroutine, so a Checker that ignores its context still cannot
-// hold the caller past CheckTimeout.
-func (e *Entitlements) ask(ctx context.Context, tenantID string) (allowed bool, refusal, err error) {
-	ctx, cancel := context.WithTimeout(ctx, e.cfg.CheckTimeout)
+// hold the caller past timeout.
+func (e *Entitlements) ask(ctx context.Context, tenantID string, timeout time.Duration) result {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	type answer struct {
-		allowed bool
-		refusal error
-		err     error
-	}
+	out := make(chan result, 1)
 
-	out := make(chan answer, 1)
-
-	go func() {
-		var a answer
-		a.allowed, a.refusal, a.err = e.askAll(ctx, tenantID)
-		out <- a
-	}()
+	go func() { out <- e.askAll(ctx, tenantID) }()
 
 	select {
-	case a := <-out:
-		return a.allowed, a.refusal, a.err
+	case r := <-out:
+		return r
 	case <-ctx.Done():
-		return false, nil, fmt.Errorf("metering: entitlement check of tenant %s: %w", tenantID, ctx.Err())
+		return result{err: fmt.Errorf("metering: entitlement check of tenant %s: %w", tenantID, ctx.Err())}
 	}
 }
 
-func (e *Entitlements) askAll(ctx context.Context, tenantID string) (allowed bool, refusal, err error) {
+// askAll is allowed when every feature is, the first refusal as an error
+// wrapping broker.ErrNotEntitled, or err when there was no answer.
+func (e *Entitlements) askAll(ctx context.Context, tenantID string) result {
 	t, err := e.tenants.Get(ctx, tenantID)
 	if err != nil {
-		return false, nil, fmt.Errorf("metering: tenant %s: %w", tenantID, err)
+		return result{err: fmt.Errorf("metering: tenant %s: %w", tenantID, err)}
 	}
 
 	for _, feature := range e.cfg.Features {
 		ok, reason, err := e.chk.Check(ctx, t, feature)
 		if err != nil {
-			return false, nil, fmt.Errorf("metering: checking %s: %w", feature, err)
+			return result{err: fmt.Errorf("metering: checking %s: %w", feature, err)}
 		}
 
 		if !ok {
-			return false, fmt.Errorf("%w: %s: %s", broker.ErrNotEntitled, feature, reason), nil
+			return result{refusal: fmt.Errorf("%w: %s: %s", broker.ErrNotEntitled, feature, reason)}
 		}
 	}
 
-	return true, nil, nil
+	return result{allowed: true}
 }
 
 // answerLocked is Allow's answer from s at now.
 func (e *Entitlements) answerLocked(tenantID string, s *entState, now time.Time) error {
-	if s.outageSince.IsZero() {
-		if !s.known {
-			// decide returned without a check that answered; it cannot,
-			// short of ctx ending, which Allow handles first.
-			return fmt.Errorf("metering: no entitlement decision for tenant %s", tenantID)
-		}
-
-		if s.allowed {
-			return nil
-		}
-
-		return s.refusal
+	cause := s.lastErr
+	if cause == nil {
+		cause = errNoAnswer
 	}
 
-	if age := now.Sub(s.outageSince); age >= e.cfg.FailOpen {
-		if !s.warnedClosed {
-			s.warnedClosed = true
-			e.log.Warn("metering: entitlement checks failing past fail_open, refusing new connections",
-				"tenant", tenantID, "since", s.outageSince, "error", s.lastErr)
+	if s.known {
+		if s.outageSince.IsZero() || now.Sub(s.outageSince) < e.cfg.FailOpen {
+			if s.allowed {
+				return nil
+			}
+
+			return s.refusal
 		}
 
-		return fmt.Errorf("metering: entitlement of tenant %s unknown for %s: %w", tenantID, age.Round(time.Second), s.lastErr)
+		age := now.Sub(s.outageSince)
+		e.warnClosedLocked(tenantID, s, age)
+
+		return fmt.Errorf("metering: entitlement of tenant %s unknown for %s: %w", tenantID, age.Round(time.Second), cause)
 	}
 
-	if !s.known {
-		if !s.warnedOpen {
-			s.warnedOpen = true
-			e.log.Warn("metering: letting a tenant in without an entitlement decision, checks are failing",
-				"tenant", tenantID, "error", s.lastErr)
-		}
+	// No decision: the node's outage clock decides (ruling R15).
+	if !e.nodeOutageSince.IsZero() && now.Sub(e.nodeOutageSince) >= e.cfg.FailOpen {
+		age := now.Sub(e.nodeOutageSince)
+		e.warnClosedLocked(tenantID, s, age)
 
-		return nil
+		return fmt.Errorf("metering: no entitlement decision for tenant %s, checks failing for %s: %w",
+			tenantID, age.Round(time.Second), cause)
 	}
 
-	if s.allowed {
-		return nil
+	if !s.warnedOpen {
+		s.warnedOpen = true
+		e.log.Warn("metering: letting a tenant in without an entitlement decision, checks are failing",
+			"tenant", tenantID, "error", cause)
 	}
 
-	return s.refusal
+	return nil
+}
+
+func (e *Entitlements) warnClosedLocked(tenantID string, s *entState, age time.Duration) {
+	if s.warnedClosed {
+		return
+	}
+
+	s.warnedClosed = true
+	e.log.Warn("metering: entitlement checks failing past fail_open, refusing new connections",
+		"tenant", tenantID, "for", age, "error", s.lastErr)
 }
 
 func (e *Entitlements) stateLocked(tenantID string) *entState {
