@@ -1,6 +1,7 @@
 // Command tether runs the Tether MQTT broker as a standalone server: a Forge
 // app with grove (SQLite or PostgreSQL), keysmith, warden, the Tether
-// extension and the Forge dashboard.
+// extension and the Forge dashboard, plus ledger when metering or
+// entitlements are on and chronicle when audit is on.
 package main
 
 import (
@@ -13,10 +14,12 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	chronicleext "github.com/xraph/chronicle/extension"
 	"github.com/xraph/forge"
 	dashboard "github.com/xraph/forge/extensions/dashboard"
 	"github.com/xraph/grove"
 	keysmithext "github.com/xraph/keysmith/extension"
+	ledgerext "github.com/xraph/ledger/extension"
 	"github.com/xraph/vessel"
 	wardenext "github.com/xraph/warden/extension"
 
@@ -146,8 +149,9 @@ func applyCluster(cfg *config, flagNodeID, envNodeID string) error {
 }
 
 // newApp builds the Forge app: a grove database (SQLite or PostgreSQL) in the container,
-// keysmith and warden with their own REST routes off, Tether, and the
-// dashboard. It does not start it.
+// keysmith and warden with their own REST routes off, ledger and chronicle
+// when the config needs them (productExtensions), Tether, and the dashboard.
+// It does not start it.
 //
 // The admin API is guarded by the bearer token. With an empty token it needs
 // insecure, and then the dashboard intents are open too. The returned func
@@ -215,12 +219,12 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 
 	ext := extension.New(extOpts...)
 
-	for _, x := range []forge.Extension{
-		ext.Keysmith(keysmithext.WithDisableRoutes()),
-		ext.Warden(wardenext.WithDisableRoutes()),
-		ext,
-		dashboard.NewExtension(),
-	} {
+	exts := make([]forge.Extension, 0, 6)
+	exts = append(exts, ext.Keysmith(keysmithext.WithDisableRoutes()), ext.Warden(wardenext.WithDisableRoutes()))
+	exts = append(exts, productExtensions(cfg.Tether)...)
+	exts = append(exts, ext, dashboard.NewExtension())
+
+	for _, x := range exts {
 		if err := app.RegisterExtension(x); err != nil {
 			_ = db.Close()
 
@@ -229,6 +233,25 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 	}
 
 	return app, func() { _ = db.Close() }, nil
+}
+
+// productExtensions returns ledger's extension when metering or entitlements
+// are on, and chronicle's when audit is on, both with their REST routes off.
+// Each finds the binary's grove database in the container, so it keeps its
+// tables next to Tether's, on SQLite or PostgreSQL alike. A part that is off
+// gets nothing: a ledger or chronicle in the app never turns a part on.
+func productExtensions(cfg extension.Config) []forge.Extension {
+	var out []forge.Extension
+
+	if cfg.Metering.Enabled || cfg.Entitlements.Enabled {
+		out = append(out, ledgerext.New(ledgerext.WithDisableRoutes()))
+	}
+
+	if cfg.Audit.Enabled {
+		out = append(out, chronicleext.New(chronicleext.WithDisableRoutes()))
+	}
+
+	return out
 }
 
 // natsDir is the embedded NATS store directory to create, "" when the node

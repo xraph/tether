@@ -2,7 +2,7 @@
 
 The standalone Tether server: `go install github.com/xraph/tether/cmd/tether@latest`, or `go build ./cmd/tether`.
 
-It builds a Forge app with a grove database (SQLite by default, PostgreSQL by config) in the container, keysmith (`ext.Keysmith(keysmithext.WithDisableRoutes())`), warden (`ext.Warden(wardenext.WithDisableRoutes())`), the Tether extension and the Forge dashboard extension, then calls `app.Run()`, which shuts down on SIGINT and SIGTERM.
+It builds a Forge app with a grove database (SQLite by default, PostgreSQL by config) in the container, keysmith (`ext.Keysmith(keysmithext.WithDisableRoutes())`), warden (`ext.Warden(wardenext.WithDisableRoutes())`), ledger and chronicle when the config needs them (`productExtensions`, below), the Tether extension and the Forge dashboard extension, then calls `app.Run()`, which shuts down on SIGINT and SIGTERM.
 
 ## Flags and environment
 
@@ -15,9 +15,13 @@ It builds a Forge app with a grove database (SQLite by default, PostgreSQL by co
 
 ## Config
 
-`tether.example.yaml` lists every key with its default. `server.http_address` (`:8080`), `server.sqlite_path` (`./data/tether.db`, used when the driver is sqlite), `server.database` (`driver: sqlite|postgres`, `postgresql` accepted for `postgres`, default sqlite, and `dsn`), and a `tether:` section that is `extension.Config` (`base_path`, `disable_routes`, `grove_database`, `dashboard_operators`, `broker.*`, with `broker.data_dir` defaulting to `./data/sessions`). The binary decodes the file over `defaultConfig()` itself and hands the result to the extension with `WithConfig`, then points Forge's own config loader at the same file (for the `dashboard:` section). Environment config sources are off (the binary itself reads only `TETHER_ADMIN_TOKEN`, `TETHER_NODE_ID` and `TETHER_DATABASE_DSN`). Data directories are created.
+`tether.example.yaml` lists every key with its default. `server.http_address` (`:8080`), `server.sqlite_path` (`./data/tether.db`, used when the driver is sqlite), `server.database` (`driver: sqlite|postgres`, `postgresql` accepted for `postgres`, default sqlite, and `dsn`), and a `tether:` section that is `extension.Config` (`base_path`, `disable_routes`, `grove_database`, `dashboard_operators`, `broker.*`, `metering`, `entitlements`, `audit`, with `broker.data_dir` defaulting to `./data/sessions`). The binary decodes the file over `defaultConfig()` itself and hands the result to the extension with `WithConfig`, then points Forge's own config loader at the same file (for the `dashboard:` section). Environment config sources are off (the binary itself reads only `TETHER_ADMIN_TOKEN`, `TETHER_NODE_ID` and `TETHER_DATABASE_DSN`). Data directories are created.
 
 `tether.cluster` is `cluster.Config` (off by default; see `extension/llm.txt` Cell). With it on in embedded mode, `applyCluster` refuses a cell of more than three nodes (itself plus more than two `embedded.routes`; the error says to run NATS yourself with `mode: external`, since every broker restart would otherwise be JetStream peer churn) and sets an empty `embedded.store_dir` to `./data/nats/<node id>`, which `newApp` creates, so nodes sharing a host never share JetStream data. External mode has no node cap. Nodes of a cell share tenants, keys and roles through the database: one SQLite file means one host, and a cell across hosts sets `server.database.driver: postgres` with the same DSN on every node.
+
+## Metering, entitlements and audit
+
+`tether.metering`, `tether.entitlements` and `tether.audit` (see `extension/llm.txt`, and `tether.example.yaml` for every key) are off by default. `productExtensions(cfg.Tether)` adds `ledgerext.New(ledgerext.WithDisableRoutes())` when `metering.enabled` or `entitlements.enabled`, and `chronicleext.New(chronicleext.WithDisableRoutes())` when `audit.enabled`, registered before Tether. Both find the binary's `*grove.DB` in the container (SQLite or Postgres, as `server.database` says) and migrate their own tables at Start. A part that is off registers nothing, so a binary with all three off is the same app as before. Their own sections (`ledger:`, `chronicle:`) in the same file reach them through Forge's config loader; routes stay off whatever those say, since the binary has no auth for them. `TestBinaryProductConfig` (all three on from a YAML file on SQLite: a tenant on a plan connects and publishes, one with none is refused, the tenant's create and connect reach chronicle) and `TestBinaryRegistersOnlyWhatIsOn`.
 
 ## Database
 

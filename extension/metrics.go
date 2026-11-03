@@ -29,6 +29,23 @@ const (
 	// "subscribe").
 	MetricACLDenials = "tether_acl_denials_total"
 
+	// The three below exist only while their part is enabled.
+
+	// MetricMeteringErrors counts the meter's failures: a usage value ledger
+	// did not take (a temporary error, retried in the next window, or a
+	// rejection, dropped) and a tenant it could not look up.
+	MetricMeteringErrors = "tether_metering_errors_total"
+
+	// MetricEntitlementChecks counts the feature checks that reached
+	// ledger, labelled result: "allowed", "denied" (ledger answered no) or
+	// "error" (no answer). A check skipped for want of a slot is not one.
+	MetricEntitlementChecks = "tether_entitlement_checks_total"
+
+	// MetricAuditDropped counts audit events the recorder dropped: its
+	// queue was full, or Stop ran out of time. It catches up with the
+	// recorder every 5 s and once more at Stop.
+	MetricAuditDropped = "tether_audit_dropped_total"
+
 	// The cell metrics below exist only when the node runs in a cell.
 
 	// MetricClusterFenced is a gauge, 1 while the node is fenced from its

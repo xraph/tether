@@ -1,9 +1,11 @@
 package extension
 
 import (
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/metering"
 )
 
 // DefaultBasePath is where the REST API mounts when the config names no
@@ -55,18 +57,44 @@ type Config struct {
 	// messages wait in the log. WithCluster sets the same thing.
 	Cluster cluster.Config `json:"cluster" yaml:"cluster"`
 
+	// Metering sends each tenant's usage (messages and bytes in and out,
+	// connection minutes) to ledger every interval, under the tenant's host
+	// pair. Off while metering.enabled is false, the default. On, Start
+	// needs ledger's extension in the app (ErrLedgerRequired). See
+	// metering.Config for the keys. WithMetering sets the same thing.
+	Metering metering.Config `json:"metering" yaml:"metering"`
+
+	// Entitlements refuses a CONNECT with 0x97 for a tenant whose ledger
+	// plan does not include every listed feature, and disconnects its live
+	// clients with 0x97 at the next check. Off while entitlements.enabled is
+	// false, the default. On, Start needs ledger's extension in the app
+	// (ErrLedgerRequired). See metering.EntitlementConfig for the keys.
+	// WithEntitlements sets the same thing.
+	Entitlements metering.EntitlementConfig `json:"entitlements" yaml:"entitlements"`
+
+	// Audit records connects, disconnects, refused CONNECTs, ACL denials,
+	// takeovers and admin changes in chronicle. Off while audit.enabled is
+	// false, the default. On, Start needs chronicle's extension in the app
+	// (ErrChronicleRequired). See audit.Config for the keys. WithAudit sets
+	// the same thing.
+	Audit audit.Config `json:"audit" yaml:"audit"`
+
 	// RequireConfig makes Register fail when the app's config has no
 	// tether section.
 	RequireConfig bool `json:"-" yaml:"-"`
 }
 
 // DefaultConfig returns the base path "/tether", broker.DefaultConfig (TCP on
-// :1883, 1 MiB packets, 7 day session cap, 1 KiB topics) and
-// cluster.DefaultConfig (off).
+// :1883, 1 MiB packets, 7 day session cap, 1 KiB topics),
+// cluster.DefaultConfig (off), and metering, entitlements and audit at their
+// packages' defaults (all off).
 func DefaultConfig() Config {
 	return Config{
-		BasePath: DefaultBasePath,
-		Broker:   broker.DefaultConfig(),
-		Cluster:  cluster.DefaultConfig(),
+		BasePath:     DefaultBasePath,
+		Broker:       broker.DefaultConfig(),
+		Cluster:      cluster.DefaultConfig(),
+		Metering:     metering.DefaultConfig(),
+		Entitlements: metering.DefaultEntitlementConfig(),
+		Audit:        audit.DefaultConfig(),
 	}
 }

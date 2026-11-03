@@ -3,9 +3,11 @@ package extension
 import (
 	"github.com/xraph/forge"
 
+	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/auth"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/cluster"
+	"github.com/xraph/tether/metering"
 	"github.com/xraph/tether/store"
 )
 
@@ -62,6 +64,62 @@ func WithCluster(cfg cluster.Config) Option {
 		cfg.Enabled = true
 		e.config.Cluster = cfg
 	}
+}
+
+// WithMetering sends each tenant's usage to ledger, configured by cfg. Start
+// from metering.DefaultConfig and set Enabled: the option takes cfg as it is,
+// so Enabled false leaves metering off, and an empty feature key turns that
+// meter off. A zero Interval takes the default (60 s). The app must register
+// ledger's extension, or Start fails with ErrLedgerRequired. The "metering"
+// block of the config file sets the same thing.
+func WithMetering(cfg metering.Config) Option {
+	return func(e *Extension) {
+		if cfg.Interval == 0 {
+			cfg.Interval = metering.DefaultConfig().Interval
+		}
+
+		e.config.Metering = cfg
+	}
+}
+
+// WithEntitlements checks each tenant's ledger plan at CONNECT and every
+// interval, configured by cfg: a tenant missing any of cfg.Features is
+// refused, and disconnected, with 0x97. Enabled false leaves it off. An empty
+// feature list and zero durations take metering.DefaultEntitlementConfig's.
+// The app must register ledger's extension, or Start fails with
+// ErrLedgerRequired. The "entitlements" block of the config file sets the
+// same thing.
+func WithEntitlements(cfg metering.EntitlementConfig) Option {
+	return func(e *Extension) {
+		def := metering.DefaultEntitlementConfig()
+
+		if len(cfg.Features) == 0 {
+			cfg.Features = def.Features
+		}
+
+		if cfg.Interval == 0 {
+			cfg.Interval = def.Interval
+		}
+
+		if cfg.CheckTimeout == 0 {
+			cfg.CheckTimeout = def.CheckTimeout
+		}
+
+		if cfg.FailOpen == 0 {
+			cfg.FailOpen = def.FailOpen
+		}
+
+		e.config.Entitlements = cfg
+	}
+}
+
+// WithAudit records the audit trail in chronicle, configured by cfg. Enabled
+// false leaves it off; an empty Events list and zero numbers take
+// audit.DefaultConfig's. The app must register chronicle's extension, or
+// Start fails with ErrChronicleRequired. The "audit" block of the config file
+// sets the same thing.
+func WithAudit(cfg audit.Config) Option {
+	return func(e *Extension) { e.config.Audit = cfg }
 }
 
 // WithJWT lets users and service accounts connect with an authsome JWT as the

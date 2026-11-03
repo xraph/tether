@@ -124,6 +124,9 @@ type Extension struct {
 	// cell is what Start made to run the node in its cell, nil without a
 	// cell. Stop closes it after the broker.
 	cell *cell
+	// product is what Start made for metering, entitlements and audit, for
+	// this broker run. Stop ends it around the broker's Stop.
+	product *product
 }
 
 // New returns the extension. Options override DefaultConfig; the app's
@@ -135,10 +138,13 @@ func New(opts ...Option) *Extension {
 		ksPlugin:      events.NewKeysmithPlugin(),
 		wdPlugin:      events.NewWardenPlugin(nil),
 	}
-	// grove is optional: forge skips a dependency that is not registered.
-	// When the grove extension is there it registers first, so its
-	// database and migration registry exist when Register looks for them.
-	e.SetDependencies([]string{"grove", "keysmith", "warden"})
+	// grove, ledger and chronicle are optional: forge skips a dependency
+	// that is not registered. When the grove extension is there it
+	// registers first, so its database and migration registry exist when
+	// Register looks for them. Ledger and chronicle start before Tether and
+	// stop after it, so the meter's last window and the audit drain reach
+	// them.
+	e.SetDependencies([]string{"grove", "keysmith", "warden", "ledger", "chronicle"})
 
 	for _, opt := range opts {
 		opt(e)
@@ -213,14 +219,16 @@ func (e *Extension) Register(app forge.App) error {
 }
 
 // Start wires and starts Tether. In order: the admin auth check, the
-// keysmith engine from the container (which must be the one the extension
-// from Keysmith owns, so the plugin is on it), the warden engine and its
-// plugin (registered now if Warden did not), the store (migrated),
-// the services, the cell when the config has one (connect, provision, the
+// metering, entitlements and audit configs and the ledger or chronicle they
+// need (ErrLedgerRequired, ErrChronicleRequired), the keysmith engine from
+// the container (which must be the one the extension from Keysmith owns, so
+// the plugin is on it), the warden engine and its plugin (registered now if
+// Warden did not), the store (migrated), the services, the cell when the config has one (connect, provision, the
 // cluster services, the tenant cache's eviction on the control bus), the
-// broker with the plugins bound to its reactor, the routes, the control bus,
-// the broker's listeners, and last Members, so the cell's callbacks find a
-// running broker. A failure undoes whatever had started.
+// audit recorder, the broker with the entitlement checks and the plugins
+// bound to its reactor, the routes, the control bus, the broker's listeners,
+// Members, so the cell's callbacks find a running broker, and last the meter
+// and the entitlement loop. A failure undoes whatever had started.
 //
 // Start is idempotent: on an extension that is already started it returns nil
 // and does nothing. That matters because *Extension is provided to the
@@ -242,6 +250,18 @@ func (e *Extension) Start(ctx context.Context) error {
 		return ErrAdminAuthRequired
 	}
 
+	// Ruling R13: every product config is checked before anything is built.
+	if err := e.validateProduct(); err != nil {
+		return err
+	}
+
+	slogger := newSlogLogger(e.Logger())
+
+	prod, err := e.newProduct(slogger)
+	if err != nil {
+		return err
+	}
+
 	ks, wd, err := e.engines()
 	if err != nil {
 		return err
@@ -252,9 +272,8 @@ func (e *Extension) Start(ctx context.Context) error {
 		return err
 	}
 
-	slogger := newSlogLogger(e.Logger())
-
-	tenants := service.NewTenants(st)
+	tenants := service.NewTenants(st, prod.tenantsOption())
+	prod.bindTenants(tenants)
 	authn := auth.NewKeysmith(ks, tenants, st)
 
 	connectAuth, err := e.connectAuth(authn, tenants)
@@ -278,16 +297,25 @@ func (e *Extension) Start(ctx context.Context) error {
 		metrics = newCellMetrics(e.Metrics())
 	}
 
-	b, err := broker.New(e.config.Broker, broker.Deps{
+	// The recorder runs before the broker exists, so nothing it emits is
+	// lost; the entitlement checks go into the broker's Deps.
+	prod.startAudit(e.config.Audit)
+	prod.buildEntitlements(e.config.Entitlements)
+
+	deps := broker.Deps{
 		Auth:    connectAuth,
 		Perms:   loader,
 		Limits:  limiter,
 		Logger:  slogger,
 		Metrics: metrics,
 		Cluster: cl.brokerDeps(),
-	})
+	}
+	prod.brokerDeps(&deps)
+
+	b, err := broker.New(e.config.Broker, deps)
 	if err != nil {
 		cl.close()
+		prod.abort(ctx)
 
 		return fmt.Errorf("tether: %w", err)
 	}
@@ -301,6 +329,7 @@ func (e *Extension) Start(ctx context.Context) error {
 	reactor, err := newReactor(authn, b, ctl, slogger)
 	if err != nil {
 		cl.close()
+		prod.abort(ctx)
 
 		return err
 	}
@@ -319,12 +348,14 @@ func (e *Extension) Start(ctx context.Context) error {
 		Limits:            limiter,
 		Logger:            slogger,
 		MaxPublishPayload: int(b.MaxPacketSize()),
+		Audit:             prod.emitter(),
 	}
 
 	if !e.config.DisableRoutes {
 		if err := e.mountRoutes(*services); err != nil {
 			e.unbind()
 			cl.close()
+			prod.abort(ctx)
 
 			return err
 		}
@@ -336,6 +367,7 @@ func (e *Extension) Start(ctx context.Context) error {
 		if err := ctl.Start(ctx); err != nil {
 			e.unbind()
 			cl.close()
+			prod.abort(ctx)
 
 			return fmt.Errorf("tether: start control bus: %w", err)
 		}
@@ -344,6 +376,7 @@ func (e *Extension) Start(ctx context.Context) error {
 	if err := b.Start(ctx); err != nil {
 		e.unbind()
 		cl.close()
+		prod.abort(ctx)
 
 		return fmt.Errorf("tether: start broker: %w", err)
 	}
@@ -360,12 +393,17 @@ func (e *Extension) Start(ctx context.Context) error {
 
 		cancel()
 		cl.close()
+		prod.abort(ctx)
 
 		return err
 	}
 
+	// Ruling R13: the meter starts only once the broker runs, and this
+	// broker run gets exactly one.
+	prod.run(e.config, b)
+
 	e.mu.Lock()
-	e.broker, e.services, e.active, e.started, e.cell = b, services, st, true, cl
+	e.broker, e.services, e.active, e.started, e.cell, e.product = b, services, st, true, cl, prod
 	e.mu.Unlock()
 
 	e.MarkStarted()
@@ -553,8 +591,9 @@ func (e *Extension) unbind() {
 	e.wdPlugin.Bind(nil)
 }
 
-// Stop unbinds the plugins and stops the broker, which disconnects every
-// client. In a cell it then stops Members, the control bus and the NATS
+// Stop unbinds the plugins, ends the entitlement checks and stops the broker,
+// which disconnects every client. The meter's last window and the audit
+// recorder's drain run after the broker and the cell. In a cell it then stops Members, the control bus and the NATS
 // connection (and the embedded server), in that order: Members goes after
 // the broker, since its peers take over this node's sessions and publish the
 // delayed wills it held once it stops heartbeating. The store is left open:
@@ -575,11 +614,17 @@ func (e *Extension) Stop(ctx context.Context) error {
 	e.unbind()
 
 	e.mu.Lock()
-	b, cl := e.broker, e.cell
-	e.started, e.cell = false, nil
+	b, cl, prod := e.broker, e.cell, e.product
+	e.started, e.cell, e.product = false, nil, nil
 	e.mu.Unlock()
 
 	e.MarkStopped()
+
+	// Ruling R17: the entitlement loop and its background refreshes end
+	// before the broker and ledger stop.
+	if prod != nil {
+		prod.stopChecks()
+	}
 
 	if b == nil {
 		cl.close()
@@ -592,6 +637,12 @@ func (e *Extension) Stop(ctx context.Context) error {
 	// After the broker: its clients are gone, so nothing is left to apply,
 	// and the cell may take over its sessions.
 	cl.close()
+
+	// The meter's last window sees the broker's final counters, and the
+	// recorder drains last, with the disconnects the broker's Stop emitted.
+	if prod != nil {
+		prod.stopAfterBroker(ctx, e.Logger())
+	}
 
 	if err != nil {
 		return fmt.Errorf("tether: %w", err)

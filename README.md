@@ -104,6 +104,7 @@ If you sell a connected product, sooner or later one broker carries traffic for 
 | More than one node | A cell of nodes over NATS JetStream: a client connects to any node, a node that dies has its sessions taken over and its wills published |
 | Devices without MQTT | `POST /tether/v1/publish` with HTTP Basic auth, behind the same grants and rate limit |
 | An admin API and a dashboard | A REST admin API for tenants, devices, roles, live clients, sessions and retained messages, and 24 [Forge dashboard](https://github.com/xraph/forge-dashboard) intents |
+| Billing and an audit trail | Per-tenant usage metered to [Ledger](https://github.com/xraph/ledger), CONNECTs refused for a tenant whose plan doesn't cover it, and connections and admin changes recorded in [Chronicle](https://github.com/xraph/chronicle) |
 | Metrics | Connections, messages in and out, auth failures by reason and ACL denials by operation |
 
 ## Tenants, devices and roles
@@ -215,7 +216,7 @@ For the [Forge dashboard](https://github.com/xraph/forge-dashboard), the extensi
 
 A signed-in user only sees their own tenant: the one their session's `tenant_id` claim names if your auth provider sets it, otherwise the org of the Forge scope your auth middleware puts on the request (Authsome does this for you). Asking for another tenant gets `PERMISSION_DENIED`, and a session that names no tenant is refused outright. If your dashboard users run the whole node, pass `WithDashboardOperators()` or set `dashboard_operators: true`, and every signed-in user can reach any tenant and create, change and delete tenants.
 
-Metrics go through the app's `forge.Metrics` and scrape from `/_/metrics` as `forge_tether_connections`, `forge_tether_messages_in_total`, `forge_tether_messages_out_total`, `forge_tether_auth_failures_total{reason}` and `forge_tether_acl_denials_total{op}`. A node in a cell adds `forge_tether_cluster_fenced`, `forge_tether_log_append_seconds`, `forge_tether_cas_lost_total` and `forge_tether_replay_messages_total`. None of them carry a tenant label.
+Metrics go through the app's `forge.Metrics` and scrape from `/_/metrics` as `forge_tether_connections`, `forge_tether_messages_in_total`, `forge_tether_messages_out_total`, `forge_tether_auth_failures_total{reason}` and `forge_tether_acl_denials_total{op}`. A node in a cell adds `forge_tether_cluster_fenced`, `forge_tether_log_append_seconds`, `forge_tether_cas_lost_total` and `forge_tether_replay_messages_total`, and metering, entitlements and audit add theirs (see [Billing and audit](#billing-and-audit)). None of them carry a tenant label.
 
 ## Run a cell
 
@@ -322,6 +323,64 @@ Create the database and a role that owns it first. Tether makes the tables itsel
 
 With `driver: postgres` the `server.sqlite_path` key is ignored and no SQLite file is made. Setting a DSN while the driver is `sqlite` is an error, since silently running on a local file would split a cell's state across hosts. `driver: postgresql` works too. We've run the tests that need a server against PostgreSQL 16 and 17. CI doesn't run them: nothing there sets `TETHER_TEST_POSTGRES`, so they skip.
 
+## Billing and audit
+
+Tether can bill each tenant through [Ledger](https://github.com/xraph/ledger), refuse a tenant whose plan doesn't cover it, and keep an audit trail in [Chronicle](https://github.com/xraph/chronicle). The three parts are separate, and all of them are off until you turn them on:
+
+```yaml
+tether:
+  metering:
+    enabled: true
+  entitlements:
+    enabled: true
+  audit:
+    enabled: true
+```
+
+Each part runs only when its own `enabled` is true. Having Ledger or Chronicle in the app turns nothing on by itself, so you can run Tether next to a Ledger that bills something else and Tether won't touch it. The binary registers Ledger when metering or entitlements are on and Chronicle when audit is on, both on the binary's own database (SQLite or PostgreSQL) with their REST routes off. Their own `ledger:` and `chronicle:` sections in the same file still apply. In your own app you register them yourself, from `github.com/xraph/ledger/extension` and `github.com/xraph/chronicle/extension`, and Start fails with `ErrLedgerRequired` or `ErrChronicleRequired` when one is missing. The options are `WithMetering`, `WithEntitlements` and `WithAudit`.
+
+Ledger and Chronicle know a tenant by its `app_id` and `external_id`, the same pair Keysmith and Warden use, so you find a tenant's usage and audit trail under the IDs your app already has. The Tether tenant ID goes in each audit event's metadata.
+
+### What is metered
+
+Every minute, each node sends Ledger how much each tenant grew since the last value Ledger accepted:
+
+| Feature key | Counts |
+| --- | --- |
+| `tether.messages.in` | PUBLISH packets a client sent that passed the ACL and the rate limit |
+| `tether.messages.out` | PUBLISH packets written to a client, `$SYS` ones included |
+| `tether.bytes.in` | Payload bytes of those messages in. Topics and properties don't count |
+| `tether.bytes.out` | Payload bytes of those messages out |
+| `tether.connection.minutes` | Whole minutes of open connections, summed. The remainder carries to the next window |
+
+You can rename any key under `metering.features`, and an empty one turns that meter off. Messages you publish yourself through `Broker().Publish` aren't billed. Retained messages aren't metered.
+
+Every delta goes to Ledger with an idempotency key made of the node, the broker's start time, the window number, the tenant and the feature. If Ledger's buffer is full or the call fails, nothing moves: the next window sends both windows' growth under a new key. A key Ledger has already seen is counted once. What a crashed node hadn't sent yet is lost, which is at most one interval of that node's traffic.
+
+### What a tenant sees when it isn't entitled
+
+With entitlements on, a CONNECT asks Ledger whether the tenant's plan includes every feature in `entitlements.features` (by default just `tether.access`, a boolean feature on your plan). A tenant missing one is refused with CONNACK 0x97, quota exceeded. MQTT 3.1.1 has no such code, so a 3.1.1 client gets 0x03, server unavailable. Each node checks its live tenants again every minute, and a tenant that has lost its plan has every connection on that node closed with 0x97 (a 5.0 client gets a DISCONNECT carrying it first).
+
+Soft limits keep running: Ledger answers a soft-limit feature over its limit as allowed. For a hard cap on traffic, list the metered feature too, say `tether.messages.in` with a hard limit on the plan, and the tenant is cut off once Ledger counts past it. It isn't instant. Usage reaches Ledger once a minute and the check runs once a minute, so expect a tenant to run a minute or two of traffic past its cap before you see it disconnected.
+
+A tenant whose answer Tether already holds connects at normal speed, and the answer is refreshed in the background. Only a tenant Tether has never asked about waits on Ledger, for two seconds at most (`check_timeout`). When Ledger is unreachable, a tenant keeps its last answer for ten minutes (`fail_open`), and a tenant with no answer yet is let in for as long as the node's checks have been failing for under ten minutes. Past that, new CONNECTs get 0x88, server unavailable. An outage never disconnects anyone, and Tether's health check doesn't look at Ledger or Chronicle, so a Ledger outage won't make your load balancer pull every node.
+
+### What the audit trail holds
+
+With audit on, Chronicle gets an event for each of these:
+
+- a connect and a disconnect (`mqtt.connect`, `mqtt.disconnect`)
+- a refused CONNECT, with the reason (`mqtt.auth.failed`)
+- a PUBLISH or SUBSCRIBE the grants refused, with the topic (`mqtt.acl.denied`)
+- a session taken over by another connection (`mqtt.session.takeover`)
+- every change made through the REST admin API or the dashboard, with who made it (`admin.tenant.create`, `admin.device.revoke` and so on)
+
+It never records a message or a delivery. You can narrow the list with `audit.events` (`connect`, `disconnect`, `auth_failure`, `acl_deny`, `takeover`, `admin`). A bad password is refused before Tether knows which tenant the client belongs to, so that event carries the username and no tenant.
+
+The broker never waits on Chronicle. Events go on a queue of 10,000 and four writers take them off it. If a flood outruns Chronicle's database and the queue fills, new events are dropped and counted in `forge_tether_audit_dropped_total`, so watch that counter if you rely on the trail. A device hammering a topic it isn't allowed on doesn't fill the queue either: repeats of the same denial within a minute (`deny_window`) become one more event at the end of the window, with `suppressed` set to how many there were. At shutdown the queue drains after the broker stops, so the last disconnects make it in.
+
+Three metrics come with these parts, none with a tenant label: `forge_tether_metering_errors_total` (deltas Ledger didn't take and tenants the meter couldn't look up), `forge_tether_entitlement_checks_total{result}` with `allowed`, `denied` or `error`, and `forge_tether_audit_dropped_total`.
+
 ## Configuration
 
 The binary reads `--config <path>`, or `./tether.yaml` when that exists, and the defaults when it doesn't. A key you leave out keeps its default. [`tether.example.yaml`](tether.example.yaml) lists every key with a comment, and a test checks that it matches the defaults.
@@ -367,6 +426,9 @@ tether:
 | `tether.broker.max_inflight` | `1024` | QoS 1 and 2 messages in flight per client, an offline session's queue included. Past it, messages for that client are dropped |
 | `tether.jwt` | off | Authsome JWT clients. See [Users and apps over JWT](#users-and-apps-over-jwt) |
 | `tether.cluster` | off | Run the node in a cell. See [Run a cell](#run-a-cell) and the commented block in [`tether.example.yaml`](tether.example.yaml) |
+| `tether.metering` | off | Send each tenant's usage to Ledger every `interval` (`60s`), under the keys in `features`. See [Billing and audit](#billing-and-audit) |
+| `tether.entitlements` | off | Refuse and disconnect, with 0x97, a tenant whose plan lacks one of `features` (`[tether.access]`). Also `interval` (`60s`), `check_timeout` (`2s`) and `fail_open` (`10m`) |
+| `tether.audit` | off | Record the audit trail in Chronicle. Also `events` (every kind), `queue_size` (`10000`), `writers` (`4`) and `deny_window` (`1m`) |
 
 Environment variables aren't a config source, with three exceptions. `TETHER_ADMIN_TOKEN` is read from the environment and never from the file, so the secret stays out of anything you commit. `TETHER_DATABASE_DSN` sets `server.database.dsn` and beats the file. `TETHER_NODE_ID` sets `tether.cluster.node_id`, and `--node-id` beats it. The `dashboard:` section of the same file belongs to the Forge dashboard.
 
@@ -378,7 +440,7 @@ Everything in [Why Tether?](#why-tether) works on one node and in a cell. What i
 
 - More than one cell. A cell is one NATS deployment; spreading tenants over several cells comes later. Inside a cell, rate and connection limits still count per node.
 - Per-tenant caps on retained messages and subscriptions. A tenant can hold as many of either as its devices' grants allow, bounded only by the packet and topic limits.
-- Metering, entitlements and audit trails, then webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication.
+- Webhooks, outbound bridges, client certificate auth and MQTT 5 re-authentication.
 
 We haven't run the Eclipse Paho interoperability suite against Tether yet. What we know about protocol behaviour comes from Tether's own tests, which run paho.mqtt.golang (3.1.1) and paho.golang (5.0) clients against a real broker. Those cover what Tether changes. They don't cover the corners of MQTT that mochi handles on its own.
 
@@ -393,6 +455,7 @@ There's no docs site for Tether yet. Every package with a public surface has an 
 | Mount Tether in a Forge app | [`extension/llm.txt`](extension/llm.txt), [`extension/contract/llm.txt`](extension/contract/llm.txt) |
 | Understand the broker's hooks and limits | [`broker/llm.txt`](broker/llm.txt), [`limits/llm.txt`](limits/llm.txt) |
 | Run nodes as a cell | [`cluster/llm.txt`](cluster/llm.txt), [`extension/llm.txt`](extension/llm.txt) |
+| Meter usage, check entitlements or audit | [`metering/llm.txt`](metering/llm.txt), [`audit/llm.txt`](audit/llm.txt), [`extension/llm.txt`](extension/llm.txt) |
 | Plug in device keys or JWTs | [`auth/llm.txt`](auth/llm.txt), [`events/llm.txt`](events/llm.txt) |
 | Write topic grants | [`perm/llm.txt`](perm/llm.txt), [`acl/llm.txt`](acl/llm.txt), [`topic/llm.txt`](topic/llm.txt) |
 

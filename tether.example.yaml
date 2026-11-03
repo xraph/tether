@@ -150,7 +150,63 @@ tether:
   #   replicas: 0          # 0 picks min(3, servers)
   #   log_max_age: 168h    # how long an offline session's messages wait
   #   pull_heartbeat: 2s   # log readers and the control bus: a lost pull costs about twice this
+  #   load_interval: 2s    # how often a node reports its tenants' usage to the cell
   #   no_discovery: false  # only for a node behind a proxy
+
+  # Send each tenant's usage to Ledger, under the tenant's app_id and
+  # external_id. Turning it on makes the binary run Ledger on the database
+  # above; its own settings go in a ledger: section.
+  metering:
+    enabled: false
+
+    # How often each node sends what grew since the last window.
+    interval: 60s
+
+    # The Ledger feature key each meter reports under. An empty key turns
+    # that meter off.
+    features:
+      messages_in: "tether.messages.in"
+      messages_out: "tether.messages.out"
+      bytes_in: "tether.bytes.in"
+      bytes_out: "tether.bytes.out"
+      connection_minutes: "tether.connection.minutes"
+
+  # Refuse a CONNECT with 0x97 when the tenant's Ledger plan lacks any of
+  # these features, and disconnect its clients with 0x97 at the next check.
+  # Turning it on makes the binary run Ledger too.
+  entitlements:
+    enabled: false
+    features: ["tether.access"]
+
+    # How long an answer is used before it is checked again, and how often
+    # each node checks its connected tenants.
+    interval: 60s
+
+    # The longest a CONNECT waits on Ledger, for a tenant with no answer yet.
+    check_timeout: 2s
+
+    # While Ledger is unreachable, how long a tenant keeps its last answer.
+    fail_open: 10m
+
+  # Record connects, disconnects, refused CONNECTs, ACL denials, takeovers
+  # and admin changes in Chronicle. Turning it on makes the binary run
+  # Chronicle on the database above; its own settings go in a chronicle:
+  # section.
+  audit:
+    enabled: false
+
+    # Which kinds to record: connect, disconnect, auth_failure, acl_deny,
+    # takeover, admin.
+    events: [connect, disconnect, auth_failure, acl_deny, takeover, admin]
+
+    # Events waiting for Chronicle. When the queue is full, new events are
+    # dropped and counted in tether_audit_dropped_total.
+    queue_size: 10000
+    writers: 4
+
+    # Repeats of one ACL denial within this window become one event, with
+    # the number of repeats.
+    deny_window: 1m
 
 # The dashboard has its own section (dashboard:), and its auth is off by
 # default. While it is off, Tether's dashboard pages refuse every request

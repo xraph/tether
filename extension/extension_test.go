@@ -342,7 +342,9 @@ func TestExtensionBootsWithKeysmithAndWarden(t *testing.T) {
 	require.NoError(t, e.ext.Health(t.Context()))
 	assert.True(t, e.ext.DashboardStatus().Configured)
 	assert.NotNil(t, e.ext.Services())
-	assert.Equal(t, []string{"grove", "keysmith", "warden"}, e.ext.Dependencies())
+	// ledger and chronicle are optional, like grove: Forge skips them when
+	// they are not registered, as here.
+	assert.Equal(t, []string{"grove", "keysmith", "warden", "ledger", "chronicle"}, e.ext.Dependencies())
 }
 
 // Revoking a device through REST fires the keysmith plugin, whose reactor
