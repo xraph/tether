@@ -279,3 +279,53 @@ func TestConcurrentCreatesOfOneExternalIDMakeOneTenant(t *testing.T) {
 
 	assert.Equal(t, 1, ok)
 }
+
+// The evict hook hears every eviction the resolve cache makes: Update, Delete
+// and Evict (a cell's tenant.updated), so a cache kept beside the service
+// (the extension's metering and audit lookups) is dropped on the same path.
+func TestEvictHookHearsEveryEviction(t *testing.T) {
+	m := memory.New()
+	t.Cleanup(func() { _ = m.Close() })
+
+	var (
+		mu    sync.Mutex
+		heard []id.TenantID
+	)
+
+	svc := NewTenants(m, WithEvictHook(func(tid id.TenantID) {
+		mu.Lock()
+		heard = append(heard, tid)
+		mu.Unlock()
+	}))
+
+	ctx := t.Context()
+
+	created, err := svc.Create(ctx, CreateTenantInput{AppID: "aapp_1", ExternalID: "aorg_1"})
+	require.NoError(t, err)
+
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+
+		for _, h := range heard {
+			require.Equal(t, created.ID, h)
+		}
+
+		return len(heard)
+	}
+
+	require.Zero(t, count(), "Create evicts nothing")
+
+	name := "renamed"
+	_, err = svc.Update(ctx, created.ID, UpdateTenantInput{Name: &name})
+	require.NoError(t, err)
+
+	afterUpdate := count()
+	require.Positive(t, afterUpdate, "Update")
+
+	svc.Evict(created.ID)
+	require.Equal(t, afterUpdate+1, count(), "Evict")
+
+	require.NoError(t, svc.Delete(ctx, created.ID))
+	require.Equal(t, afterUpdate+2, count(), "Delete")
+}

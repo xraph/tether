@@ -4,7 +4,7 @@ Import: github.com/xraph/tether/service
 
 Tenant and device management.
 
-`NewTenants(s store.Store) *Tenants`:
+`NewTenants(s store.Store, opts ...TenantsOption) *Tenants`. Option `WithEvictHook(fn func(id.TenantID))`: fn hears every eviction of the resolve cache (Update, on both sides of its write; Delete; Evict, which a cell's tenant.updated calls), after the service's lock is released, on the caller's goroutine. The extension hangs its metering and audit tenant cache off it. `TestEvictHookHearsEveryEviction`. Methods:
 - `Create(ctx, CreateTenantInput{AppID, ExternalID, Name string; Limits tenant.Limits})`: new tenants are enabled. Empty AppID or ExternalID wraps `tether.ErrInvalidInput`; an ExternalID already used by another tenant, under this app or any other, wraps `tether.ErrConflict` (keysmith and warden isolate by tenant ID alone, so two tenants must never share one). The check scans every tenant and a mutex serialises `Create` within a process; it is not atomic across nodes sharing a store. `Update` cannot change ExternalID, so it needs no check.
 - `Get(ctx, id.TenantID)`, `List(ctx, tenant.ListFilter)`.
 - `Update(ctx, id.TenantID, UpdateTenantInput{Name *string; Enabled *bool; Limits *tenant.Limits})`: nil fields are untouched; evicts the resolve cache.

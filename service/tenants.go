@@ -52,6 +52,9 @@ type Tenants struct {
 	// gen counts evictions. A resolve that started before an eviction must
 	// not write its stale result into the cache after it.
 	gen uint64
+
+	// onEvict, when set, hears every eviction (WithEvictHook).
+	onEvict func(id.TenantID)
 }
 
 type externalKey struct{ appID, externalID string }
@@ -61,9 +64,27 @@ type cacheEntry struct {
 	expires time.Time
 }
 
+// TenantsOption configures a Tenants.
+type TenantsOption func(*Tenants)
+
+// WithEvictHook calls fn with the tenant's ID every time the resolve cache
+// drops it: Update (on both sides of the write), Delete and Evict. A cache
+// kept beside the service hangs off it, so it is dropped on the same path,
+// a cell's tenant.updated included. fn runs after the service's own lock is
+// released, on the caller's goroutine, and must be quick.
+func WithEvictHook(fn func(tenantID id.TenantID)) TenantsOption {
+	return func(t *Tenants) { t.onEvict = fn }
+}
+
 // NewTenants returns a tenant service over s.
-func NewTenants(s store.Store) *Tenants {
-	return &Tenants{store: s, now: time.Now, cache: make(map[externalKey]cacheEntry)}
+func NewTenants(s store.Store, opts ...TenantsOption) *Tenants {
+	t := &Tenants{store: s, now: time.Now, cache: make(map[externalKey]cacheEntry)}
+
+	for _, opt := range opts {
+		opt(t)
+	}
+
+	return t
 }
 
 // Create stores a new, enabled tenant. A missing AppID or ExternalID wraps
@@ -244,10 +265,9 @@ func (s *Tenants) Evict(tenantID id.TenantID) {
 	s.evict(tenantID)
 }
 
-// evict drops every cached entry for the tenant.
+// evict drops every cached entry for the tenant, then tells the evict hook.
 func (s *Tenants) evict(tenantID id.TenantID) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	s.gen++
 
@@ -255,5 +275,11 @@ func (s *Tenants) evict(tenantID id.TenantID) {
 		if e.tenant.ID == tenantID {
 			delete(s.cache, k)
 		}
+	}
+
+	s.mu.Unlock()
+
+	if s.onEvict != nil {
+		s.onEvict(tenantID)
 	}
 }
