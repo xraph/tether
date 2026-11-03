@@ -11,7 +11,7 @@ It builds a Forge app with a grove database (SQLite by default, PostgreSQL by co
 - `--version`.
 - `--node-id <id>` and `TETHER_NODE_ID`: the node's ID in its cell (`tether.cluster.node_id`). The flag wins over the variable, the variable over the file. `applyCluster` applies it after the file is read and before anything starts.
 - `TETHER_DATABASE_DSN`: the PostgreSQL connection string, overriding `server.database.dsn`. `applyDatabase` applies it after the file is read and validates the database settings. Never logged.
-- `TETHER_ADMIN_TOKEN`: bearer token for the admin API, compared as SHA-256 digests with `crypto/subtle.ConstantTimeCompare`. A missing or wrong one is 401 with `WWW-Authenticate: Bearer`. Empty without `--insecure-admin` fails startup. The device endpoint `POST /tether/v1/publish` is not behind it (it uses HTTP Basic with the device key).
+- `TETHER_ADMIN_TOKEN`: bearer token for the admin API, compared as SHA-256 digests with `crypto/subtle.ConstantTimeCompare`. A missing or wrong one is 401 with `WWW-Authenticate: Bearer`. A request it lets through gets a forge `extensions/auth` `AuthContext` with Subject `admin-token` (`adminSubject`), set on the forge context (`auth_context`) and the request context, so the REST API's audit events carry that Actor (ruling R24, `TestAdminMiddlewareSetsActor`). With `--insecure-admin` there is no middleware and the Actor is empty. Empty without `--insecure-admin` fails startup. The device endpoint `POST /tether/v1/publish` is not behind it (it uses HTTP Basic with the device key).
 
 ## Config
 

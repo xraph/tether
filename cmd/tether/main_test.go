@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/forge"
+	forgeauth "github.com/xraph/forge/extensions/auth"
 	"github.com/xraph/vessel"
 
 	"github.com/xraph/tether"
@@ -351,4 +352,47 @@ func TestExampleConfigMatchesDefaults(t *testing.T) {
 	cfg, err := loadConfig(filepath.Join("..", "..", "tether.example.yaml"), true)
 	require.NoError(t, err)
 	assert.Equal(t, defaultConfig(), cfg)
+}
+
+// Ruling R24: a request the admin token let through carries a forge auth
+// context with Subject "admin-token", the way forge's auth extension does, so
+// the REST API records an Actor on every admin change the binary audits.
+func TestAdminMiddlewareSetsActor(t *testing.T) {
+	app := forge.New(forge.WithAppLogger(forge.NewNoopLogger()), forge.WithEnableConfigAutoDiscovery(false))
+
+	subjects := make(chan [2]string, 1)
+
+	g := app.Router().Group("/admin")
+	g.Use(adminAuth(testToken))
+	require.NoError(t, g.GET("/who", func(c forge.Context) error {
+		var got [2]string
+
+		if ac, ok := forgeauth.GetAuthContext(c); ok {
+			got[0] = ac.Subject
+		}
+
+		if ac, ok := forgeauth.GetAuthContextFromStdContext(c.Context()); ok {
+			got[1] = ac.Subject
+		}
+
+		subjects <- got
+
+		return c.NoContent(http.StatusNoContent)
+	}))
+
+	srv := httptest.NewServer(app.Router())
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/admin/who", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Equal(t, [2]string{adminSubject, adminSubject}, <-subjects, "the forge context and the request context")
+	assert.Equal(t, "admin-token", adminSubject)
 }

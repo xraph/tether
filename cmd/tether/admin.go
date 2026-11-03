@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/xraph/forge"
+	forgeauth "github.com/xraph/forge/extensions/auth"
 )
 
 // adminTokenEnv names the environment variable that holds the admin bearer
@@ -20,9 +21,18 @@ var errNoAdminToken = errors.New(
 	"tether: " + adminTokenEnv + " is empty: set it to a long random value, " +
 		"or pass --insecure-admin to leave the admin API and dashboard open")
 
+// adminSubject is the Subject of the auth context adminAuth sets: the actor
+// the audit trail records for an admin change made with the token.
+const adminSubject = "admin-token"
+
 // adminAuth returns a middleware that lets a request through only when it
 // carries "Authorization: Bearer <token>". Anything else gets 401 with a
 // "WWW-Authenticate: Bearer" challenge.
+//
+// A request it lets through gets a forge auth context with Subject
+// "admin-token", on the forge context and on the request's context, the way
+// forge's auth extension sets one, so the REST API records an actor on the
+// admin changes it audits (ruling R24).
 //
 // The comparison runs on SHA-256 digests with crypto/subtle, so it takes the
 // same time whatever the length of what the caller sent.
@@ -34,6 +44,10 @@ func adminAuth(token string) forge.Middleware {
 			if got, ok := bearerToken(c.Request().Header.Get("Authorization")); ok {
 				sum := sha256.Sum256([]byte(got))
 				if subtle.ConstantTimeCompare(sum[:], want[:]) == 1 {
+					ac := &forgeauth.AuthContext{Subject: adminSubject}
+					c.Set("auth_context", ac)
+					c.WithContext(forgeauth.WithContext(c.Context(), ac))
+
 					return next(c)
 				}
 			}
