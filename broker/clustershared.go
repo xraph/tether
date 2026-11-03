@@ -968,12 +968,25 @@ func (n *clusterNode) pinShare(s *session, cl *mqtt.Client, out *shareOut, track
 // out of the inflight map (send quota restored, as mochi's own rollback
 // does) and goes back to its group when the connection is gone. QoS 2 is the
 // session's already: on a lost connection it stays in the inflight map and
-// the record, for the resume. A write that failed on a live connection (over
-// the client's Maximum Packet Size, say) never will succeed: the message is
-// dropped, as mochi drops such a delivery.
+// the record, for the resume. A packet that could not be encoded (over the
+// client's Maximum Packet Size, say) never will be: the message is dropped,
+// as mochi drops such a delivery.
+//
+// Any other failure is the network's, and the connection is lost even while
+// mochi still has it open: the peer went away and mochi's reader has not read
+// the end yet, or Stop closed the socket and has not marked the client closed.
+// The client is stopped, so its session ends, and the message is handled as
+// lost with it. Taking such a failure for an encoding one acked a QoS 1
+// message nobody had received.
 func (n *clusterNode) shareWriteFailed(nsID string, s *session, cl *mqtt.Client, pk packets.Packet, it shareItem, err error) {
 	qos := pk.FixedHeader.Qos
+
 	closed := cl.Closed()
+	if !closed && !encodeFailed(err) {
+		cl.Stop(err)
+
+		closed = true
+	}
 
 	if qos == 2 && closed {
 		return
@@ -1020,6 +1033,15 @@ func (n *clusterNode) shareWriteFailed(nsID string, s *session, cl *mqtt.Client,
 
 	it.done(errShareLost)
 	n.sharedLost.Add(1)
+}
+
+// encodeFailed reports whether err, from a WritePacket, is mochi refusing to
+// encode the packet (every such error is a packets.Code) rather than the
+// connection failing under the write.
+func encodeFailed(err error) bool {
+	var code packets.Code
+
+	return errors.As(err, &code)
 }
 
 // shareTarget waits until nsID's session has a connection whose CONNACK is

@@ -239,6 +239,86 @@ func TestSharedMemberLoss(t *testing.T) {
 	t.Logf("B held %d unacked", len(held))
 }
 
+// A shared QoS 1 write that fails on the network while mochi still has the
+// connection open (its reader has not seen the peer go yet) loses the
+// message with the connection: the member's connection is dropped and the
+// message goes to another member. It used to be taken for a packet that can
+// never be sent, finished and acked, so no member got it. This was
+// TestSharedMemberLoss failing now and then with one message missing: the
+// one being written as the member's peer closed.
+func TestSharedWriteFailureLosesConnection(t *testing.T) {
+	var (
+		armed  atomic.Bool
+		target atomic.Value // the namespaced client ID whose write breaks
+		broke  = make(chan error, 1)
+		node   *clusterNode
+	)
+
+	c, tid := sharedSeamCell(t, func(n *clusterNode) {
+		node = n
+		n.shareBeforeSend = func(nsID string) {
+			if id, _ := target.Load().(string); id != nsID || !armed.CompareAndSwap(true, false) {
+				return
+			}
+
+			// Shut down only the server's sending half: the write fails as
+			// on a peer that is gone, and mochi's reader, still blocked,
+			// keeps the client open.
+			_, cl, _, ok := n.shareClient(nsID)
+			if !ok {
+				broke <- errors.New("no live connection")
+
+				return
+			}
+
+			hc, ok := cl.Net.Conn.(interface{ CloseWrite() error })
+			if !ok {
+				broke <- fmt.Errorf("%T cannot half-close", cl.Net.Conn)
+
+				return
+			}
+
+			broke <- hc.CloseWrite()
+		}
+	})
+
+	ma, _, err := connect5(t, c.addr(0), "ma", "u1", true)
+	require.NoError(t, err)
+	subscribeQoS(t, ma, "$share/g/w/#", 1, false)
+
+	rawMember(t, c.addr(0), "mb", "$share/g/w/#")
+
+	mbID := namespacedID(tid, "mb")
+	target.Store(mbID)
+	armed.Store(true)
+
+	pub, _, err := connect5(t, c.addr(0), "pub", "u1", true)
+	require.NoError(t, err)
+
+	const total = 10
+
+	for i := range total {
+		require.Equal(t, byte(0), publishQ(t, pub, fmt.Sprintf("w/%d", i), fmt.Sprintf("w%d", i), 1))
+	}
+
+	select {
+	case err := <-broke:
+		require.NoError(t, err)
+	case <-time.After(logWait):
+		t.Fatal("no shared message was written to mb")
+	}
+
+	got := collectShared(t, total, "w", ma)[0]
+	requireEachOnce(t, got, "w", total)
+
+	eventually(t, "mb's connection dropped", func() bool {
+		_, _, _, ok := node.shareClient(mbID)
+
+		return !ok
+	})
+	require.Positive(t, node.sharedLost.Load())
+}
+
 // QoS 0 goes through the group's queue group. Published on a node with no
 // member, each of 100 messages reaches one member of A and B, both get some.
 // A group whose only member is on the publishing node gets the node's own
