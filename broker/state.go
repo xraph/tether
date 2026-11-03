@@ -121,6 +121,13 @@ func newClientState(cl *mqtt.Client, rawID, username string, ident *auth.Identit
 }
 
 // acl returns the connection's current grants.
+// nsID is the connection's namespaced client ID, from fields set when the
+// state is made. mochi's cl.ID holds the raw ID until OnSessionEstablish
+// writes the namespaced one, on the connection's goroutine, so code that
+// may run before or alongside that (the reactions, reloads and timers that
+// find the state in the registry) reads this instead.
+func (st *clientState) nsID() string { return namespacedID(st.tenantID, st.rawID) }
+
 func (st *clientState) acl() *acl.Set {
 	return st.grants.Load().acl
 }

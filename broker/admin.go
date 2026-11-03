@@ -60,7 +60,7 @@ func (b *Broker) DisconnectPrincipal(principalID string, code packets.Code) int 
 			continue
 		}
 
-		b.log.Info("tether: disconnecting principal", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID),
+		b.log.Info("tether: disconnecting principal", slog.String("client", st.nsID()), slog.String("tenant", st.tenantID),
 			slog.String("principal", principalID), slog.Int("code", int(code.Code)))
 		disconnect(srv, b.log, st.cl, code)
 		n++
@@ -127,7 +127,7 @@ func (b *Broker) shorten(srv *mqtt.Server, st *clientState, at time.Time) bool {
 	st.ident.Store(&ident)
 	st.setExpiry(time.AfterFunc(time.Until(at), func() { b.expireConnection(srv, st) }))
 
-	b.log.Info("tether: connection ends with its credentials' grace window", slog.String("client", st.cl.ID),
+	b.log.Info("tether: connection ends with its credentials' grace window", slog.String("client", st.nsID()),
 		slog.String("tenant", st.tenantID), slog.Time("at", at))
 
 	return true
@@ -140,7 +140,7 @@ func (b *Broker) expireConnection(srv *mqtt.Server, st *clientState) {
 		return
 	}
 
-	b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+	b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.nsID()), slog.String("tenant", st.tenantID))
 	disconnect(srv, b.log, st.cl, packets.ErrMaxConnectTime)
 }
 
@@ -239,7 +239,7 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 		} else if !st.offerTenant(snap) {
 			// A newer change reached the connection first (a failed
 			// publish sent again late, say): this one is out of date.
-			b.log.Debug("tether: tenant snapshot older than the one held, ignored", slog.String("client", st.cl.ID),
+			b.log.Debug("tether: tenant snapshot older than the one held, ignored", slog.String("client", st.nsID()),
 				slog.String("tenant", tenantID), slog.Time("updated_at", snap.UpdatedAt))
 
 			continue
@@ -249,7 +249,7 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 			continue
 		}
 
-		b.log.Info("tether: tenant disabled, disconnecting", slog.String("client", st.cl.ID), slog.String("tenant", tenantID))
+		b.log.Info("tether: tenant disabled, disconnecting", slog.String("client", st.nsID()), slog.String("tenant", tenantID))
 
 		if async {
 			go disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
@@ -341,7 +341,7 @@ func (b *Broker) reloadLocked(ctx context.Context, srv *mqtt.Server, st *clientS
 		return reloadGone
 	}
 
-	log := b.log.With(slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+	log := b.log.With(slog.String("client", st.nsID()), slog.String("tenant", st.tenantID))
 
 	rules, roleIDs, err := b.deps.Perms.Load(ctx, st.identity())
 	if err != nil {
@@ -440,7 +440,7 @@ func (b *Broker) retryReload(srv *mqtt.Server, st *clientState, stop chan struct
 
 		if !time.Now().Before(deadline) {
 			b.log.Warn("tether: permissions still unavailable, disconnecting so the client authorizes again",
-				slog.String("client", st.cl.ID), slog.String("tenant", st.tenantID))
+				slog.String("client", st.nsID()), slog.String("tenant", st.tenantID))
 			disconnect(srv, b.log, st.cl, packets.ErrServerUnavailable)
 
 			return
@@ -540,7 +540,7 @@ func (b *Broker) pruneSession(srv *mqtt.Server, st *clientState) {
 func (b *Broker) pruneSubscriptions(srv *mqtt.Server, st *clientState, set *acl.Set) {
 	n := b.unsubscribe(srv, st.cl, func(filter string) bool { return !b.canRead(st.tenantID, set, filter) })
 	if n > 0 {
-		b.log.Info("tether: subscriptions removed, no longer granted", slog.String("client", st.cl.ID), slog.Int("count", n))
+		b.log.Info("tether: subscriptions removed, no longer granted", slog.String("client", st.nsID()), slog.Int("count", n))
 	}
 }
 
