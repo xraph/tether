@@ -17,7 +17,7 @@ gofmt -s -w . && goimports -w -local github.com/xraph/tether .
 GOWORK=off go mod tidy                    # CI fails if this changes go.mod or go.sum
 ```
 
-The Postgres store tests skip unless `TETHER_TEST_POSTGRES` holds a DSN for a server where the role may `CREATE DATABASE`. Each test makes its own throwaway database and drops it afterwards. For a local run, start a disposable server and point the variable at it:
+The Postgres store tests and the binary's Postgres tests (`cmd/tether/postgres_test.go`, which includes a two-node cell on one database) skip unless `TETHER_TEST_POSTGRES` holds a DSN for a server where the role may `CREATE DATABASE`. Each test makes its own throwaway database and drops it afterwards. For a local run, start a disposable server and point the variable at it:
 
 ```sh
 docker run --rm -d --name tether-test-pg -e POSTGRES_PASSWORD=tether -p 127.0.0.1:0:5432 postgres:17-alpine

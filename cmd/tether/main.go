@@ -1,10 +1,9 @@
 // Command tether runs the Tether MQTT broker as a standalone server: a Forge
-// app with grove (SQLite), keysmith, warden, the Tether extension and the
-// Forge dashboard.
+// app with grove (SQLite or PostgreSQL), keysmith, warden, the Tether
+// extension and the Forge dashboard.
 package main
 
 import (
-	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,7 +16,6 @@ import (
 	"github.com/xraph/forge"
 	dashboard "github.com/xraph/forge/extensions/dashboard"
 	"github.com/xraph/grove"
-	"github.com/xraph/grove/drivers/sqlitedriver"
 	keysmithext "github.com/xraph/keysmith/extension"
 	"github.com/xraph/vessel"
 	wardenext "github.com/xraph/warden/extension"
@@ -25,7 +23,6 @@ import (
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/extension"
-	"github.com/xraph/tether/store/sqlite"
 )
 
 // Defaults for the keys this binary adds on top of the extension's config.
@@ -68,8 +65,12 @@ type serverConfig struct {
 	HTTPAddress string `yaml:"http_address"`
 
 	// SQLitePath is the SQLite file that holds tenants, devices, keys and
-	// roles. Its directory is created when missing.
+	// roles when the database driver is sqlite. Its directory is created
+	// when missing.
 	SQLitePath string `yaml:"sqlite_path"`
+
+	// Database picks SQLite (the default) or PostgreSQL for the same data.
+	Database databaseConfig `yaml:"database"`
 }
 
 // defaultConfig is the config of a process started with no config file: HTTP
@@ -79,7 +80,11 @@ func defaultConfig() config {
 	cfg.Broker.DataDir = defaultDataDir
 
 	return config{
-		Server: serverConfig{HTTPAddress: defaultHTTPAddress, SQLitePath: defaultSQLitePath},
+		Server: serverConfig{
+			HTTPAddress: defaultHTTPAddress,
+			SQLitePath:  defaultSQLitePath,
+			Database:    databaseConfig{Driver: driverSQLite},
+		},
 		Tether: cfg,
 	}
 }
@@ -140,7 +145,7 @@ func applyCluster(cfg *config, flagNodeID, envNodeID string) error {
 	return nil
 }
 
-// newApp builds the Forge app: a grove SQLite database in the container,
+// newApp builds the Forge app: a grove database (SQLite or PostgreSQL) in the container,
 // keysmith and warden with their own REST routes off, Tether, and the
 // dashboard. It does not start it.
 //
@@ -152,11 +157,19 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 		return nil, nil, errNoAdminToken
 	}
 
-	if cfg.Server.SQLitePath == "" {
-		return nil, nil, errors.New("tether: server.sqlite_path is empty")
+	if err := cfg.Server.validateDatabase(); err != nil {
+		return nil, nil, err
 	}
 
-	for _, dir := range []string{filepath.Dir(cfg.Server.SQLitePath), cfg.Tether.Broker.DataDir, natsDir(cfg)} {
+	dirs := []string{cfg.Tether.Broker.DataDir, natsDir(cfg)}
+
+	// The SQLite file's directory only matters on SQLite. A PostgreSQL node
+	// keeps nothing of the database on disk.
+	if !cfg.Server.usesPostgres() {
+		dirs = append([]string{filepath.Dir(cfg.Server.SQLitePath)}, dirs...)
+	}
+
+	for _, dir := range dirs {
 		if dir == "" {
 			continue
 		}
@@ -166,7 +179,7 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 		}
 	}
 
-	db, err := openDB(cfg.Server.SQLitePath)
+	db, err := openDB(cfg.Server)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -175,9 +188,9 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 		forge.WithAppName("tether"),
 		forge.WithAppVersion(tether.Version),
 		forge.WithHTTPAddress(cfg.Server.HTTPAddress),
-		// Environment variables are for the admin token and the node ID
-		// only (run reads both): the config file is the one place
-		// everything else is set.
+		// Environment variables are for the admin token, the node ID and
+		// the database DSN only (run reads them): the config file is the
+		// one place everything else is set.
 		forge.WithEnableEnvConfig(false),
 		forge.WithEnableAppScopedConfig(false),
 	}, appOpts...)...)
@@ -202,8 +215,17 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 
 	ext := extension.New(extOpts...)
 
+	ksOpts := []keysmithext.ExtOption{keysmithext.WithDisableRoutes()}
+
+	// On PostgreSQL openDB has already migrated keysmith under a lock, which
+	// the extension's own unlocked migration at Start would race against
+	// when several nodes start together.
+	if cfg.Server.usesPostgres() {
+		ksOpts = append(ksOpts, keysmithext.WithDisableMigrate())
+	}
+
 	for _, x := range []forge.Extension{
-		ext.Keysmith(keysmithext.WithDisableRoutes()),
+		ext.Keysmith(ksOpts...),
 		ext.Warden(wardenext.WithDisableRoutes()),
 		ext,
 		dashboard.NewExtension(),
@@ -227,22 +249,6 @@ func natsDir(cfg config) string {
 	}
 
 	return c.Embedded.StoreDir
-}
-
-// openDB opens the grove SQLite database at path.
-func openDB(path string) (*grove.DB, error) {
-	drv := sqlitedriver.New()
-
-	if err := drv.Open(context.Background(), sqlite.DSN(path)); err != nil {
-		return nil, fmt.Errorf("tether: open sqlite %s: %w", path, err)
-	}
-
-	db, err := grove.Open(drv)
-	if err != nil {
-		return nil, fmt.Errorf("tether: open grove: %w", err)
-	}
-
-	return db, nil
 }
 
 // run is the whole program, with its inputs passed in so a test can drive it:
@@ -285,6 +291,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) er
 
 	if cerr := applyCluster(&cfg, *nodeID, getenv(nodeIDEnv)); cerr != nil {
 		return cerr
+	}
+
+	if derr := applyDatabase(&cfg, getenv(databaseDSNEnv)); derr != nil {
+		return derr
 	}
 
 	app, closeDB, err := newApp(cfg, token, *insecure, configSource(path)...)
