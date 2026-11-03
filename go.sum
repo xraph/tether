@@ -438,8 +438,8 @@ github.com/xraph/grove/drivers/sqlitedriver v1.10.1 h1:Uyc2W0MjvROh4pTO+XuRgER05
 github.com/xraph/grove/drivers/sqlitedriver v1.10.1/go.mod h1:UlTGQQRp7VD4Rjj8HN6XjW1TMZl0iSNI4LApoQnChYQ=
 github.com/xraph/grove/extension v1.10.1 h1:HSiNiFFTqeQN9Uo3errv9Ld5vqavu822TEqNES5JMtI=
 github.com/xraph/grove/extension v1.10.1/go.mod h1:2JHsObtQmsHfGytkSygRXdioktF0nXSRyPwIPdm/FCc=
-github.com/xraph/keysmith v1.8.0 h1:KIGF5XbJDw7133PX1NnnrTyEgUf13g/Jb1IG3JjePzU=
-github.com/xraph/keysmith v1.8.0/go.mod h1:SiYAYp+gtEdFHHjrAf7luCd2BrYAORWXxhzwyqaDIp4=
+github.com/xraph/keysmith v1.9.0 h1:t8OFoppo6pYaWougL+D6tHanTxNzLj7z911gVb3emQo=
+github.com/xraph/keysmith v1.9.0/go.mod h1:lb2QzvYCPG9nGeHynlXqr3F2vgoAIt7hkZiBg7bAN9k=
 github.com/xraph/vessel v1.0.5 h1:4In3UmIJzOrym5+FXE/uvm1jR+gofUqVmEjKjjgE3gw=
 github.com/xraph/vessel v1.0.5/go.mod h1:5hgrMbuczxu2kRIM3iVJ3wPSb6HOvbMhV4nkRFaPNqs=
 github.com/xraph/warden v1.8.1 h1:JZFmZvKHp5haXKm8O4yMksP+jp/Bi6A0uOskfgW8/mc=

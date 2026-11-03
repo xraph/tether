@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/extension
 
-Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith and warden plugins (`events/`) that make live connections react to key and role changes. Forge v1.13.2, grove v1.10.1, keysmith v1.8.0, warden v1.8.1.
+Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith and warden plugins (`events/`) that make live connections react to key and role changes. Forge v1.13.2, grove v1.10.1, keysmith v1.9.0, warden v1.8.1.
 
 ## Use
 

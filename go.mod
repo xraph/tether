@@ -19,7 +19,7 @@ require (
 	github.com/xraph/grove/drivers/pgdriver v1.10.1
 	github.com/xraph/grove/drivers/sqlitedriver v1.10.1
 	github.com/xraph/grove/extension v1.10.1
-	github.com/xraph/keysmith v1.8.0
+	github.com/xraph/keysmith v1.9.0
 	github.com/xraph/vessel v1.0.5
 	github.com/xraph/warden v1.8.1
 	go.jetify.com/typeid/v2 v2.0.0-alpha.3
