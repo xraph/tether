@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,5 +256,135 @@ func TestAuditFailuresFeedTheCounter(t *testing.T) {
 
 	if failed.n != 4 || dropped.n != 0 {
 		t.Fatalf("failures counter %v, dropped counter %v; want 4 and 0", failed.n, dropped.n)
+	}
+}
+
+// recordingSink keeps every event it is given, 50 ms after it is given it,
+// so a Stop finds the writers busy.
+type recordingSink struct {
+	mu  sync.Mutex
+	evs []audit.Event
+}
+
+func (s *recordingSink) Record(ctx context.Context, ev audit.Event, _ audit.Tenant) error {
+	select {
+	case <-time.After(50 * time.Millisecond):
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.evs = append(s.evs, ev)
+
+	return nil
+}
+
+func (s *recordingSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return len(s.evs)
+}
+
+// meterSink counts what the meter sends.
+type meterSink struct {
+	mu  sync.Mutex
+	qty int64
+}
+
+func (s *meterSink) Meter(_ context.Context, _ metering.Tenant, _ string, q int64, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.qty += q
+
+	return nil
+}
+
+// someTenants knows every tenant.
+type someTenants struct{}
+
+func (someTenants) Get(_ context.Context, id string) (metering.Tenant, error) {
+	return metering.Tenant{ID: id, AppID: "app", ExternalID: "ext"}, nil
+}
+
+// runningProduct is a product with a started recorder holding three events
+// and a started meter with usage to send.
+func runningProduct(t *testing.T) (*product, *recordingSink, *meterSink) {
+	t.Helper()
+
+	cfg := audit.DefaultConfig()
+	cfg.Enabled = true
+
+	rs := &recordingSink{}
+	rec := audit.NewRecorder(cfg, rs, nil, nil)
+	rec.Start()
+
+	for range 3 {
+		rec.Emit(audit.Event{Action: audit.ActionDisconnect, Outcome: audit.OutcomeSuccess, TenantID: "t"})
+	}
+
+	mcfg := metering.DefaultConfig()
+	mcfg.Enabled = true
+	mcfg.Interval = time.Hour
+	mcfg.Features = metering.Features{MessagesIn: "tether.messages.in"}
+
+	ms := &meterSink{}
+	meter := metering.New(mcfg, usageSource{usage: []broker.TenantUsage{{Tenant: "ttnt_a", MessagesIn: 7}}},
+		someTenants{}, ms, "n1", slog.New(slog.DiscardHandler))
+	meter.Start()
+
+	m := &productMetrics{auditDropped: &addCounter{}, auditFailures: &addCounter{}}
+
+	return &product{rec: rec, meter: meter, metrics: m, log: slog.New(slog.DiscardHandler)}, rs, ms
+}
+
+// The meter's last window and the recorder's drain each get a bounded slice
+// of their own: a Stop whose ctx the broker's Stop used up still sends the
+// last window and drains the queue.
+func TestStopAfterBrokerOutlivesSpentContext(t *testing.T) {
+	p, rs, ms := runningProduct(t)
+
+	spent, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p.stopAfterBroker(spent, forge.NewNoopLogger())
+
+	if n := rs.count(); n != 3 {
+		t.Fatalf("the recorder drained %d of 3 events", n)
+	}
+
+	if ms.qty != 7 {
+		t.Fatalf("the last window sent %d of 7", ms.qty)
+	}
+}
+
+// A Stop that finds no broker (its Start failed after the product was made)
+// still drains the recorder.
+func TestStopWithoutBrokerDrains(t *testing.T) {
+	p, rs, ms := runningProduct(t)
+
+	e := New()
+	e.started = true
+	e.product = p
+
+	if err := e.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := rs.count(); n != 3 {
+		t.Fatalf("the recorder drained %d of 3 events", n)
+	}
+
+	if ms.qty != 7 {
+		t.Fatalf("the last window sent %d of 7", ms.qty)
+	}
+
+	p.rec.Emit(audit.Event{Action: audit.ActionConnect, TenantID: "t"})
+
+	if p.rec.Dropped() != 1 {
+		t.Fatal("the recorder still takes events after Stop")
 	}
 }

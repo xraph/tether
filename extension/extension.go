@@ -630,6 +630,12 @@ func (e *Extension) Stop(ctx context.Context) error {
 	if b == nil {
 		cl.close()
 
+		// No broker ran, but the recorder may hold events (an admin change
+		// made before the failure); they drain all the same.
+		if prod != nil {
+			prod.stopAfterBroker(ctx, e.Logger())
+		}
+
 		return nil
 	}
 

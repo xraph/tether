@@ -45,6 +45,11 @@ var auditDropSync = 5 * time.Second
 // started.
 const stopProductWait = 5 * time.Second
 
+// stopPartWait bounds the meter's last window and, separately, the
+// recorder's drain at Stop. Each gets its own, apart from Stop's ctx, which
+// the broker's Stop may already have used up.
+const stopPartWait = 10 * time.Second
+
 // product is what Start builds for metering, entitlements and audit. Each
 // part is nil when its config is off. One product belongs to one broker run:
 // Start builds it, Stop ends it, and the next Start builds a new one, so the
@@ -247,19 +252,27 @@ func (p *product) stopChecks() {
 
 // stopAfterBroker runs the meter's last window, now that the broker's
 // counters have stopped, then drains the recorder, which also takes the
-// disconnects the broker's Stop emitted. Their errors are logged: neither
-// should fail Stop.
+// disconnects the broker's Stop emitted. Each runs on ctx's values without
+// its cancellation, bounded by stopPartWait of its own: the broker's Stop
+// may have used ctx up, and the last window and the drain matter most then.
+// Their errors are logged: neither should fail Stop.
 func (p *product) stopAfterBroker(ctx context.Context, log forge.Logger) {
 	if p.meter != nil {
-		if err := p.meter.Stop(ctx); err != nil {
+		mctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopPartWait)
+		if err := p.meter.Stop(mctx); err != nil {
 			log.Warn("tether: the last metering window failed", forge.F("error", err.Error()))
 		}
+
+		cancel()
 	}
 
 	if p.rec != nil {
-		if err := p.rec.Stop(ctx); err != nil {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), stopPartWait)
+		if err := p.rec.Stop(rctx); err != nil {
 			log.Warn("tether: the audit recorder did not drain", forge.F("error", err.Error()))
 		}
+
+		cancel()
 
 		p.syncDropped()
 		p.syncFailures()
