@@ -4,8 +4,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -14,6 +16,11 @@ const (
 	// pgSecret is a password the tests plant in a DSN and then look for in
 	// every error, so a leak fails a test.
 	pgSecret = "hunter2-do-not-log"
+
+	// pgBadPool is the key=value DSN a reviewer found leaking: the password is
+	// quoted with an escaped quote in it, and pool_max_conns does not parse.
+	// pgx masks the password in its error only up to the first space.
+	pgBadPool = `host=127.0.0.1 port=1 user=tether password='a\'b ` + pgSecret + `' dbname=tetherdb pool_max_conns=abc`
 
 	// pgURL points at a port nothing listens on, so opening it fails fast.
 	pgURL = "postgres://tether:" + pgSecret + "@127.0.0.1:1/tetherdb?sslmode=disable&connect_timeout=2"
@@ -87,6 +94,19 @@ func TestDatabaseValidation(t *testing.T) {
 			c.Server.Database.Driver = "postgres"
 			c.Server.Database.DSN = "postgres://tether:" + pgSecret + "@127.0.0.1:notaport/tetherdb"
 		}, "", "does not parse"},
+		{"postgres with a bad pool value in a url", func(c *config) {
+			c.Server.Database.Driver = "postgres"
+			c.Server.Database.DSN = "postgres://tether:" + pgSecret + "@127.0.0.1:1/tetherdb?pool_max_conns=abc"
+		}, "", "does not parse"},
+		{"postgres with a bad pool value and a quoted password", func(c *config) {
+			c.Server.Database.Driver = "postgres"
+			c.Server.Database.DSN = pgBadPool
+		}, "", "does not parse"},
+		{"postgres with a missing certificate file", func(c *config) {
+			c.Server.Database.Driver = "postgres"
+			c.Server.Database.DSN = "postgres://tether:" + pgSecret + "@127.0.0.1:1/tetherdb?sslmode=verify-full&sslrootcert=" +
+				filepath.Join(os.TempDir(), "tether-no-such-ca.pem")
+		}, "", "could not be read"},
 		{"sqlite with a dsn in the file", func(c *config) { c.Server.Database.DSN = pgURL }, "", "driver is sqlite"},
 		{"sqlite with a dsn in the environment", func(*config) {}, pgURL, "driver is sqlite"},
 	} {
@@ -104,6 +124,7 @@ func TestDatabaseValidation(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.wantErr)
 			assert.NotContains(t, err.Error(), pgSecret, "an error must never quote the DSN")
+			assert.NotContains(t, err.Error(), "hunter2", "not even part of the password")
 		})
 	}
 }
@@ -153,6 +174,25 @@ func TestOpenPostgresErrorHidesThePassword(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "tether@127.0.0.1:1/tetherdb")
 	assert.NotContains(t, err.Error(), pgSecret)
+}
+
+// pgx's own error for pgBadPool shows part of the password, which is why
+// the binary never passes it on. The first check pins the leak, so the test
+// still means something if pgx fixes its masking. openPostgres skips
+// validateDatabase here, so this is the backstop in Open.
+func TestOpenPostgresHidesAParseError(t *testing.T) {
+	_, perr := pgxpool.ParseConfig(pgBadPool)
+	require.Error(t, perr)
+
+	if !strings.Contains(perr.Error(), pgSecret) {
+		t.Log("pgx no longer leaks the password for this DSN; the check below still holds")
+	}
+
+	_, err := openPostgres(pgBadPool)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not parse")
+	assert.NotContains(t, err.Error(), pgSecret)
+	assert.NotContains(t, err.Error(), "hunter2")
 }
 
 // run refuses a PostgreSQL config with no DSN before it opens or starts

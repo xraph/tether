@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/xraph/grove"
 	"github.com/xraph/grove/drivers/pgdriver"
@@ -102,11 +104,10 @@ func (s serverConfig) validateDatabase() error {
 				"set server.database.dsn or " + databaseDSNEnv)
 		}
 
-		// The cause is left out on purpose: a parse error can quote the
-		// string, and the string holds the password.
-		if _, err := pgconn.ParseConfig(s.Database.dsn()); err != nil {
-			return errors.New("tether: the PostgreSQL DSN does not parse: " +
-				"use a postgres:// URL or key=value pairs (the error is not shown, since it could quote the password)")
+		// This is the parser the driver uses, so a bad pool_* parameter
+		// fails here too, and not inside Open.
+		if _, err := pgxpool.ParseConfig(s.Database.dsn()); err != nil {
+			return dsnError(err)
 		}
 	default:
 		if s.SQLitePath == "" {
@@ -120,6 +121,26 @@ func (s serverConfig) validateDatabase() error {
 	}
 
 	return nil
+}
+
+// dsnError says why a DSN was refused without showing the parser's error.
+// pgx quotes the connection string in it with the password masked, and the
+// masking is best effort: a quoted password with an escaped quote in it
+// comes out partly in clear. So the cause is classified by type and dropped.
+//
+// pgx also reads the files a DSN names (sslrootcert, sslcert, sslkey,
+// servicefile), and a file that is missing or unreadable is not a parse
+// error, so it gets its own message.
+func dsnError(err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		return errors.New("tether: a file the PostgreSQL DSN names (sslrootcert, sslcert, sslkey or servicefile) " +
+			"could not be read: check the path and its permissions (the error is not shown, since it could quote the password)")
+	}
+
+	return errors.New("tether: the PostgreSQL DSN does not parse: " +
+		"use a postgres:// URL or key=value pairs, and check any pool_* values " +
+		"(the error is not shown, since it could quote the password)")
 }
 
 // openDB opens the grove database the settings name. It assumes
@@ -163,6 +184,14 @@ func openPostgres(dsn string) (*grove.DB, error) {
 	drv := pgdriver.New()
 
 	if err := drv.Open(ctx, dsn); err != nil {
+		// A parse error carries the DSN, so it never goes out wrapped.
+		// validateDatabase runs the same parser first, so this is the
+		// backstop for a caller that skipped it.
+		var parseErr *pgconn.ParseConfigError
+		if errors.As(err, &parseErr) || errors.As(err, new(*fs.PathError)) {
+			return nil, dsnError(err)
+		}
+
 		return nil, fmt.Errorf("tether: open postgres %s: %w", describeDSN(dsn), err)
 	}
 
@@ -217,15 +246,26 @@ func migrateKeysmith(ctx context.Context, db *grove.DB) (err error) {
 
 	// The lock belongs to the session, and Release only returns the session
 	// to the pool, so drop it here whatever happens. ctx may be the thing
-	// that failed, so the unlock gets its own. If it fails, the pooled
-	// session still holds the lock, so startup fails and the caller closes
-	// the pool.
+	// that failed, so the unlock gets its own. Only this lock is dropped:
+	// pg_advisory_unlock returns false when the session did not hold it,
+	// which means something else released it, and that is an error too. If
+	// the unlock fails, the pooled session may still hold the lock, so
+	// startup fails and the caller closes the pool.
 	defer func() {
 		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		if _, uerr := conn.Exec(uctx, "SELECT pg_advisory_unlock_all()"); uerr != nil && err == nil {
+		var released bool
+
+		uerr := conn.QueryRow(uctx, "SELECT pg_advisory_unlock($1)", keysmithMigrationLock).Scan(&released)
+
+		switch {
+		case err != nil:
+			// The migration's own error is the one to report.
+		case uerr != nil:
 			err = fmt.Errorf("tether: migrate keysmith: release the lock: %w", uerr)
+		case !released:
+			err = errors.New("tether: migrate keysmith: release the lock: the session no longer held it")
 		}
 	}()
 
