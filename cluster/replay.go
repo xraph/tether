@@ -36,7 +36,10 @@ import (
 // share a consumer run on the same goroutine, so a slow fn slows the others.
 // An error from fn ends this call with that error (wrapped) and does not
 // affect the calls it shares a consumer with. When Replay returns, fn is not
-// running and will not run again. ctx ends the call with its error; the
+// running and will not run again. ctx ends the call with an error that wraps
+// ctx's and says how far the consumer got (being made, being asked what it
+// holds, or how many messages it handed out and how long it has been quiet),
+// so a call that ran out of time can be told from one that was only slow; the
 // consumer stops when no call is left using it.
 func (l *Log) Replay(ctx context.Context, tenant string, fromSeq, toSeq uint64, fn func(LogMessage) error) error {
 	if subject.LogTenantAll(tenant) == "" {
@@ -74,9 +77,17 @@ func (l *Log) Replay(ctx context.Context, tenant string, fromSeq, toSeq uint64, 
 	case <-ctx.Done():
 		// A fn that is running holds the waiter, so this waits for it.
 		w.end(ctx.Err())
+
+		state := r.state()
+
 		r.shutdownIfIdle()
 
-		return w.result()
+		err := w.result()
+		if err != nil && errors.Is(err, ctx.Err()) {
+			return fmt.Errorf("cluster: replay of seq %d to %d: %w (%s)", w.from, w.to, err, state)
+		}
+
+		return err
 	}
 }
 
@@ -118,7 +129,7 @@ func (l *Log) join(tenant string, w *waiter) (r *replayer, created bool) {
 
 	r = &replayer{
 		l: l, tenant: tenant, start: w.from, pos: w.from - 1, waiters: []*waiter{w}, stop: make(chan struct{}),
-		stall: newStallWatch(l.stallAfter),
+		stall: newStallWatch(l.stallAfter), began: time.Now(),
 	}
 	l.replayers[tenant] = append(l.replayers[tenant], r)
 
@@ -193,12 +204,24 @@ func (w *waiter) result() error {
 	return w.err
 }
 
+// How far a replayer's goroutine got, for the error of a call whose context
+// ended first.
+const (
+	phaseOpening  int32 = iota // making the consumer
+	phaseChecking              // asking it what it holds (checkEmpty)
+	phaseReading               // reading its messages
+)
+
 // replayer is one consumer shared by the Replay calls of a tenant.
 type replayer struct {
 	l      *Log
 	tenant string
 	start  uint64 // the first sequence the consumer reads
 	stop   chan struct{}
+
+	phase   atomic.Int32
+	handled atomic.Int64 // messages the consumer handed out
+	began   time.Time
 
 	mu      sync.Mutex
 	pos     uint64 // the last sequence handed out, or start-1
@@ -246,9 +269,13 @@ func (r *replayer) run() {
 
 	defer r.l.dropConsumer(cons)
 
+	r.phase.Store(phaseChecking)
+
 	// A range with nothing of the tenant's left would never see a message to
 	// tell it so.
 	r.checkEmpty(cons)
+
+	r.phase.Store(phaseReading)
 
 	ended := make(chan struct{})
 	defer close(ended)
@@ -385,6 +412,8 @@ func (r *replayer) handle(m jetstream.Msg) {
 	r.stall.progress()
 	defer r.stall.progress()
 
+	r.handled.Add(1)
+
 	r.stall.busy.Store(true)
 	defer r.stall.busy.Store(false)
 
@@ -430,6 +459,32 @@ func (r *replayer) handle(m jetstream.Msg) {
 	}
 
 	r.shutdownIfIdle()
+}
+
+// state says how far the consumer got, for a call that ran out of time.
+func (r *replayer) state() string {
+	r.mu.Lock()
+	pos, closed := r.pos, r.closed
+	waiting := 0
+
+	for _, w := range r.waiters {
+		if !w.fin.Load() {
+			waiting++
+		}
+	}
+	r.mu.Unlock()
+
+	age := time.Since(r.began).Round(time.Millisecond)
+
+	switch r.phase.Load() {
+	case phaseOpening:
+		return fmt.Sprintf("consumer from seq %d still being made after %s", r.start, age)
+	case phaseChecking:
+		return fmt.Sprintf("consumer from seq %d made, still being asked what it holds after %s", r.start, age)
+	default:
+		return fmt.Sprintf("consumer from seq %d reading for %s: %d messages handed out, last seq %d, quiet %s, %d other calls waiting, closed %v",
+			r.start, age, r.handled.Load(), pos, r.stall.quiet().Round(time.Millisecond), waiting, closed)
+	}
 }
 
 // shutdownIfIdle closes the consumer when no call is waiting on it.

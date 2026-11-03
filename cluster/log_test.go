@@ -906,6 +906,11 @@ func TestReplayCancelAndHandlerError(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 
+	// The error says how far the consumer got.
+	if !strings.Contains(err.Error(), "messages handed out") {
+		t.Fatalf("err = %v, want the consumer's progress in it", err)
+	}
+
 	if running.Load() != 0 {
 		t.Fatal("handler still running after Replay returned")
 	}
