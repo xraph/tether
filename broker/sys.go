@@ -227,9 +227,20 @@ func (b *Broker) runSys(srv *mqtt.Server, interval time.Duration, stop <-chan st
 // under each live tenant's own "$SYS/<tenant>/..." names. They are not
 // retained. Only that tenant's clients can read them: OnACLCheck strips the
 // subscriber's tenant from every delivery.
+//
+// In a cell with Cluster.Load the connection and message counts are the
+// cell's (CellUsage): this node's plus every other node's latest report. The
+// subscription and retained counts stay this node's.
 func (b *Broker) publishSys(srv *mqtt.Server) {
 	for tenantID, st := range collect(srv, "", true) {
 		b.addCounters(tenantID, st)
+
+		if b.reportsLoad() {
+			cu := b.CellUsage(tenantID)
+			st.Connected = cu.Connections
+			st.MessagesIn = cu.MessagesIn
+			st.MessagesOut = cu.MessagesOut
+		}
 
 		for _, t := range sysTopics {
 			name := topic.Namespace(tenantID, t.name)

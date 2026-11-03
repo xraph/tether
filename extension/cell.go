@@ -84,6 +84,7 @@ func (e *Extension) openCell(ctx context.Context, st store.Store, tenants *servi
 		Sessions: cluster.NewSessions(conn, cfg),
 		Log:      cluster.NewLog(conn, cfg),
 		Retained: cluster.NewRetained(conn, cfg),
+		Load:     cluster.NewLoad(conn, cfg),
 		Members:  c.members,
 		Control:  c.control,
 	}

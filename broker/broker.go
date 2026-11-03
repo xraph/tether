@@ -75,6 +75,17 @@ type Broker struct {
 	// shorten it before Start.
 	sysInterval time.Duration
 
+	// loadInterval, when a test sets it before Start, replaces the sampling
+	// interval of the load loop (clusterload.go): Config.LoadInterval in a
+	// cell, defaultRateInterval outside one.
+	loadInterval time.Duration
+
+	// load is the view of the cell's load (clusterload.go). loadCancel ends
+	// the load loop and the load watch, which loadWG waits for.
+	load       loadView
+	loadCancel context.CancelFunc
+	loadWG     sync.WaitGroup
+
 	// disconnectHold, when set before Start, runs in lastHook.OnDisconnect
 	// before (removed false) and after (removed true) the state is removed,
 	// so a test can hold a connection in either window. Tests only.
@@ -304,6 +315,10 @@ func (b *Broker) Start(ctx context.Context) error {
 	b.sysStop, b.sysDone = make(chan struct{}), make(chan struct{})
 	go b.runSys(srv, interval, b.sysStop, b.sysDone)
 
+	// The load loop samples usage for rates and, in a cell with a Load,
+	// reports it and watches the other nodes' reports.
+	b.startLoad(b.startedAt)
+
 	return nil
 }
 
@@ -399,6 +414,7 @@ func (b *Broker) Stop(ctx context.Context) error {
 	srv := b.server
 	ids := b.listenerIDs
 	sysStop, sysDone := b.sysStop, b.sysDone
+	loadCancel := b.loadCancel
 	b.server = nil
 	b.mu.Unlock()
 
@@ -413,6 +429,10 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// server that is closing.
 		close(sysStop)
 		<-sysDone
+
+		// The load report and the load watch end with it. A report or a
+		// watch start waiting on NATS ends with their context.
+		b.stopLoad(loadCancel)
 
 		// Pending reload retries end before the clients go.
 		b.stopRetries()

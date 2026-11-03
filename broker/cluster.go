@@ -75,6 +75,16 @@ type Cluster struct {
 	// changes stay on this node and a session another node serves can be
 	// neither kicked nor deleted from here.
 	Control *cluster.Control
+
+	// Load publishes this node's load reports and watches the other nodes'
+	// (clusterload.go). When it is set, the broker reports its Usage every
+	// Config.LoadInterval from Start until Stop and keeps every other node's
+	// latest report, which gives CellUsage, RemoteConnections, TenantRates
+	// and Nodes the whole cell, and the tenants' $SYS connection and message
+	// counts the cell's. The broker starts and stops both loops itself; it
+	// needs the load bucket Provision makes. Nil: those calls answer for
+	// this node alone.
+	Load *cluster.Load
 }
 
 // injectorID is the client ID of the injector, the inline client that

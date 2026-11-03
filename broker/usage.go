@@ -115,6 +115,11 @@ func (b *Broker) StartedAt() time.Time {
 // counted. ConnectionTime is integrated up to the call. It takes no lock a
 // publish needs and calls into neither mochi nor the cell.
 func (b *Broker) Usage() []TenantUsage {
+	return b.usageAt(time.Now())
+}
+
+// usageAt is Usage with the connection time integrated up to now.
+func (b *Broker) usageAt(now time.Time) []TenantUsage {
 	b.countersMu.Lock()
 	tenants := make([]string, 0, len(b.counters))
 	counters := make([]*tenantCounters, 0, len(b.counters))
@@ -125,23 +130,43 @@ func (b *Broker) Usage() []TenantUsage {
 	}
 	b.countersMu.Unlock()
 
-	now := time.Now()
 	out := make([]TenantUsage, len(tenants))
 
 	for i, c := range counters {
-		conns, total := c.clock.read(now)
-		out[i] = TenantUsage{
-			Tenant:         tenants[i],
-			Connections:    conns,
-			MessagesIn:     c.in.Load(),
-			MessagesOut:    c.out.Load(),
-			BytesIn:        c.bytesIn.Load(),
-			BytesOut:       c.bytesOut.Load(),
-			ConnectionTime: total,
-		}
+		out[i] = c.usage(tenants[i], now)
 	}
 
 	slices.SortFunc(out, func(a, b TenantUsage) int { return strings.Compare(a.Tenant, b.Tenant) })
 
 	return out
+}
+
+// usage reads the counters as tenantID's TenantUsage, with the connection
+// time integrated up to now.
+func (c *tenantCounters) usage(tenantID string, now time.Time) TenantUsage {
+	conns, total := c.clock.read(now)
+
+	return TenantUsage{
+		Tenant:         tenantID,
+		Connections:    conns,
+		MessagesIn:     c.in.Load(),
+		MessagesOut:    c.out.Load(),
+		BytesIn:        c.bytesIn.Load(),
+		BytesOut:       c.bytesOut.Load(),
+		ConnectionTime: total,
+	}
+}
+
+// localUsage is tenantID's row of Usage, integrated up to now: zero but for
+// Tenant when this node has not seen the tenant.
+func (b *Broker) localUsage(tenantID string, now time.Time) TenantUsage {
+	b.countersMu.Lock()
+	c := b.counters[tenantID]
+	b.countersMu.Unlock()
+
+	if c == nil {
+		return TenantUsage{Tenant: tenantID}
+	}
+
+	return c.usage(tenantID, now)
 }
