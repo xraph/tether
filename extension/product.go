@@ -14,6 +14,7 @@ import (
 	"github.com/xraph/ledger"
 	"github.com/xraph/vessel"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/audit"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/id"
@@ -327,7 +328,9 @@ func (c countingSink) Meter(ctx context.Context, t metering.Tenant, feature stri
 	return err
 }
 
-// countingTenants counts the meter's failed tenant lookups.
+// countingTenants counts the meter's failed tenant lookups. A tenant that
+// no longer exists is not a failure: the meter drops its usage (and says so
+// once), and counting it would put a deleted tenant on the outage signal.
 type countingTenants struct {
 	t metering.Tenants
 	m *productMetrics
@@ -335,7 +338,7 @@ type countingTenants struct {
 
 func (c countingTenants) Get(ctx context.Context, tenantID string) (metering.Tenant, error) {
 	t, err := c.t.Get(ctx, tenantID)
-	if err != nil {
+	if err != nil && !errors.Is(err, tether.ErrNotFound) {
 		c.m.meteringErrors.Inc()
 	}
 

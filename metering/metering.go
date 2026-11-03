@@ -99,11 +99,17 @@ func DefaultConfig() Config {
 
 // Validate reports a feature key that is longer than 64 bytes, has a byte
 // outside [-_.a-zA-Z0-9], or is shared with another meter (the sink counts a
-// key once, so two meters under one feature would lose one of them). It also
-// reports a non-positive Interval when metering is enabled.
+// key once, so two meters under one feature would lose one of them). When
+// metering is enabled it also reports a non-positive Interval and a config
+// whose feature keys are all empty, which would meter nothing.
 func (c Config) Validate() error {
 	if c.Enabled && c.Interval <= 0 {
 		return fmt.Errorf("metering: interval must be positive, got %s", c.Interval)
+	}
+
+	if c.Enabled && c.Features == (Features{}) {
+		return errors.New("metering: enabled with every key in features empty, which meters nothing; " +
+			"set at least one, or start from DefaultConfig")
 	}
 
 	seen := make(map[string]string, 5)

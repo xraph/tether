@@ -239,13 +239,16 @@ func NewEntitlements(cfg EntitlementConfig, tenants Tenants, chk Checker, logger
 // errClosed is the failure a check records when it would start after Close.
 var errClosed = errors.New("metering: entitlements closed")
 
-// Close ends the background refreshes Allow started: their checks are
-// canceled, and Close returns once they have ended. After it no check calls
-// the Checker: a refresh is not started, and a tenant with nothing
-// remembered gets the outage rules at once, as when every check slot is
-// taken. Run is ended by its own context. Call Close before the Checker's
-// backend stops (the extension calls it at Stop, before the broker and
-// ledger stop). A second call does nothing.
+// Close stops new checks from starting and ends the background refreshes
+// Allow started: their contexts are canceled, and Close returns once each
+// has given up. After it no new check starts: a refresh is not started, and
+// a tenant with nothing remembered gets the outage rules at once, as when
+// every check slot is taken. A check gives up on its context without waiting
+// for the Checker, so a Checker that ignores ctx can still be running after
+// Close returns, and a CONNECT's check that started before Close runs until
+// its own CheckTimeout. Run is ended by its own context. Call Close before
+// the Checker's backend stops (the extension calls it at Stop, before the
+// broker and ledger stop). A second call does nothing.
 func (e *Entitlements) Close() {
 	e.mu.Lock()
 	e.closed = true

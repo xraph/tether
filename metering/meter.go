@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/broker"
 )
 
@@ -28,6 +29,8 @@ type Meter struct {
 	// accepted is the cumulative value the sink last took, per tenant and
 	// feature key.
 	accepted map[pair]uint64
+	// gone holds the tenants found deleted, logged once each.
+	gone map[string]struct{}
 
 	// runMu guards the loop's lifecycle.
 	runMu  sync.Mutex
@@ -49,6 +52,7 @@ func New(cfg Config, src Source, tenants Tenants, sink Sink, nodeID string, logg
 	return &Meter{
 		cfg: cfg, src: src, tenants: tenants, sink: sink, nodeID: nodeID, log: logger,
 		accepted: make(map[pair]uint64),
+		gone:     make(map[string]struct{}),
 	}
 }
 
@@ -120,7 +124,9 @@ func (m *Meter) Stop(ctx context.Context) error {
 // cumulative value minus what the sink last accepted, when that is positive.
 // It returns the errors of every delta the sink did not take, joined. Those
 // deltas go out in a later window, with the growth since. A delta the sink
-// rejected (ErrRejected) is logged and dropped, and is not an error here.
+// rejected (ErrRejected) is logged and dropped, and is not an error here, and
+// so is the usage of a tenant whose lookup says it no longer exists
+// (tether.ErrNotFound), logged once at Info.
 // While the source's StartedAt is zero (the broker is not started) it sends
 // nothing and the window is not counted.
 func (m *Meter) Flush(ctx context.Context) error {
@@ -141,6 +147,7 @@ func (m *Meter) Flush(ctx context.Context) error {
 		// The broker restarted and its counters began again from zero.
 		m.started = started.UnixNano()
 		clear(m.accepted)
+		clear(m.gone)
 	}
 
 	var errs []error
@@ -188,6 +195,12 @@ func (m *Meter) flushTenant(ctx context.Context, u broker.TenantUsage) []error {
 	}
 
 	t, err := m.tenants.Get(ctx, u.Tenant)
+	if errors.Is(err, tether.ErrNotFound) {
+		m.dropDeleted(u.Tenant, pending)
+
+		return nil
+	}
+
 	if err != nil {
 		return []error{fmt.Errorf("metering: tenant %s: %w", u.Tenant, err)}
 	}
@@ -213,6 +226,23 @@ func (m *Meter) flushTenant(ctx context.Context, u broker.TenantUsage) []error {
 	}
 
 	return errs
+}
+
+// dropDeleted gives up the pending usage of a tenant that no longer exists:
+// nothing can bill it, and retrying it every window would only fail. The
+// first time per tenant it is logged at Info.
+func (m *Meter) dropDeleted(tenantID string, pending []delta) {
+	for _, d := range pending {
+		m.accepted[pair{tenantID, d.feature}] = d.cum
+	}
+
+	if _, seen := m.gone[tenantID]; seen {
+		return
+	}
+
+	m.gone[tenantID] = struct{}{}
+
+	m.log.Info("metering: tenant no longer exists, dropping its unsent usage", "tenant", tenantID)
 }
 
 func clampInt64(v uint64) int64 {

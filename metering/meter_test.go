@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/metering"
 )
@@ -495,6 +496,55 @@ func TestTenantLookupFailureRetriesNextWindow(t *testing.T) {
 	}
 }
 
+// A tenant deleted while it had usage the sink had not taken is not an
+// outage: its usage is dropped and logged once, and no window fails over it.
+func TestDeletedTenantDropped(t *testing.T) {
+	r := newRig(t, onlyMessagesIn(), zeta)
+	r.tenants.fails[acme.ID] = fmt.Errorf("tether/memory: get tenant: %w", tether.ErrNotFound)
+
+	var logs bytes.Buffer
+	r.meter = metering.New(onlyMessagesIn(), r.src, r.tenants, r.sink, "node-a",
+		slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	r.src.set(
+		broker.TenantUsage{Tenant: acme.ID, MessagesIn: 3},
+		broker.TenantUsage{Tenant: zeta.ID, MessagesIn: 8},
+	)
+
+	for i := range 2 {
+		if err := r.meter.Flush(t.Context()); err != nil {
+			t.Fatalf("Flush %d: %v", i+1, err)
+		}
+	}
+
+	if got := r.sink.totalMessagesIn(acme.ID); got != 0 {
+		t.Fatalf("sent %d of a deleted tenant's usage", got)
+	}
+
+	if got := r.sink.totalMessagesIn(zeta.ID); got != 8 {
+		t.Fatalf("zeta total %d, want 8", got)
+	}
+
+	if n := r.tenants.gets[acme.ID]; n != 1 {
+		t.Fatalf("looked the deleted tenant up %d times, want 1", n)
+	}
+
+	if n := strings.Count(logs.String(), "level=INFO"); n != 1 || !strings.Contains(logs.String(), acme.ID) {
+		t.Fatalf("want one Info line naming the tenant, got:\n%s", logs.String())
+	}
+
+	// More usage of the same tenant is dropped too, without another line.
+	r.src.set(broker.TenantUsage{Tenant: acme.ID, MessagesIn: 5})
+
+	if err := r.meter.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	if n := strings.Count(logs.String(), "level=INFO"); n != 1 {
+		t.Fatalf("logged the deleted tenant %d times", n)
+	}
+}
+
 func TestIdleTenantNotLooked(t *testing.T) {
 	r := newRig(t, onlyMessagesIn(), acme)
 
@@ -609,6 +659,23 @@ func TestConfigValidate(t *testing.T) {
 				t.Fatal("want an error")
 			}
 		})
+	}
+}
+
+// Metering on with every feature key empty would meter nothing at all.
+func TestConfigValidateEnabledNeedsAFeature(t *testing.T) {
+	cfg := metering.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Features = metering.Features{}
+
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "features") {
+		t.Fatalf("Validate = %v, want an error naming features", err)
+	}
+
+	cfg.Features.ConnectionMinutes = "tether.connection.minutes"
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("one feature is enough: %v", err)
 	}
 }
 

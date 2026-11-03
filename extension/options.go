@@ -66,16 +66,25 @@ func WithCluster(cfg cluster.Config) Option {
 	}
 }
 
-// WithMetering sends each tenant's usage to ledger, configured by cfg. Start
-// from metering.DefaultConfig and set Enabled: the option takes cfg as it is,
-// so Enabled false leaves metering off, and an empty feature key turns that
-// meter off. A zero Interval takes the default (60 s). The app must register
-// ledger's extension, or Start fails with ErrLedgerRequired. The "metering"
-// block of the config file sets the same thing.
+// WithMetering sends each tenant's usage to ledger, configured by cfg.
+// Enabled false leaves metering off. A zero Interval takes the default
+// (60 s), and Features with every key empty take metering.DefaultConfig's
+// five, so WithMetering(metering.Config{Enabled: true}) meters everything
+// under the tether.* keys. Name any key and the others stay as you gave
+// them: an empty one turns that meter off. The app must register ledger's
+// extension, or Start fails with ErrLedgerRequired. The "metering" block of
+// the config file sets the same thing, and there a block with every key
+// empty fails Start (metering.Config.Validate).
 func WithMetering(cfg metering.Config) Option {
 	return func(e *Extension) {
+		def := metering.DefaultConfig()
+
 		if cfg.Interval == 0 {
-			cfg.Interval = metering.DefaultConfig().Interval
+			cfg.Interval = def.Interval
+		}
+
+		if cfg.Features == (metering.Features{}) {
+			cfg.Features = def.Features
 		}
 
 		e.config.Metering = cfg

@@ -2,12 +2,18 @@ package extension
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/xraph/forge"
 
+	"github.com/xraph/tether"
 	"github.com/xraph/tether/audit"
+	"github.com/xraph/tether/broker"
+	"github.com/xraph/tether/metering"
 	"github.com/xraph/tether/service"
 	"github.com/xraph/tether/store/memory"
 )
@@ -142,4 +148,73 @@ func TestAuditDroppedFeedsTheCounter(t *testing.T) {
 	if c.n != float64(rec.Dropped()) {
 		t.Fatalf("counter %v, recorder dropped %d", c.n, rec.Dropped())
 	}
+}
+
+// incCounter counts Inc; nothing else of forge.Counter is called.
+type incCounter struct {
+	forge.Counter
+	n int
+}
+
+func (c *incCounter) Inc() { c.n++ }
+
+// goneTenants answers every lookup the way the store answers a deleted
+// tenant.
+type goneTenants struct{}
+
+func (goneTenants) Get(_ context.Context, tenantID string) (metering.Tenant, error) {
+	return metering.Tenant{}, fmt.Errorf("tether/memory: get tenant %s: %w", tenantID, tether.ErrNotFound)
+}
+
+// failSink fails every call: the meter must not reach it.
+type failSink struct{ calls *int }
+
+func (s failSink) Meter(context.Context, metering.Tenant, string, int64, string) error {
+	*s.calls++
+
+	return errors.New("not expected")
+}
+
+// usageSource is a started broker with fixed usage.
+type usageSource struct{ usage []broker.TenantUsage }
+
+func (s usageSource) Usage() []broker.TenantUsage { return s.usage }
+func (usageSource) StartedAt() time.Time          { return time.Unix(1_700_000_000, 0) }
+
+// A deleted tenant with unsent usage is not a metering error: no window
+// fails over it and tether_metering_errors_total stays where it was.
+func TestMeteringDeletedTenantNotCounted(t *testing.T) {
+	errs := &incCounter{}
+	m := &productMetrics{meteringErrors: errs}
+	calls := 0
+
+	meter := metering.New(metering.DefaultConfig(),
+		usageSource{usage: []broker.TenantUsage{{Tenant: "ttnt_gone", MessagesIn: 4, BytesIn: 40}}},
+		countingTenants{t: goneTenants{}, m: m}, countingSink{s: failSink{calls: &calls}, m: m}, "n1", slog.New(slog.DiscardHandler))
+
+	for i := range 2 {
+		if err := meter.Flush(t.Context()); err != nil {
+			t.Fatalf("Flush %d: %v", i+1, err)
+		}
+	}
+
+	if calls != 0 {
+		t.Fatalf("the sink was called %d times", calls)
+	}
+
+	if errs.n != 0 {
+		t.Fatalf("tether_metering_errors_total went up by %d", errs.n)
+	}
+
+	// Another lookup error still counts.
+	if _, err := (countingTenants{t: failTenants{}, m: m}).Get(t.Context(), "ttnt_x"); err == nil || errs.n != 1 {
+		t.Fatalf("a failed lookup: err %v, counter %d", err, errs.n)
+	}
+}
+
+// failTenants fails every lookup with an outage.
+type failTenants struct{}
+
+func (failTenants) Get(context.Context, string) (metering.Tenant, error) {
+	return metering.Tenant{}, errors.New("store down")
 }
