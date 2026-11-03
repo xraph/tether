@@ -332,7 +332,7 @@ func TestClusterHealthReportsFenced(t *testing.T) {
 	ccfg.NoDiscovery = true
 	ccfg.Heartbeat = 100 * time.Millisecond
 	ccfg.Lease = time.Second
-	ccfg.LoadInterval = 500 * time.Millisecond // Validate: at most Lease/2.
+	ccfg.LoadInterval = 300 * time.Millisecond // Validate: at most Lease/3.
 
 	e := startApp(t, newApp(t), false, extension.WithInsecureAdminRoutes(), extension.WithBrokerConfig(loopback()),
 		extension.WithCluster(ccfg))

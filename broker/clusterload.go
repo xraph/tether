@@ -2,6 +2,8 @@ package broker
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"log/slog"
 	"math"
 	"slices"
@@ -35,6 +37,9 @@ const (
 	// start: 200 ms, doubling up to 5 s.
 	loadWatchRetry    = 200 * time.Millisecond
 	loadWatchRetryMax = 5 * time.Second
+
+	// withdrawWait bounds the withdrawal of the load report at Stop.
+	withdrawWait = 2 * time.Second
 )
 
 // shareInterval is how often a node in a cell with a Cluster.Load recomputes
@@ -185,6 +190,24 @@ func (b *Broker) stopLoad(cancel context.CancelFunc) {
 	b.load.mu.Unlock()
 }
 
+// withdrawLoad removes this node's load report from the cell, so its peers
+// stop counting its connections at once instead of for up to three intervals.
+// Stop calls it once mochi has shut down, after the last report. It waits
+// withdrawWait at most, and a failure is only logged at Debug: the report's
+// lifetime takes it down anyway.
+func (b *Broker) withdrawLoad() {
+	if !b.reportsLoad() {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), withdrawWait)
+	defer cancel()
+
+	if err := b.cluster.Load.Withdraw(ctx); err != nil {
+		b.log.Debug("tether: withdrawing the load report failed; it expires on its own", slog.Any("error", err))
+	}
+}
+
 // runLoad samples this node's usage at once and then every interval until
 // ctx ends, and in a cell with a Load reports each sample. A failed report is
 // not retried: the next tick sends a fresh one.
@@ -192,20 +215,34 @@ func (b *Broker) runLoad(ctx context.Context, started time.Time, interval time.D
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
-	var warned time.Time
+	var (
+		warned time.Time
+		// reported is every tenant's entry as of the last report NATS
+		// took, the ones left out of it included.
+		reported map[string]cluster.TenantLoad
+	)
 
 	for {
 		snap := b.sampleLoad(started)
 
 		if b.reportsLoad() {
-			if err := b.reportLoad(ctx, snap, interval); err != nil && ctx.Err() == nil {
-				if now := time.Now(); now.Sub(warned) >= loadWarnEvery {
+			tenants := reportTenants(snap.tenants, reported)
+
+			err := b.reportLoad(ctx, snap, tenants, interval)
+
+			switch {
+			case err == nil:
+				reported = snap.tenants
+			case ctx.Err() != nil:
+			default:
+				now := time.Now()
+				loud := now.Sub(warned) >= loadWarnEvery
+
+				if loud {
 					warned = now
-					b.log.Warn("tether: load report failed; peers count this node's last report until it expires",
-						slog.Any("error", err))
-				} else {
-					b.log.Debug("tether: load report failed", slog.Any("error", err))
 				}
+
+				b.logReportFailure(err, snap, tenants, loud)
 			}
 		}
 
@@ -244,18 +281,67 @@ func (b *Broker) sampleLoad(started time.Time) *loadSnap {
 	return snap
 }
 
-// reportLoad publishes snap as this node's load report. It gives up after the
-// report's lifetime (loadStaleAfter intervals): a report that lands later is
-// of no use.
-func (b *Broker) reportLoad(ctx context.Context, snap *loadSnap, interval time.Duration) error {
+// reportLoad publishes snap's time and tenants as this node's load report.
+// It gives up after the report's lifetime (loadStaleAfter intervals): a
+// report that lands later is of no use.
+func (b *Broker) reportLoad(ctx context.Context, snap *loadSnap, tenants map[string]cluster.TenantLoad, interval time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, loadStaleAfter*interval)
 	defer cancel()
 
 	return b.cluster.Load.Report(ctx, &cluster.NodeLoad{
 		StartedAt: snap.startedAt,
 		At:        snap.at,
-		Tenants:   snap.tenants,
+		Tenants:   tenants,
 	})
+}
+
+// reportTenants is what goes in a load report out of a sample's tenants: all
+// of them but those with no connection whose entry is the same as in the last
+// report NATS took (reported, nil before the first). Every peer already holds
+// that entry and keeps it (onLoad), so the report grows with the tenants that
+// are active, not with every tenant the node has seen since it started.
+func reportTenants(all, reported map[string]cluster.TenantLoad) map[string]cluster.TenantLoad {
+	out := make(map[string]cluster.TenantLoad, len(all))
+
+	for id, tl := range all {
+		if last, ok := reported[id]; ok && tl.Connections == 0 && last == tl {
+			continue
+		}
+
+		out[id] = tl
+	}
+
+	return out
+}
+
+// logReportFailure logs a load report that failed, at Warn or Error when loud
+// and at Debug otherwise. A report over NATS's max_payload gets Error with
+// the tenant count and size: until it fits, the peers forget this node once
+// its last report expires, so cell-wide limits stop counting it.
+func (b *Broker) logReportFailure(err error, snap *loadSnap, tenants map[string]cluster.TenantLoad, loud bool) {
+	if !loud {
+		b.log.Debug("tether: load report failed", slog.Any("error", err))
+
+		return
+	}
+
+	if errors.Is(err, cluster.ErrTooLarge) {
+		size := 0
+		if data, merr := json.Marshal(&cluster.NodeLoad{
+			NodeID: b.selfNodeID(), StartedAt: snap.startedAt, At: snap.at, Tenants: tenants,
+		}); merr == nil {
+			size = len(data)
+		}
+
+		b.log.Error("tether: load report is over NATS max_payload and was not sent; once this node's last report "+
+			"expires its peers count none of its connections, so cell connection and rate limits miss this node's share",
+			slog.Int("tenants", len(tenants)), slog.Int("bytes", size), slog.Any("error", err))
+
+		return
+	}
+
+	b.log.Warn("tether: load report failed; peers count this node's last report until it expires",
+		slog.Any("error", err))
 }
 
 // watchLoad keeps the view up to date with the other nodes' reports until
@@ -317,8 +403,36 @@ func (b *Broker) onLoad(nodeID string, r *cluster.NodeLoad, deleted bool) {
 		b.load.peers[nodeID] = p
 	}
 
-	p.prev, p.last = p.last, &loadSnap{startedAt: r.StartedAt, at: r.At, tenants: r.Tenants}
+	p.prev, p.last = p.last, &loadSnap{startedAt: r.StartedAt, at: r.At, tenants: keepIdle(p.last, r)}
 	p.seen = time.Now()
+}
+
+// keepIdle is r's tenants plus those of last that r leaves out, with no
+// connections: a node leaves out a tenant whose entry has not moved since its
+// last report and that has no connection (reportTenants), so its counters
+// are the ones last holds. Only within one run of the node: a report with
+// another StartedAt counts from zero again.
+func keepIdle(last *loadSnap, r *cluster.NodeLoad) map[string]cluster.TenantLoad {
+	tenants := r.Tenants
+
+	if last == nil || !last.startedAt.Equal(r.StartedAt) {
+		return tenants
+	}
+
+	for id, tl := range last.tenants {
+		if _, ok := tenants[id]; ok {
+			continue
+		}
+
+		if tenants == nil {
+			tenants = make(map[string]cluster.TenantLoad, len(last.tenants))
+		}
+
+		tl.Connections = 0
+		tenants[id] = tl
+	}
+
+	return tenants
 }
 
 // CellUsage returns tenantID's usage across the cell: this node's live usage

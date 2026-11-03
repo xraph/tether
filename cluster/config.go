@@ -100,8 +100,8 @@ type Config struct {
 	// LoadInterval is how often a node publishes its load report (per-tenant
 	// connection counts and usage) to the cell. A report lives three times
 	// this long, so a node that stops reporting drops out of its peers' view
-	// on its own. Above 0 and at most Lease/2. DefaultLoadInterval in
-	// DefaultConfig.
+	// on its own. Above 0 and at most Lease/3, so a report never outlives
+	// the lease. DefaultLoadInterval in DefaultConfig.
 	LoadInterval time.Duration `yaml:"load_interval" json:"load_interval"`
 }
 
@@ -200,8 +200,12 @@ func (c Config) Validate() error {
 		return fmt.Errorf("cluster: pull_heartbeat %s must be above 0 and at most %s, half the pull expiry", c.PullHeartbeat, maxPullHeartbeat)
 	}
 
-	if c.LoadInterval <= 0 || c.LoadInterval > c.Lease/2 {
-		return fmt.Errorf("cluster: load_interval %s must be above 0 and at most half the lease (%s)", c.LoadInterval, c.Lease/2)
+	// A report lives loadReportLifetimes intervals. One that outlived the
+	// lease would still count a dead node's connections after the cell
+	// reclaimed its sessions, when the takeover rescue no longer applies.
+	if c.LoadInterval <= 0 || loadReportLifetimes*c.LoadInterval > c.Lease {
+		return fmt.Errorf("cluster: load_interval %s must be above 0 and at most a third of the lease (%s): a report lives three intervals",
+			c.LoadInterval, c.Lease/loadReportLifetimes)
 	}
 
 	if c.LogMaxAge < 0 {

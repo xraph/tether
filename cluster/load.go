@@ -200,6 +200,41 @@ func (l *Load) Report(ctx context.Context, r *NodeLoad) error {
 	return nil
 }
 
+// Withdraw removes this node's load report from the bucket, so its peers
+// stop counting it at once instead of after its lifetime. A node calls it
+// when it stops gracefully, after its last report and once its clients are
+// gone; reporting again after it puts the report back.
+//
+// It is a purge of the node's key, whose marker lives as long as a report
+// (three LoadIntervals) and then leaves nothing behind. A Watch reports it as
+// a removal. Withdrawing a key that is already gone is not an error. A NATS
+// error that says it could not be reached or did not answer in time wraps
+// ErrUnavailable; the report's own lifetime still takes it down then. A call
+// without a context deadline gets 10 s.
+func (l *Load) Withdraw(ctx context.Context) error {
+	if err := checkNodeID(l.nodeID); err != nil {
+		return fmt.Errorf("cluster: withdraw load: %w: %w", err, tether.ErrInvalidInput)
+	}
+
+	ctx, cancel := opContext(ctx)
+	defer cancel()
+
+	h, err := l.handles(ctx)
+	if err != nil {
+		return err
+	}
+
+	// The marker's TTL in whole seconds, one at least, as ttlHeader rounds
+	// a report's.
+	ttl := max(time.Second, (loadReportLifetimes*l.interval + time.Second - 1).Truncate(time.Second))
+
+	if err := h.kv.Purge(ctx, l.nodeID, jetstream.PurgeTTL(ttl)); err != nil {
+		return l.wrapErr("withdraw load", err)
+	}
+
+	return nil
+}
+
 // Watch keeps fn up to date with every node's load report, this node's
 // included.
 //

@@ -712,10 +712,11 @@ tether:
     urls: [%s]
     heartbeat: %s
     lease: %s
+    load_interval: %s
     replicas: 3
     no_discovery: true
 `, n.http, filepath.Join(c.dir, "tether.db"), n.mqtt, filepath.Join(c.dir, n.id, "sessions"),
-		n.id, cellName, strings.Join(quoted, ", "), c.heartbeat, c.lease)
+		n.id, cellName, strings.Join(quoted, ", "), c.heartbeat, c.lease, min(cluster.DefaultLoadInterval, c.lease/3))
 }
 
 func (c *testCell) launchBroker(i int) {

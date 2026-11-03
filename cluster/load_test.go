@@ -559,7 +559,11 @@ func TestLoadIntervalConfig(t *testing.T) {
 		{"default", good(func(*Config) {}), false},
 		{"zero", good(func(c *Config) { c.LoadInterval = 0 }), true},
 		{"negative", good(func(c *Config) { c.LoadInterval = -time.Second }), true},
-		{"half the lease", good(func(c *Config) { c.LoadInterval = c.Lease / 2 }), false},
+		// A report lives three intervals, and must not outlive the lease
+		// (a reclaimed dead node's report would still count).
+		{"a third of the lease", good(func(c *Config) { c.LoadInterval = c.Lease / 3 }), false},
+		{"over a third of the lease", good(func(c *Config) { c.LoadInterval = c.Lease/3 + time.Nanosecond }), true},
+		{"half the lease", good(func(c *Config) { c.LoadInterval = c.Lease / 2 }), true},
 		{"over half the lease", good(func(c *Config) { c.LoadInterval = c.Lease/2 + time.Nanosecond }), true},
 	} {
 		err := tc.cfg.Validate()
@@ -648,5 +652,45 @@ func TestProvisionCreatesLoadBucket(t *testing.T) {
 				t.Errorf("load bucket has %d replicas, sessions bucket %d", sc.Replicas, sr)
 			}
 		})
+	}
+}
+
+// A node that withdraws its report leaves its peers' view at once, long
+// before the report's lifetime runs out.
+func TestLoadWithdraw(t *testing.T) {
+	loads := startLoads(t, 2, 10*time.Second) // a 30 s lifetime
+	a, b := loads[0], loads[1]
+
+	feed := newLoadFeed()
+
+	stop, err := b.Watch(tctx(t, 30*time.Second), feed.fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(stop)
+
+	if err := a.Report(tctx(t, 10*time.Second), sampleLoad("n1", 0)); err != nil {
+		t.Fatal(err)
+	}
+
+	feed.waitN1(t, 10*time.Second, anyReport)
+
+	start := time.Now()
+
+	if err := a.Withdraw(tctx(t, 10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, "removal of the withdrawn report", 5*time.Second, func() bool { return feed.deleted("n1") > 0 })
+	t.Logf("withdrawn report removed after %s", time.Since(start).Round(10*time.Millisecond))
+
+	if feed.report("n1") != nil {
+		t.Fatal("the callback still holds the withdrawn report")
+	}
+
+	// Withdrawing again, with nothing left to remove, is not an error.
+	if err := a.Withdraw(tctx(t, 10*time.Second)); err != nil {
+		t.Fatalf("second withdraw: %v", err)
 	}
 }

@@ -117,8 +117,8 @@ func memberConfig(id, url string) Config {
 	cfg.Replicas = 3
 	cfg.Heartbeat = testHeartbeat
 	cfg.Lease = testLease
-	// Validate keeps LoadInterval at or under Lease/2.
-	cfg.LoadInterval = testLease / 2
+	// Validate keeps LoadInterval at or under Lease/3.
+	cfg.LoadInterval = testLease / 3
 
 	return cfg
 }

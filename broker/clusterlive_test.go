@@ -108,7 +108,7 @@ func startLiveCellWith(t *testing.T, nodes, proxied int, before func(*Broker)) *
 		ccfg.NoDiscovery = true
 		ccfg.Heartbeat = liveHeartbeat
 		ccfg.Lease = liveLease
-		ccfg.LoadInterval = liveLease / 2 // Validate: at most Lease/2.
+		ccfg.LoadInterval = liveLease / 3 // Validate: at most Lease/3.
 
 		if i < proxied {
 			p, err := chaos.NewProxy(strings.TrimPrefix(ccfg.URLs[0], "nats://"))

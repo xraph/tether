@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -308,4 +309,93 @@ func TestSingleNodeNodesAndRates(t *testing.T) {
 	assert.Equal(t, 1, b.CellUsage(tn.ID.String()).Connections)
 	assert.Zero(t, b.RemoteConnections(tn.ID.String()))
 	assert.Positive(t, b.TenantRates(tn.ID.String()).MessagesInPerSec)
+}
+
+// rawLoad watches the cell's load bucket and keeps the latest raw report of
+// each node, as it went over NATS.
+type rawLoad struct {
+	mu   sync.Mutex
+	last map[string]*cluster.NodeLoad
+}
+
+func watchRawLoad(t *testing.T, c *testCell) *rawLoad {
+	t.Helper()
+
+	cfg := c.nodes[0].cluster.Config
+	cfg.NodeID = "raw"
+
+	w := &rawLoad{last: make(map[string]*cluster.NodeLoad)}
+
+	stop, err := cluster.NewLoad(c.conns[0], cfg).Watch(t.Context(), func(id string, r *cluster.NodeLoad, _ bool) {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+
+		w.last[id] = r
+	})
+	require.NoError(t, err)
+	t.Cleanup(stop)
+
+	return w
+}
+
+// tenant returns node's latest raw entry for tenantID, and whether there is
+// a report at all and the tenant is in it.
+func (w *rawLoad) tenant(node, tenantID string) (cluster.TenantLoad, bool, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	r := w.last[node]
+	if r == nil {
+		return cluster.TenantLoad{}, false, false
+	}
+
+	tl, ok := r.Tenants[tenantID]
+
+	return tl, true, ok
+}
+
+// A tenant with no connection whose counters stood still since the node's
+// last report is left out of the next one, so the report stays small. Its
+// peers keep its last counters (CellUsage), count no connection for it and
+// read no rate from it, and when it comes back the rate is its new traffic.
+func TestLoadReportLeavesIdleTenantsOut(t *testing.T) {
+	c := startLoadCell(t, 2, loadTestInterval, nil)
+	b := c.nodes[1]
+	t1 := c.t1.ID.String()
+	raw := watchRawLoad(t, c)
+
+	pub, _, err := connect5(t, c.addr(0), "a1", "u1", true)
+	require.NoError(t, err)
+
+	for range 3 {
+		publish0(t, pub, "x", "x", nil)
+	}
+
+	eventually(t, "A reports the three messages", func() bool {
+		tl, _, ok := raw.tenant("n1", t1)
+
+		return ok && tl.MessagesIn == 3
+	})
+	require.NoError(t, pub.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+
+	eventually(t, "A leaves the idle tenant out", func() bool {
+		_, reported, ok := raw.tenant("n1", t1)
+
+		return reported && !ok
+	})
+
+	assert.Equal(t, uint64(3), b.CellUsage(t1).MessagesIn, "B keeps A's counters for it")
+	assert.Zero(t, b.CellUsage(t1).Connections)
+	assert.Zero(t, b.RemoteConnections(t1))
+	assert.Zero(t, b.TenantRates(t1).MessagesInPerSec)
+
+	pub, _, err = connect5(t, c.addr(0), "a2", "u1", true)
+	require.NoError(t, err)
+	publish0(t, pub, "x", "x", nil)
+
+	eventually(t, "B sees the fourth message", func() bool { return b.CellUsage(t1).MessagesIn == 4 })
+
+	// One message over one interval, not the four since A started.
+	assert.Less(t, b.TenantRates(t1).MessagesInPerSec, 3/loadTestInterval.Seconds())
+	assert.Equal(t, 1, b.RemoteConnections(t1))
 }

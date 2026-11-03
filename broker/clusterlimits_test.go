@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 )
 
 // startLimitCell is startLoadCell where t1 carries lim.
-func startLimitCell(t *testing.T, nodes int, interval time.Duration, lim tenant.Limits, more func(*Broker)) *testCell {
+func startLimitCell(t *testing.T, nodes int, interval time.Duration, lim tenant.Limits, more func(*Broker)) *testCell { //nolint:unparam // two nodes so far
 	t.Helper()
 
 	t1, t2 := newTenant(lim), newTenant(tenant.Limits{})
@@ -198,4 +199,43 @@ func TestPeerLeavesViewWhenStale(t *testing.T) {
 	})
 	assert.Less(t, time.Since(reported), bound, "gone within 3 x interval + 1 s")
 	assert.Zero(t, a.CellUsage(t1).Connections)
+}
+
+// A node that stops gracefully withdraws its load report, so its devices
+// reconnecting to the rest of the cell during a rolling deploy find their
+// slots free at once, not after the report's lifetime.
+func TestCellConnectionLimitGracefulStop(t *testing.T) {
+	const interval = time.Second // the report lives 3 s, its peers count it as long
+
+	c := startLimitCell(t, 2, interval, tenant.Limits{MaxConnections: 3}, nil)
+	a, b := c.nodes[0], c.nodes[1]
+	t1 := c.t1.ID.String()
+
+	for _, id := range []string{"a1", "a2"} {
+		_, _, err := connect5(t, c.addr(0), id, "u1", true)
+		require.NoError(t, err)
+	}
+
+	_, _, err := connect5(t, c.addr(1), "b1", "u1", true)
+	require.NoError(t, err)
+
+	eventually(t, "B sees A's two connections", func() bool { return b.RemoteConnections(t1) == 2 })
+
+	ctx, cancel := context.WithTimeout(t.Context(), waitTimeout)
+	defer cancel()
+
+	require.NoError(t, a.Stop(ctx))
+
+	stopped := time.Now()
+
+	for _, id := range []string{"a1", "a2"} {
+		eventuallyWithin(t, interval, id+" reconnects to B", func() bool {
+			_, _, err := connect5(t, c.addr(1), id, "u1", true)
+
+			return err == nil
+		})
+	}
+
+	assert.Less(t, time.Since(stopped), interval, "both back within one interval")
+	assert.Zero(t, b.RemoteConnections(t1), "A's report is gone")
 }

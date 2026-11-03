@@ -466,7 +466,10 @@ func (b *Broker) Stop(ctx context.Context) error {
 		// records; the delayed wills, the reclaims, the watch and the
 		// flusher go now. A delayed will left pending keeps this node as
 		// its key's owner, for the cell to publish once this node is dead.
+		// The load report goes first, so the cell stops counting this
+		// node's connections as its clients reconnect elsewhere.
 		if b.cluster != nil {
+			b.withdrawLoad()
 			b.stopLive()
 			b.cluster.stopRetainedWriters()
 			b.stopSessions()
