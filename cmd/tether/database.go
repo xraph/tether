@@ -21,8 +21,11 @@ import (
 
 const (
 	// driverSQLite and driverPostgres are the values of server.database.driver.
-	driverSQLite   = "sqlite"
-	driverPostgres = "postgres"
+	// driverPostgresAlias is accepted for driverPostgres, since libpq URLs
+	// spell the scheme both ways.
+	driverSQLite        = "sqlite"
+	driverPostgres      = "postgres"
+	driverPostgresAlias = "postgresql"
 
 	// databaseDSNEnv names the environment variable that carries the
 	// PostgreSQL connection string, so the password need not sit in the
@@ -41,7 +44,8 @@ const (
 
 // databaseConfig picks where tenants, devices, keys and roles live.
 type databaseConfig struct {
-	// Driver is "sqlite" (the default) or "postgres". SQLite keeps its file at
+	// Driver is "sqlite" (the default) or "postgres" ("postgresql" works
+	// too). SQLite keeps its file at
 	// server.sqlite_path, which is why that key stays where it was.
 	Driver string `yaml:"driver"`
 
@@ -57,7 +61,7 @@ func (d databaseConfig) driver() (string, error) {
 	switch v := strings.ToLower(strings.TrimSpace(d.Driver)); v {
 	case "", driverSQLite:
 		return driverSQLite, nil
-	case driverPostgres:
+	case driverPostgres, driverPostgresAlias:
 		return driverPostgres, nil
 	default:
 		return "", fmt.Errorf("tether: server.database.driver %q is not supported (want %s or %s)",

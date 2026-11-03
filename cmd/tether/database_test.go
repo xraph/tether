@@ -94,6 +94,10 @@ func TestDatabaseValidation(t *testing.T) {
 			c.Server.Database.Driver = "postgres"
 			c.Server.Database.DSN = "postgres://tether:" + pgSecret + "@127.0.0.1:notaport/tetherdb"
 		}, "", "does not parse"},
+		{"postgresql is postgres", func(c *config) {
+			c.Server.Database.Driver = "postgresql"
+			c.Server.Database.DSN = pgURL
+		}, "", ""},
 		{"postgres with a bad pool value in a url", func(c *config) {
 			c.Server.Database.Driver = "postgres"
 			c.Server.Database.DSN = "postgres://tether:" + pgSecret + "@127.0.0.1:1/tetherdb?pool_max_conns=abc"
