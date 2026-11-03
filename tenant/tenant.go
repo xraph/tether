@@ -137,7 +137,11 @@ type Store interface {
 	GetTenantByExternal(ctx context.Context, appID, externalID string) (*Tenant, error)
 
 	// UpdateTenant replaces the stored tenant with t, keeps the stored
-	// CreatedAt, and sets UpdatedAt to now. Moving the tenant to an
+	// CreatedAt, and sets UpdatedAt to now, or to a microsecond past the
+	// stored UpdatedAt when that is not before now: a tenant's UpdatedAt
+	// grows with every write, in the order the writes land, whatever the
+	// writers' clocks say, so it orders the tenant's snapshots (a cell node
+	// drops a snapshot older than the one it holds). Moving the tenant to an
 	// (AppID, ExternalID) pair another tenant holds returns tether.ErrConflict.
 	UpdateTenant(ctx context.Context, t *Tenant) error
 

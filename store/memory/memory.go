@@ -215,6 +215,12 @@ func (s *Store) UpdateTenant(ctx context.Context, t *tenant.Tenant) error {
 	t.CreatedAt = old.CreatedAt
 	t.UpdatedAt = now()
 
+	// Each write moves UpdatedAt forward, even past a clock behind the last
+	// writer's (tenant.Store).
+	if !t.UpdatedAt.After(old.UpdatedAt) {
+		t.UpdatedAt = old.UpdatedAt.Add(time.Microsecond)
+	}
+
 	cp := *t
 	s.tenants[key] = &cp
 

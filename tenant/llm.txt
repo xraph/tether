@@ -15,6 +15,6 @@ Tenant model and store interface. Imports only `id`, so the root package can imp
 
 Contract (every backend passes `store/storetest`):
 - Missing record: error wrapping `tether.ErrNotFound` (Get, GetByExternal, Update, Delete). Duplicate ID or `(AppID, ExternalID)`, on Create or on Update moving onto another tenant's pair: `tether.ErrConflict`. Nil record or nil ID: `tether.ErrInvalidInput`.
-- Create sets `CreatedAt`/`UpdatedAt` on the caller's struct when zero and normalises set ones to UTC at microsecond precision. Update keeps the stored `CreatedAt`, sets `UpdatedAt` to now, and writes both back to the caller's struct.
+- Create sets `CreatedAt`/`UpdatedAt` on the caller's struct when zero and normalises set ones to UTC at microsecond precision. Update keeps the stored `CreatedAt`, sets `UpdatedAt` to now, or to a microsecond past the stored one when that is not before now (so it grows with every write in write order, whatever the writers' clocks; the broker orders a cell's tenant snapshots by it), and writes both back to the caller's struct.
 - `DeleteTenant` does not cascade. The service layer refuses to delete a tenant that still has devices.
 - `ListTenants` order is `CreatedAt` ascending, then ID.

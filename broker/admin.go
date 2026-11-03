@@ -215,6 +215,12 @@ func (b *Broker) UpdateTenant(t *tenant.Tenant) {
 // applyTenant is UpdateTenant on this node. With async the disconnects of a
 // disabled tenant run in their own goroutines and applyTenant does not wait
 // for them (the control bus's handlers must not block).
+//
+// In cluster mode a connection whose snapshot is newer than snap (UpdatedAt,
+// which the store moves forward with every write of the tenant) keeps it.
+// Snapshots can arrive out of order in a cell (a change whose publish failed
+// is sent again after a newer one landed, ruling R51), and the older one
+// must not undo the newer, or disconnect a tenant enabled again since.
 func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 	tenantID := snap.ID.String()
 
@@ -227,7 +233,16 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 	srv := b.running()
 
 	for _, st := range b.state.match(func(st *clientState) bool { return st.tenantID == tenantID }) {
-		st.tenant.Store(snap)
+		if b.cluster == nil {
+			st.tenant.Store(snap)
+		} else if !st.offerTenant(snap) {
+			// A newer change reached the connection first (a failed
+			// publish sent again late, say): this one is out of date.
+			b.log.Debug("tether: tenant snapshot older than the one held, ignored", slog.String("client", st.cl.ID),
+				slog.String("tenant", tenantID), slog.Time("updated_at", snap.UpdatedAt))
+
+			continue
+		}
 
 		if snap.Enabled || srv == nil || st.cl.Closed() {
 			continue
@@ -239,6 +254,22 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 			go disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
 		} else {
 			disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+		}
+	}
+}
+
+// offerTenant makes snap the connection's tenant snapshot unless the one it
+// holds is newer, and reports whether it did. A snapshot with no UpdatedAt
+// (a caller that did not read it from a store) is never taken for older.
+func (st *clientState) offerTenant(snap *tenant.Tenant) bool {
+	for {
+		held := st.tenant.Load()
+		if held != nil && !snap.UpdatedAt.IsZero() && snap.UpdatedAt.Before(held.UpdatedAt) {
+			return false
+		}
+
+		if st.tenant.CompareAndSwap(held, snap) {
+			return true
 		}
 	}
 }

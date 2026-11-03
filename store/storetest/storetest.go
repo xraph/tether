@@ -38,6 +38,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 		{"TenantInvalidInput", testTenantInvalidInput},
 		{"TenantList", testTenantList},
 		{"TenantUpdateSetsUpdatedAt", testTenantUpdateSetsUpdatedAt},
+		{"TenantUpdatedAtGrows", testTenantUpdatedAtGrows},
 		{"TenantDeleteDoesNotCascade", testTenantDeleteDoesNotCascade},
 		{"DeviceCRUD", testDeviceCRUD},
 		{"DeviceByKey", testDeviceByKey},
@@ -761,6 +762,37 @@ func testTenantUpdateSetsUpdatedAt(t *testing.T, s store.Store) {
 	require.NoError(t, err)
 	assert.True(t, read.UpdatedAt.Equal(upd.UpdatedAt), "read-back UpdatedAt: want %v got %v", upd.UpdatedAt, read.UpdatedAt)
 	assert.True(t, read.CreatedAt.Equal(stamp(0)))
+}
+
+// A tenant's UpdatedAt grows with every write even when the stored one is
+// ahead of this writer's clock (another node's, skewed): it orders the
+// tenant's snapshots across a cell, so a later write never looks older.
+func testTenantUpdatedAtGrows(t *testing.T, s store.Store) {
+	ctx := context.Background()
+
+	ahead := time.Now().UTC().Truncate(time.Microsecond).Add(time.Hour)
+
+	tn := newTenant()
+	tn.UpdatedAt = ahead
+	mustCreateTenant(t, s, tn)
+
+	got, err := s.GetTenant(ctx, tn.ID)
+	require.NoError(t, err)
+
+	first := *got
+	first.Name = "first"
+	require.NoError(t, s.UpdateTenant(ctx, &first))
+	assert.True(t, first.UpdatedAt.After(ahead), "UpdatedAt went back to the writer's clock: %v, stored %v", first.UpdatedAt, ahead)
+
+	second := first
+	second.Name = "second"
+	require.NoError(t, s.UpdateTenant(ctx, &second))
+	assert.True(t, second.UpdatedAt.After(first.UpdatedAt), "a later write is not later: %v then %v", first.UpdatedAt, second.UpdatedAt)
+
+	read, err := s.GetTenant(ctx, tn.ID)
+	require.NoError(t, err)
+	assert.True(t, read.UpdatedAt.Equal(second.UpdatedAt), "read-back UpdatedAt: want %v got %v", second.UpdatedAt, read.UpdatedAt)
+	assert.Equal(t, "second", read.Name)
 }
 
 func testDeviceUpdateSetsUpdatedAt(t *testing.T, s store.Store) {

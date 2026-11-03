@@ -210,15 +210,21 @@ func (s *Store) UpdateTenant(ctx context.Context, t *tenant.Tenant) error {
 		return invalidErr(op, err)
 	}
 
-	// created_at is left out of the column list, so the stored value stays,
-	// and RETURNING hands it back for the caller's struct.
-	var created int64
+	// created_at is left out, so the stored value stays, and RETURNING hands
+	// it back for the caller's struct. updated_at moves forward with every
+	// write, even past a clock behind the last writer's (tenant.Store).
+	var created, stamped int64
 
 	err = s.sdb.NewUpdate(m).
-		Column("app_id", "external_id", "name", "enabled", "limits", "updated_at").
+		Set("app_id = ?", m.AppID).
+		Set("external_id = ?", m.ExternalID).
+		Set("name = ?", m.Name).
+		Set("enabled = ?", m.Enabled).
+		Set("limits = ?", m.Limits).
+		Set("updated_at = MAX(?, updated_at + 1)", m.UpdatedAt).
 		Where("id = ?", m.ID).
-		Returning("created_at").
-		Scan(ctx, &created)
+		Returning("created_at", "updated_at").
+		Scan(ctx, &created, &stamped)
 	if err != nil {
 		switch {
 		case isNoRows(err):
@@ -230,7 +236,7 @@ func (s *Store) UpdateTenant(ctx context.Context, t *tenant.Tenant) error {
 		}
 	}
 
-	t.CreatedAt, t.UpdatedAt = fromMicros(created), updated
+	t.CreatedAt, t.UpdatedAt = fromMicros(created), fromMicros(stamped)
 
 	return nil
 }

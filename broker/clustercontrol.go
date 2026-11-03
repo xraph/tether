@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -70,6 +71,17 @@ type controlNode struct {
 	// when a publish failed, its own), and kicks and deletes addressed to
 	// this node that it handled.
 	tenantApplied, kickEvents, deleteEvents atomic.Uint64
+
+	// tenantRepub is, per tenant ID, the background republish of the
+	// tenant's last change whose publish failed, under tenantRepubMu. A
+	// newer change of the tenant stops it: it carries an older snapshot.
+	tenantRepubMu sync.Mutex
+	tenantRepub   map[string]*tenantRepublish
+}
+
+// tenantRepublish is one tenant change being sent again (republishTenant).
+type tenantRepublish struct {
+	cancel context.CancelFunc
 }
 
 // subscribeControl registers the broker's handlers on the control bus, when
@@ -136,12 +148,17 @@ func (b *Broker) publishTenant(snap *tenant.Tenant) bool {
 	tenantID := snap.ID.String()
 	ev := tenantEvent{TenantUpdated: cluster.TenantUpdated{TenantID: tenantID}, Tenant: snap}
 
+	// An earlier change of the tenant still being sent again is out of date
+	// now. One attempt of it may be under way and land after this one; the
+	// nodes drop it then, as older than what they hold (applyTenant).
+	n.stopTenantRepublish(tenantID, nil)
+
 	if err := n.publishControl(cluster.KindTenantUpdated, ev); err != nil {
 		n.log.Warn("tether: could not send a tenant change to the cell, applying it on this node and sending it again in the background",
 			slog.String("tenant", tenantID), slog.Any("error", err))
 
 		if !errors.Is(err, tether.ErrInvalidInput) {
-			go n.republish(cluster.KindTenantUpdated, ev)
+			n.republishTenant(tenantID, ev)
 		}
 
 		return false
@@ -150,18 +167,74 @@ func (b *Broker) publishTenant(snap *tenant.Tenant) bool {
 	return true
 }
 
-// republish sends a control event whose publish failed again until the bus
-// takes it, the broker stops, or an hour has passed (cluster.Republish).
-func (n *clusterNode) republish(kind string, v any) {
-	err := cluster.Republish(n.ctx.Done(), func(ctx context.Context) error { return n.publishControlCtx(ctx, kind, v) })
-	if err != nil {
-		n.log.Warn("tether: gave up sending a control event to the cell", slog.String("kind", kind), slog.Any("error", err))
+// republishTenant sends tenant change ev again in the background, as
+// republish does, until a newer change of the tenant stops it
+// (stopTenantRepublish), replacing any republish of the tenant running.
+func (n *clusterNode) republishTenant(tenantID string, ev tenantEvent) {
+	ctx, cancel := context.WithCancel(n.ctx)
+	p := &tenantRepublish{cancel: cancel}
+
+	n.tenantRepubMu.Lock()
+
+	if old := n.tenantRepub[tenantID]; old != nil {
+		old.cancel()
+	}
+
+	if n.tenantRepub == nil {
+		n.tenantRepub = make(map[string]*tenantRepublish)
+	}
+
+	n.tenantRepub[tenantID] = p
+	n.tenantRepubMu.Unlock()
+
+	go func() {
+		defer n.stopTenantRepublish(tenantID, p)
+
+		n.republishUntil(ctx, cluster.KindTenantUpdated, ev)
+	}()
+}
+
+// stopTenantRepublish cancels the tenant's republish: only p when p is not
+// nil (its own end), whichever runs otherwise.
+func (n *clusterNode) stopTenantRepublish(tenantID string, p *tenantRepublish) {
+	n.tenantRepubMu.Lock()
+	defer n.tenantRepubMu.Unlock()
+
+	cur := n.tenantRepub[tenantID]
+	if cur == nil || (p != nil && cur != p) {
+		if p != nil {
+			p.cancel()
+		}
 
 		return
 	}
 
-	n.republished.Add(1)
-	n.log.Info("tether: control event sent to the cell after the bus came back", slog.String("kind", kind))
+	cur.cancel()
+	delete(n.tenantRepub, tenantID)
+}
+
+// republishUntil sends a control event whose publish failed again until the
+// bus takes it, the broker stops, an hour has passed (cluster.Republish), or
+// ctx ends: a change that a newer one replaced is dropped without a warning.
+func (n *clusterNode) republishUntil(ctx context.Context, kind string, v any) {
+	var landed bool
+
+	err := cluster.Republish(ctx.Done(), func(actx context.Context) error {
+		perr := n.publishControlCtx(actx, kind, v)
+		landed = perr == nil
+
+		return perr
+	})
+
+	switch {
+	case landed:
+		n.republished.Add(1)
+		n.log.Info("tether: control event sent to the cell after the bus came back", slog.String("kind", kind))
+	case ctx.Err() != nil && n.ctx.Err() == nil:
+		n.log.Debug("tether: control event not sent again, a newer one replaced it", slog.String("kind", kind))
+	default:
+		n.log.Warn("tether: gave up sending a control event to the cell", slog.String("kind", kind), slog.Any("error", err))
+	}
 }
 
 // publishSession publishes a session.kick or session.delete event for an

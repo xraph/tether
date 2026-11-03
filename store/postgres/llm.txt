@@ -23,6 +23,6 @@ Schema (`Migrations`):
 
 Behaviour:
 - SQLSTATE 23505 (`*pgconn.PgError`) maps to `tether.ErrConflict`. A write that touches no row maps to `tether.ErrNotFound`. Errors read `tether/postgres: <op>: ... %w`.
-- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`.
+- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`. `UpdateTenant` writes explicit SET clauses with `updated_at = GREATEST(now, updated_at + 1 µs)` and returns `updated_at` too, so a tenant's `UpdatedAt` grows with every write in row order, whatever the writer's clock (tenant.Store).
 
 Tests: skipped unless `TETHER_TEST_POSTGRES` holds a DSN whose role may `CREATE DATABASE`. Each test creates and drops its own database. See AGENTS.md for a disposable-server recipe.

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether"
+	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/tenant"
 )
 
@@ -338,4 +339,100 @@ func TestControlRepublishedAfterFailure(t *testing.T) {
 	requireKicked(t, onA)
 	requireKicked(t, onB)
 	require.Positive(t, a.cluster.republished.Load())
+}
+
+// A tenant change whose publish failed and is sent again late does not
+// overwrite a newer change that landed meanwhile (D-I1 follow-up): node A's
+// disable fails to publish, node B then enables the tenant again with a
+// newer snapshot, and when A's republish lands it is older than what every
+// node holds, so B's client is not disconnected and keeps the newer limits.
+// A newer change on the node itself stops the older one's republish.
+func TestStaleTenantRepublishIgnored(t *testing.T) {
+	c := startControlCell(t, 2)
+	a, b := c.nodes[0], c.nodes[1]
+	tid := c.t1.ID.String()
+
+	var failing atomic.Bool
+
+	a.cluster.publishFault = func(kind string) error {
+		if kind == cluster.KindTenantUpdated && failing.Load() {
+			return errors.New("control stream has no leader")
+		}
+
+		return nil
+	}
+
+	onA, _, err := connect5(t, c.addr(0), "sa", "u1", true)
+	require.NoError(t, err)
+
+	onB, _, err := connect5(t, c.addr(1), "sb", "u1", true)
+	require.NoError(t, err)
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+
+	failing.Store(true)
+
+	disabled := *c.t1
+	disabled.Enabled = false
+	disabled.UpdatedAt = base
+	a.UpdateTenant(&disabled)
+	requireKicked(t, onA) // applied on A at once (R41)
+
+	enabled := *c.t1
+	enabled.Limits.MaxConnections = 7
+	enabled.UpdatedAt = base.Add(time.Second)
+	b.UpdateTenant(&enabled)
+
+	eventually(t, "B's change on B's client", func() bool {
+		tn := tenantOf(b, tid+"/sb")
+
+		return tn != nil && tn.Limits.MaxConnections == 7
+	})
+
+	applied := b.cluster.tenantApplied.Load()
+	republished := a.cluster.republished.Load()
+
+	failing.Store(false)
+
+	eventually(t, "A's disable sent again", func() bool { return a.cluster.republished.Load() > republished })
+	eventually(t, "B to handle it", func() bool { return b.cluster.tenantApplied.Load() > applied })
+
+	select {
+	case d := <-onB.disconnects:
+		t.Fatalf("B's client disconnected with %#x by a tenant change older than the one it holds", d.ReasonCode)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	tn := tenantOf(b, tid+"/sb")
+	require.NotNil(t, tn)
+	require.True(t, tn.Enabled)
+	require.Equal(t, 7, tn.Limits.MaxConnections, "the older snapshot replaced the newer one")
+
+	// On one node: two changes whose publishes fail; only the newer is sent
+	// again.
+	failing.Store(true)
+
+	older := enabled
+	older.Limits.MaxConnections = 8
+	older.UpdatedAt = base.Add(2 * time.Second)
+	a.UpdateTenant(&older)
+
+	newer := enabled
+	newer.Limits.MaxConnections = 9
+	newer.UpdatedAt = base.Add(3 * time.Second)
+	a.UpdateTenant(&newer)
+
+	republished = a.cluster.republished.Load()
+
+	failing.Store(false)
+
+	eventually(t, "B to get A's newer change", func() bool {
+		tn := tenantOf(b, tid+"/sb")
+
+		return tn != nil && tn.Limits.MaxConnections == 9
+	})
+
+	time.Sleep(time.Second) // past the older one's next attempt, had it still run
+	require.Equal(t, republished+1, a.cluster.republished.Load(), "the older change was still sent again")
+	require.Equal(t, 9, tenantOf(b, tid+"/sb").Limits.MaxConnections)
 }

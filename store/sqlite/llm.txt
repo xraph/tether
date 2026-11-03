@@ -24,5 +24,5 @@ Schema (`Migrations`):
 
 Behaviour:
 - UNIQUE and PRIMARY KEY violations (typed `*sqlite.Error`, not string matching) map to `tether.ErrConflict`. A write that touches no row maps to `tether.ErrNotFound`. Errors read `tether/sqlite: <op>: ... %w`.
-- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`, so the caller's struct gets the stored value.
+- `UpdateTenant` and `UpdateDevice` leave `created_at` (and the device's `tenant_id`) out of the UPDATE and read the stored `created_at` back with `RETURNING`, so the caller's struct gets the stored value. `UpdateTenant` writes explicit SET clauses with `updated_at = MAX(now, updated_at + 1)` (microseconds) and returns `updated_at` too, so a tenant's `UpdatedAt` grows with every write in write order, whatever the writer's clock (tenant.Store).
 - Lists order by `created_at, id`. An offset without a limit gets an effectively unbounded limit, because SQLite rejects a bare OFFSET.
