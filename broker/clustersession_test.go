@@ -804,7 +804,8 @@ func TestSlowSubscriberCursorNeverSkips(t *testing.T) {
 	require.Equal(t, byte(0), ca.ReasonCode)
 	require.True(t, ca.SessionPresent)
 
-	eventually(t, "every message", func() bool {
+	// A replay of 500 messages through the log, 100 at a time.
+	eventuallyWithin(t, logWait, "every message", func() bool {
 		for i := range total {
 			if sess2.count(strconv.Itoa(i)) == 0 {
 				return false

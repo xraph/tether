@@ -31,9 +31,10 @@ const (
 	liveHeartbeat = 100 * time.Millisecond
 	liveLease     = time.Second
 	liveDead      = liveLease + 2*time.Second
-	// liveWait bounds the waits that span a node's death and a will delay.
-	liveWait = 20 * time.Second
 )
+
+// liveWait bounds the waits that span a node's death and a will delay.
+var liveWait = scaled(20 * time.Second)
 
 // liveCell is a cell whose nodes run Members, with the first nodes reaching
 // NATS through proxies (proxy is node 0's).
@@ -378,11 +379,12 @@ func TestDeadNodeWillsPublished(t *testing.T) {
 	require.NoError(t, err)
 	awaitInterest(t, pb, sc)
 
-	// y dies while A is up: A publishes its will to the cell at once.
+	// y dies while A is up: A publishes its will to the cell at once. It is
+	// QoS 1, so it reaches B and C through the log.
 	y := rawConnectWill(t, c.addr(0), willSpec{id: "y", topic: "will/y", qos: 1, expiry: 3600})
 	require.NoError(t, y.Close())
-	require.Equal(t, "will/y", recvMsg(t, sb).Topic)
-	require.Equal(t, "will/y", recvMsg(t, sc).Topic)
+	require.Equal(t, "will/y", recvLog(t, sb).Topic)
+	require.Equal(t, "will/y", recvLog(t, sc).Topic)
 
 	eventually(t, "y's record without its will", func() bool {
 		rec, rerr := c.record(t, 1, "y")

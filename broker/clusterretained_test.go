@@ -344,6 +344,17 @@ func TestRetainedSubscribeWaitsForLoad(t *testing.T) {
 	b := c.nodes[0]
 	n := b.cluster
 
+	// The first load, pub's, reads the hook as it starts: wait for it to
+	// finish, so setting the hook below does not race that read.
+	first := n.cacheOf(tid)
+	require.NotNil(t, first)
+
+	select {
+	case <-first.ready:
+	case <-time.After(logWait):
+		t.Fatal("the first load never finished")
+	}
+
 	held := make(chan struct{})
 	release := make(chan struct{})
 	n.retainedLoadHook = func(string) {

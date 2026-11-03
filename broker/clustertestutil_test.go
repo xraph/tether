@@ -284,7 +284,14 @@ func noMoreMsgs(t *testing.T, c *client5) {
 func eventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 
-	deadline := time.Now().Add(waitTimeout)
+	eventuallyWithin(t, waitTimeout, what, cond)
+}
+
+// eventuallyWithin is eventually bounded by d.
+func eventuallyWithin(t *testing.T, d time.Duration, what string, cond func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(d)
 
 	for !cond() {
 		if time.Now().After(deadline) {

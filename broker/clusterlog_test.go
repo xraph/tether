@@ -31,7 +31,7 @@ import (
 
 // logWait bounds the waits of the log tests, which go through JetStream and,
 // in some, a fault proxy that delays every byte.
-const logWait = 30 * time.Second
+var logWait = scaled(30 * time.Second)
 
 // startProxiedCell is startCluster with node 0 reaching NATS through a fault
 // proxy (NoDiscovery is set on every node, so it cannot get around it).

@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -31,7 +32,36 @@ import (
 
 // waitTimeout bounds every wait in these tests. Nothing sleeps: tests wait on
 // channels and fail when this runs out.
-const waitTimeout = 5 * time.Second
+var waitTimeout = scaled(5 * time.Second)
+
+// waitScale stretches the waits for something that should happen
+// (waitTimeout, logWait, liveWait) on a slow machine:
+// TETHER_TEST_WAIT_SCALE when it is set (a number of at least 1), else 3
+// when CI is set, where every package's tests share a four-vCPU runner with
+// these cells of JetStream servers, else 1. It stretches no bound a test
+// asserts about the broker (a will after the lease, a give-back inside the
+// ack wait) and not settle, the time a test listens to show that nothing
+// more arrives.
+var waitScale = loadWaitScale()
+
+func loadWaitScale() float64 {
+	if v := os.Getenv("TETHER_TEST_WAIT_SCALE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 1 {
+			return f
+		}
+	}
+
+	if os.Getenv("CI") != "" {
+		return 3
+	}
+
+	return 1
+}
+
+// scaled is d stretched by waitScale.
+func scaled(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * waitScale)
+}
 
 // Will is the last will a 3.1.1 test client registers.
 type Will struct {
