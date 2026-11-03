@@ -1404,8 +1404,18 @@ func TestIdleSessionTakenOverByWatch(t *testing.T) {
 // connection that stopped reading: the stuck writer is abandoned, what it
 // had queued goes back to the replay, and the new connection gets every
 // message, in order (mochi resends what the old one had in flight, ordered
-// by sequence at the CONNACK, then the replay goes on from there).
+// by sequence at the CONNACK, then the replay goes on from there). The
+// takeover does not wait for the old connection's keepalive (45 s here): in
+// the second case the stalled peer keeps sending packets that need no reply,
+// and each one resets mochi's deadlines on its connection.
 func TestHandoverDuringStalledReplay(t *testing.T) {
+	t.Run("quiet", func(t *testing.T) { handoverDuringStalledReplay(t, false) })
+	t.Run("still sending", func(t *testing.T) { handoverDuringStalledReplay(t, true) })
+}
+
+func handoverDuringStalledReplay(t *testing.T, noisy bool) {
+	t.Helper()
+
 	c := startCluster(t, 1)
 	a := c.nodes[0]
 	tid := c.t1.ID.String()
@@ -1445,6 +1455,25 @@ func TestHandoverDuringStalledReplay(t *testing.T) {
 		return !moved && now > 0
 	})
 
+	if noisy {
+		stop := make(chan struct{})
+		t.Cleanup(func() { close(stop) })
+
+		go func() {
+			tick := time.NewTicker(100 * time.Millisecond)
+			defer tick.Stop()
+
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tick.C:
+					stalled.send(&packets.Publish{Topic: "noise/x", Payload: []byte("n"), Properties: &packets.Properties{}})
+				}
+			}
+		}()
+	}
+
 	// Same client ID, same node, the old connection still open.
 	got := newRawSession()
 	order := make(chan int, 4*total)
@@ -1456,8 +1485,12 @@ func TestHandoverDuringStalledReplay(t *testing.T) {
 		}
 	}
 
+	// Not scaled: on a slow runner ack waits longer than the old
+	// connection's keepalive, which is what this bounds.
+	t0 := time.Now()
 	again := dialRaw(t, c.addr(0), "hand", got, false)
 	require.True(t, again.ack(t).SessionPresent)
+	require.Less(t, time.Since(t0), 10*time.Second, "the takeover waited on the stalled connection")
 
 	next := 0
 	deadline := time.After(logWait)

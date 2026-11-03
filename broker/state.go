@@ -214,12 +214,24 @@ const takeoverWriteWait = disconnectWait
 // replay's, a shared delivery's, mochi's own), and the takeover would wait
 // for it until the old connection's keepalive ran out, or for good with no
 // keepalive. The deadline fails such a write, which ends the old connection,
-// and a healthy one is done with its writes well before it.
+// and a healthy one is done with its writes well before it. mochi resets the
+// deadline before every packet it reads, so a peer that stopped reading but
+// still sends would keep the write blocked: the connection is also closed
+// once the wait is over, unless mochi has stopped it by then. bind is the
+// last step before mochi's takeover, which always stops the old client.
 func (st *clientState) boundWrites() error {
 	conn := st.cl.Net.Conn
 	if conn == nil {
 		return nil
 	}
+
+	cl := st.cl
+
+	time.AfterFunc(takeoverWriteWait, func() {
+		if !cl.Closed() {
+			_ = conn.Close()
+		}
+	})
 
 	return conn.SetWriteDeadline(time.Now().Add(takeoverWriteWait))
 }
