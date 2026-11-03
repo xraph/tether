@@ -2106,6 +2106,10 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 
 	rec, rev, err := n.Sessions.Get(ctx, tenantID, clientID)
 	if errors.Is(err, tether.ErrNotFound) {
+		// No key, so no will to bar: a noWill entry of an earlier session
+		// would only bar the will of a later one, whose epoch restarts at 1.
+		n.clearNoWill(nsID, 0)
+
 		if hasLocal {
 			return nil
 		}
@@ -2163,6 +2167,10 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 			b.goPublishHeld(tenantID, clientID, w, willMsgID)
 		}
 	}
+
+	// The key is gone, so its noWill entry has nothing left to bar. A
+	// session created later restarts at epoch 1 and could meet it.
+	n.clearNoWill(nsID, rec.Epoch)
 
 	return nil
 }

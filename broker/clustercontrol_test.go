@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eclipse/paho.golang/paho"
 	"github.com/stretchr/testify/require"
 
 	"github.com/xraph/tether"
@@ -435,4 +436,91 @@ func TestStaleTenantRepublishIgnored(t *testing.T) {
 	time.Sleep(time.Second) // past the older one's next attempt, had it still run
 	require.Equal(t, republished+1, a.cluster.republished.Load(), "the older change was still sent again")
 	require.Equal(t, 9, tenantOf(b, tid+"/sb").Limits.MaxConnections)
+}
+
+// A noWill entry of a session that DeleteSession removed does not outlive
+// it: a session created later under the same client ID restarts at epoch 1,
+// and the stale entry would bar that session's held will (R42). The entry is
+// also dropped when the delete finds no key at all.
+func TestDeleteSessionClearsNoWill(t *testing.T) {
+	c := startControlCell(t, 1)
+	a := c.nodes[0]
+	tid := c.t1.ID.String()
+
+	held := func(nsID string) bool {
+		a.cluster.willsMu.Lock()
+		defer a.cluster.willsMu.Unlock()
+
+		_, ok := a.cluster.noWill[nsID]
+
+		return ok
+	}
+
+	cl, _, err := connect5(t, c.addr(0), "nw", "u1", false)
+	require.NoError(t, err)
+	require.NoError(t, cl.Disconnect(&paho.Disconnect{ReasonCode: 0}))
+
+	var rec *cluster.SessionRecord
+
+	eventually(t, "nw's offline record", func() bool {
+		var rerr error
+
+		rec, rerr = sessionKey(t, a, tid, "nw")
+
+		return rerr == nil && rec.Owner == ""
+	})
+
+	nsID := namespacedID(tid, "nw")
+
+	a.cluster.markNoWill(nsID, rec.Epoch)
+	require.True(t, a.cluster.willBarred(nsID, rec.Epoch))
+
+	require.NoError(t, a.DeleteSession(tid, "nw"))
+	require.False(t, held(nsID), "the deleted session's noWill entry is still held")
+	require.False(t, a.cluster.willBarred(nsID, 1), "a later session at epoch 1 would be barred")
+
+	ghost := namespacedID(tid, "ghost")
+
+	a.cluster.markNoWill(ghost, 4)
+	require.Error(t, a.DeleteSession(tid, "ghost"))
+	require.False(t, held(ghost), "a delete that found no key left its noWill entry")
+}
+
+// Two changes of a tenant whose publishes both fail can reach
+// republishTenant in either order; the republish of the newer snapshot
+// stays.
+func TestOlderTenantRepublishKeepsNewer(t *testing.T) {
+	c := startControlCell(t, 1)
+	n := c.nodes[0].cluster
+	tid := c.t1.ID.String()
+
+	// The bus is down, so no republish ends before the test does.
+	n.publishFault = func(string) error { return errors.New("control stream has no leader") }
+
+	base := time.Now().UTC().Truncate(time.Microsecond)
+
+	mk := func(at time.Time) tenantEvent {
+		snap := *c.t1
+		snap.UpdatedAt = at
+
+		return tenantEvent{TenantUpdated: cluster.TenantUpdated{TenantID: tid}, Tenant: &snap}
+	}
+
+	running := func() *tenantRepublish {
+		n.tenantRepubMu.Lock()
+		defer n.tenantRepubMu.Unlock()
+
+		return n.tenantRepub[tid]
+	}
+
+	n.republishTenant(tid, mk(base.Add(time.Second)))
+
+	newer := running()
+	require.NotNil(t, newer)
+
+	n.republishTenant(tid, mk(base))
+	require.Same(t, newer, running(), "the older snapshot replaced the newer one's republish")
+
+	n.republishTenant(tid, mk(base.Add(2*time.Second)))
+	require.NotSame(t, newer, running(), "a newer snapshot did not replace the older one's republish")
 }

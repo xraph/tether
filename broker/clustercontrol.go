@@ -82,6 +82,9 @@ type controlNode struct {
 // tenantRepublish is one tenant change being sent again (republishTenant).
 type tenantRepublish struct {
 	cancel context.CancelFunc
+
+	// updatedAt is the UpdatedAt of the snapshot being sent again.
+	updatedAt time.Time
 }
 
 // subscribeControl registers the broker's handlers on the control bus, when
@@ -169,16 +172,30 @@ func (b *Broker) publishTenant(snap *tenant.Tenant) bool {
 
 // republishTenant sends tenant change ev again in the background, as
 // republish does, until a newer change of the tenant stops it
-// (stopTenantRepublish), replacing any republish of the tenant running.
+// (stopTenantRepublish), replacing any republish of the tenant running. Two
+// changes that both failed to publish can get here in either order, so a
+// republish running for a snapshot newer than ev's (UpdatedAt, as in
+// applyTenant) is kept and ev is dropped.
 func (n *clusterNode) republishTenant(tenantID string, ev tenantEvent) {
-	ctx, cancel := context.WithCancel(n.ctx)
-	p := &tenantRepublish{cancel: cancel}
+	var updatedAt time.Time
+	if ev.Tenant != nil {
+		updatedAt = ev.Tenant.UpdatedAt
+	}
 
 	n.tenantRepubMu.Lock()
 
 	if old := n.tenantRepub[tenantID]; old != nil {
+		if !updatedAt.IsZero() && updatedAt.Before(old.updatedAt) {
+			n.tenantRepubMu.Unlock()
+
+			return
+		}
+
 		old.cancel()
 	}
+
+	ctx, cancel := context.WithCancel(n.ctx)
+	p := &tenantRepublish{cancel: cancel, updatedAt: updatedAt}
 
 	if n.tenantRepub == nil {
 		n.tenantRepub = make(map[string]*tenantRepublish)

@@ -196,8 +196,9 @@ func (b *Broker) ReloadPrincipal(ctx context.Context, principalID string) {
 // of t and returns once it is stored, and every node, this one included,
 // applies it when the event comes back (clustercontrol.go), with the
 // disconnects running in the background. If the publish fails this node
-// applies it at once and logs at Warn; other nodes then keep the old
-// snapshot until their clients reconnect.
+// applies it at once and logs at Warn, and sends it to the cell again in the
+// background until the bus takes it (ruling R51), so the other nodes apply it
+// once the bus is back; a newer change of the tenant replaces that retry.
 func (b *Broker) UpdateTenant(t *tenant.Tenant) {
 	if t == nil || t.ID.IsNil() {
 		return
