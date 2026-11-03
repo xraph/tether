@@ -579,6 +579,71 @@ func TestConcurrentConnectSameClientID(t *testing.T) {
 		rounds, len(all), sess.dups, c.nodes[0].cluster.casRetries.Load(), c.nodes[1].cluster.casRetries.Load())
 }
 
+// A QoS 2 PUBLISH whose QoS2Out write succeeded reaches the connection with
+// its own write, not with a later one. Mochi coalesces a client's writes
+// while more packets are queued for it and flushes them at the next write
+// that finds the queue empty, so a delivery written while the next one was
+// queued sat in that buffer for as long as the next one's record write took.
+// When that write lost to a takeover, the DISCONNECT 0x8E flushed the held
+// PUBLISH after the new owner had resent it from the record and completed
+// it, and the client took it as a new message
+// (TestConcurrentConnectSameClientID under load).
+func TestQoS2PublishNotHeldBehindNextWrite(t *testing.T) {
+	t1 := newTenant(tenant.Limits{})
+	all := acl.Rules{Publish: []string{"#"}, Subscribe: []string{"#"}}
+
+	var (
+		calls   atomic.Int32
+		queued  = make(chan struct{})
+		blocked = make(chan struct{})
+		release = make(chan struct{})
+	)
+
+	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")},
+		fakePerms{rules: map[string]acl.Rules{"u1": all}}, func(b *Broker) {
+			b.cluster.beforeQoS2Write = func(uint64) {
+				switch calls.Add(1) {
+				case 1:
+					// The first delivery is written only once the second
+					// is queued behind it.
+					<-queued
+				case 2:
+					close(blocked)
+					<-release
+				}
+			}
+		})
+	t.Cleanup(func() { close(release) })
+
+	n := c.nodes[0].cluster
+
+	sess := newRawSession()
+	sub := dialRaw(t, c.addr(0), "held", sess, false)
+	require.Equal(t, byte(0), sub.ack(t).ReasonCode)
+	sub.subscribe(t, "q/#", 2)
+
+	pub, _, err := connect5(t, c.addr(0), "held-pub", "u1", true)
+	require.NoError(t, err)
+
+	base := n.logDelivered.Load()
+
+	require.Equal(t, byte(0), publishQ(t, pub, "q/x", "m1", 2))
+	require.Equal(t, byte(0), publishQ(t, pub, "q/x", "m2", 2))
+	eventually(t, "both deliveries queued", func() bool { return n.logDelivered.Load() >= base+2 })
+	close(queued)
+
+	select {
+	case <-blocked:
+	case <-time.After(logWait):
+		t.Fatal("the second delivery's record write never started")
+	}
+
+	// The second delivery's record write is held. The first one's is in the
+	// record, so it must be on the wire.
+	eventually(t, "the first delivery on the wire", func() bool { return sess.count("m1") == 1 })
+	require.Zero(t, sess.count("m2"))
+}
+
 // Review Focus 4: a persistent subscriber that stops acknowledging while 500
 // QoS 1 messages arrive, more than its window holds, then reconnects on
 // another node, gets every one of them at least once. Its cursor never moved

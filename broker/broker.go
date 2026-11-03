@@ -222,11 +222,25 @@ func (b *Broker) Start(ctx context.Context) error {
 		caps.ReceiveMaximum = b.receiveMaximum
 	}
 
-	srv := mqtt.New(&mqtt.Options{
+	opts := &mqtt.Options{
 		InlineClient: true,
 		Capabilities: caps,
 		Logger:       b.log.With(slog.String("component", "mochi")),
-	})
+	}
+
+	if b.cluster != nil {
+		// Every packet goes to the connection in its own write. Mochi
+		// otherwise buffers a client's packets while more are queued and
+		// flushes them at a later write: a QoS 2 PUBLISH already in the
+		// session's record (beforeQoS2Send) then waited for the next one's
+		// record write, and after a takeover the DISCONNECT 0x8E flushed it
+		// once the new owner had resent and completed it, so the client got
+		// it twice. A buffer size of 1 never buffers (mochi writes any
+		// packet at least that large straight through).
+		opts.ClientNetWriteBufferSize = 1
+	}
+
+	srv := mqtt.New(opts)
 
 	if err := b.setup(ctx, srv); err != nil {
 		_ = srv.Close()

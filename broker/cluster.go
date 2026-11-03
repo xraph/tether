@@ -229,6 +229,10 @@ type clusterNode struct {
 	// beforeInject runs in deliverLog between pinFull and the injection,
 	// under the tenant's lock.
 	beforeInject func(seq uint64)
+	// beforeQoS2Write runs in beforeQoS2Send (OnPacketEncode, mochi's
+	// write goroutine for the client) right before a delivery's QoS2Out
+	// write.
+	beforeQoS2Write func(seq uint64)
 }
 
 // routeRef is one session's reference on a (tenant, filter) route. It is

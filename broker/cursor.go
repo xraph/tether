@@ -1401,6 +1401,10 @@ func (n *clusterNode) beforeQoS2Send(cl *mqtt.Client, pk packets.Packet) bool {
 	s.gen++
 	s.mu.Unlock()
 
+	if hook := n.beforeQoS2Write; hook != nil {
+		hook(seq)
+	}
+
 	return n.persistNow(s, cl)
 }
 
