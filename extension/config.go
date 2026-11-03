@@ -26,6 +26,11 @@ type Config struct {
 	// overrides both.
 	GroveDatabase string `json:"grove_database" yaml:"grove_database"`
 
+	// DisableMigrate stops Start from migrating the store, for a host that
+	// runs Tether's migration group itself. Migrate and Rollback then refuse
+	// to run. WithDisableMigrate sets the same thing.
+	DisableMigrate bool `json:"disable_migrate" yaml:"disable_migrate"`
+
 	// Broker configures the MQTT listeners and protocol limits.
 	Broker broker.Config `json:"broker" yaml:"broker"`
 

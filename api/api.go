@@ -64,9 +64,9 @@ type API struct {
 // Register mounts the admin routes on admin and POST /v1/publish on public,
 // all relative to those routers' base path. It does not authenticate the
 // admin group: add your own auth middleware to admin with admin.Use first.
-// Do not use forge.WithGroupMiddleware for it: the routes go on groups
-// nested in admin, and forge v1.12.10's Group drops a parent's
-// WithGroupMiddleware, so they would be mounted open. The publish route
+// The routes go on groups nested in admin, which inherit both admin.Use and
+// forge.WithGroupMiddleware since forge v1.13.0 (older forge dropped the
+// second, so prefer Use if you build against one). The publish route
 // authenticates itself with HTTP Basic (key ID and raw key).
 //
 // It returns an error when a required service is missing or a route cannot

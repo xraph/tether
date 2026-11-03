@@ -17,7 +17,7 @@ gofmt -s -w . && goimports -w -local github.com/xraph/tether .
 GOWORK=off go mod tidy                    # CI fails if this changes go.mod or go.sum
 ```
 
-The Postgres store tests skip unless `TETHER_TEST_POSTGRES` holds a DSN for a server where the role may `CREATE DATABASE`. Each test makes its own throwaway database and drops it afterwards. For a local run, start a disposable server and point the variable at it:
+The Postgres store tests and the binary's Postgres tests (`cmd/tether/postgres_test.go`, which includes a two-node cell on one database) skip unless `TETHER_TEST_POSTGRES` holds a DSN for a server where the role may `CREATE DATABASE`. Each test makes its own throwaway database and drops it afterwards. For a local run, start a disposable server and point the variable at it:
 
 ```sh
 docker run --rm -d --name tether-test-pg -e POSTGRES_PASSWORD=tether -p 127.0.0.1:0:5432 postgres:17-alpine
@@ -50,6 +50,12 @@ IDs are TypeIDs, and there's one `id.ID` struct rather than a type per entity, c
 Sentinel errors live in the root `errors.go` and read `errors.New("tether: ...")`. A store backend wraps them as `tether/<backend>: <op>: %w`, so callers can use `errors.Is` whatever backend sits underneath.
 
 Logging goes through `github.com/xraph/go-utils/log`, which is forge's logger. Mochi wants an `*slog.Logger`, so give it one.
+
+### Migrations
+
+The SQL stores keep their schema in grove migration groups, `postgres.Migrations` and `sqlite.Migrations`, both named `tether`. Each migration is its own file named `<14 digit version>_<name>.go`, and its `init` calls `Migrations.Add(up, down)`, so the version and the name come from the file name. To change the schema, add a file with a later version. Don't rename, renumber or edit a shipped one: grove matches applied rows on group and version, and `legacy_migrations_test.go` in each store checks that a database migrated before the per-file layout still has nothing to run. The SQL drivers have no schema builders yet, so the bodies are raw SQL through `db.Exec`.
+
+Everything goes through grove's orchestrator, which takes a lock first (an advisory lock on Postgres, a lock row on SQLite). `Store.Migrate` builds a new executor and orchestrator per call. The extension is a `forge.MigratableExtension`, and when the app runs central migrations with grove's registry in the container it hands its group over in `Register` and Start skips its own run. `WithDisableMigrate` turns the Start run off. keysmith and warden migrate the same way, so the binary just lets each extension run its own at Start. Postgres connections for that need to be direct or through a session-mode pooler, since the lock is a session advisory lock.
 
 ### Auth and permissions
 

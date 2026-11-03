@@ -15,6 +15,8 @@ Import: github.com/xraph/tether/store/sqlite
   Do not use ":memory:": every pooled connection would get its own empty database.
 - `Ping` and `Close` pass through to grove. After `Close`, `Ping` fails.
 
+Migrations: `Migrations` is a `*migrate.Group` named `tether`. Each migration is its own file, `<14 digit version>_<name>.go`, whose `init` calls `Migrations.Add(up, down)`; grove reads the version and name from the file name. Add a migration by adding a file with a later version. Never rename or renumber an existing one: the orchestrator matches applied rows on group and version, and `TestMigrationsKeepTheirVersionsAndNames` plus `TestMigrateOnALegacyDatabaseIsANoOp` (a database migrated by the old struct-literal group, kept in `legacy_migrations_test.go`) pin the shipped ones: `20261022000001 create_tenants`, `20261022000002 create_devices`. They are raw SQL through `db.Exec`. sqlitemigrate has no transactions, so each runs plain even though `Add` marks it transactional. `Migrate` takes grove's lock row, so pools on one file take turns.
+
 Schema (`Migrations`):
 - `tether_tenants(id PK, app_id, external_id, name, enabled, limits, created_at, updated_at)`, `UNIQUE (app_id, external_id)`.
 - `tether_devices(id PK, tenant_id, name, key_id UNIQUE, client_id, roles, metadata, created_at, updated_at)`, index `(tenant_id, created_at, id)`.

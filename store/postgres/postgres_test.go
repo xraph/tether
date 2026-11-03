@@ -35,6 +35,14 @@ var _ store.Store = (*postgres.Store)(nil)
 func openStore(t *testing.T) (*postgres.Store, *grove.DB) {
 	t.Helper()
 
+	return openStoreOn(t, newDatabase(t))
+}
+
+// newDatabase creates a throwaway database and returns a DSN for it. The
+// database is dropped when the test ends.
+func newDatabase(t *testing.T) string {
+	t.Helper()
+
 	dsn := os.Getenv("TETHER_TEST_POSTGRES")
 	if dsn == "" {
 		t.Skip("TETHER_TEST_POSTGRES is not set")
@@ -53,25 +61,33 @@ func openStore(t *testing.T) (*postgres.Store, *grove.DB) {
 	_, err = admin.Exec(ctx, "CREATE DATABASE "+name)
 	require.NoError(t, err)
 
+	t.Cleanup(func() {
+		// t.Context() is already cancelled here, so use a fresh one.
+		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+		_ = admin.Close()
+	})
+
 	u, err := url.Parse(dsn)
 	require.NoError(t, err)
 
 	u.Path = "/" + name
 
+	return u.String()
+}
+
+// openStoreOn opens a store with its own pool on the database dsn names and
+// closes it when the test ends.
+func openStoreOn(t *testing.T, dsn string) (*postgres.Store, *grove.DB) {
+	t.Helper()
+
 	drv := pgdriver.New()
-	require.NoError(t, drv.Open(ctx, u.String()))
+	require.NoError(t, drv.Open(t.Context(), dsn))
 
 	db, err := grove.Open(drv)
 	require.NoError(t, err)
 
 	s := postgres.New(db)
-
-	t.Cleanup(func() {
-		_ = s.Close()
-		// t.Context() is already cancelled here, so use a fresh one.
-		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-		_ = admin.Close()
-	})
+	t.Cleanup(func() { _ = s.Close() })
 
 	return s, db
 }

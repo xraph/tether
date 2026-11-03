@@ -342,7 +342,7 @@ func TestExtensionBootsWithKeysmithAndWarden(t *testing.T) {
 	require.NoError(t, e.ext.Health(t.Context()))
 	assert.True(t, e.ext.DashboardStatus().Configured)
 	assert.NotNil(t, e.ext.Services())
-	assert.Equal(t, []string{"keysmith", "warden"}, e.ext.Dependencies())
+	assert.Equal(t, []string{"grove", "keysmith", "warden"}, e.ext.Dependencies())
 }
 
 // Revoking a device through REST fires the keysmith plugin, whose reactor

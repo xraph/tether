@@ -123,6 +123,83 @@ func (s *started) do(t *testing.T, method, path, token string, body any, want in
 	return m
 }
 
+// tenant makes a tenant through the admin API and returns its ID.
+func (s *started) tenant(t *testing.T) string {
+	t.Helper()
+
+	res := s.do(t, http.MethodPost, "/tether/v1/tenants", testToken,
+		map[string]any{"app_id": testApp, "external_id": testOrg, "name": "Acme"}, http.StatusCreated)
+
+	return res["id"].(string)
+}
+
+// role makes a role with its topic grants.
+func (s *started) role(t *testing.T, tid, slug string, publish, subscribe []string) {
+	t.Helper()
+
+	// Warden's REST routes are off in the binary, so the role comes from
+	// Tether's own API, with its topics.
+	s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/roles", testToken,
+		map[string]any{"slug": slug, "name": slug, "publish": publish, "subscribe": subscribe}, http.StatusCreated)
+}
+
+// device makes a device with the roles and returns its MQTT username and
+// password.
+func (s *started) device(t *testing.T, tid, name string, roles ...string) (string, string) {
+	t.Helper()
+
+	dev := s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/devices", testToken,
+		map[string]any{"name": name, "roles": roles}, http.StatusCreated)
+
+	return dev["username"].(string), dev["password"].(string)
+}
+
+// dial connects an MQTT 3.1.1 client to the broker at addr, and disconnects
+// it when the test ends.
+func (s *started) dial(t *testing.T, addr, clientID, user, pass string) pahov3.Client {
+	t.Helper()
+
+	opts := pahov3.NewClientOptions().
+		AddBroker("tcp://" + addr).
+		SetClientID(clientID).
+		SetUsername(user).
+		SetPassword(pass).
+		SetProtocolVersion(4).
+		SetCleanSession(true).
+		SetAutoReconnect(false).
+		SetConnectRetry(false).
+		SetConnectTimeout(waitTimeout)
+
+	c := pahov3.NewClient(opts)
+	tok := c.Connect()
+	require.True(t, tok.WaitTimeout(waitTimeout), "connect timed out")
+	require.NoError(t, tok.Error())
+
+	t.Cleanup(func() { c.Disconnect(0) })
+
+	return c
+}
+
+// subscribe subscribes at QoS 1 and sends what arrives to msgs.
+func subscribe(t *testing.T, c pahov3.Client, filter string, msgs chan<- [2]string) {
+	t.Helper()
+
+	tok := c.Subscribe(filter, 1, func(_ pahov3.Client, m pahov3.Message) {
+		msgs <- [2]string{m.Topic(), string(m.Payload())}
+	})
+	require.True(t, tok.WaitTimeout(waitTimeout), "subscribe timed out")
+	require.NoError(t, tok.Error())
+}
+
+// publish publishes at QoS 1 and waits for the broker's PUBACK.
+func publish(t *testing.T, c pahov3.Client, topic, payload string) {
+	t.Helper()
+
+	tok := c.Publish(topic, 1, false, payload)
+	require.True(t, tok.WaitTimeout(waitTimeout), "publish timed out")
+	require.NoError(t, tok.Error())
+}
+
 // The binary's whole stack boots from its config: a tenant and a device come
 // from the admin API behind the token, and the device round-trips a message
 // over MQTT with the key keysmith issued.
@@ -145,50 +222,15 @@ func TestBinaryBootsAndServes(t *testing.T) {
 	assert.Equal(t, "Bearer", resp.Header.Get("WWW-Authenticate"))
 
 	// With it, a tenant and a device.
-	tenantRes := s.do(t, http.MethodPost, "/tether/v1/tenants", testToken,
-		map[string]any{"app_id": testApp, "external_id": testOrg, "name": "Acme"}, http.StatusCreated)
-	tid := tenantRes["id"].(string)
-
-	// Warden's REST routes are off in the binary, so the role comes from
-	// Tether's own API, with its topics.
-	s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/roles", testToken,
-		map[string]any{
-			"slug": "sensor", "name": "Sensor",
-			"publish": []string{"sensors/%c/up"}, "subscribe": []string{"sensors/%c/#"},
-		}, http.StatusCreated)
-
-	dev := s.do(t, http.MethodPost, "/tether/v1/tenants/"+tid+"/devices", testToken,
-		map[string]any{"name": "pump", "roles": []string{"sensor"}}, http.StatusCreated)
+	tid := s.tenant(t)
+	s.role(t, tid, "sensor", []string{"sensors/%c/up"}, []string{"sensors/%c/#"})
+	user, pass := s.device(t, tid, "pump", "sensor")
 
 	msgs := make(chan [2]string, 4)
+	c := s.dial(t, s.ext.Broker().Addr().String(), "pump-1", user, pass)
 
-	opts := pahov3.NewClientOptions().
-		AddBroker("tcp://" + s.ext.Broker().Addr().String()).
-		SetClientID("pump-1").
-		SetUsername(dev["username"].(string)).
-		SetPassword(dev["password"].(string)).
-		SetProtocolVersion(4).
-		SetCleanSession(true).
-		SetAutoReconnect(false).
-		SetConnectRetry(false).
-		SetConnectTimeout(waitTimeout)
-
-	c := pahov3.NewClient(opts)
-	tok := c.Connect()
-	require.True(t, tok.WaitTimeout(waitTimeout), "connect timed out")
-	require.NoError(t, tok.Error())
-
-	t.Cleanup(func() { c.Disconnect(0) })
-
-	tok = c.Subscribe("sensors/pump-1/#", 1, func(_ pahov3.Client, m pahov3.Message) {
-		msgs <- [2]string{m.Topic(), string(m.Payload())}
-	})
-	require.True(t, tok.WaitTimeout(waitTimeout), "subscribe timed out")
-	require.NoError(t, tok.Error())
-
-	tok = c.Publish("sensors/pump-1/up", 1, false, "21.5")
-	require.True(t, tok.WaitTimeout(waitTimeout), "publish timed out")
-	require.NoError(t, tok.Error())
+	subscribe(t, c, "sensors/pump-1/#", msgs)
+	publish(t, c, "sensors/pump-1/up", "21.5")
 
 	select {
 	case m := <-msgs:

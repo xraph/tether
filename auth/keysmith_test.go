@@ -667,14 +667,11 @@ func (failingKeyLookup) GetByHash(context.Context, string) (*key.Key, error) {
 	return nil, errors.New("connection refused")
 }
 
-// TestKeysmithLookupOutageSurfacesAsBadCredentials pins a known keysmith
-// v1.8.0 limitation, not behaviour we want. keysmith reports any key lookup
-// failure, an outage included, as keysmith.ErrInvalidKey, so Tether sees a
-// wrong key and answers ErrBadCredentials (CONNACK 0x86) instead of
-// ErrUnavailable (0x88). When keysmith distinguishes outages, this test fails:
-// flip the expectation to ErrUnavailable and update auth/llm.txt and the
-// ErrUnavailable doc comment.
-func TestKeysmithLookupOutageSurfacesAsBadCredentials(t *testing.T) {
+// A key store that cannot answer is an outage, not a wrong key. keysmith
+// v1.9.0 returns the lookup error instead of keysmith.ErrInvalidKey, so the
+// device gets ErrUnavailable (CONNACK 0x88) and can retry. keysmith v1.8.0
+// reported it as ErrInvalidKey, which came out as ErrBadCredentials (0x86).
+func TestKeysmithLookupOutageSurfacesAsUnavailable(t *testing.T) {
 	ctx := t.Context()
 
 	eng, err := keysmith.NewEngine(keysmith.WithStore(failingKeyLookupStore{Store: kmemory.New()}))
@@ -684,9 +681,9 @@ func TestKeysmithLookupOutageSurfacesAsBadCredentials(t *testing.T) {
 	a := NewKeysmith(eng, e.tenants, e.st)
 
 	_, err = a.Authenticate(ctx, Credentials{ClientID: "c", Username: e.keyID.String(), Password: []byte(rawKey)})
-	require.ErrorIs(t, err, ErrBadCredentials)
-	require.NotErrorIs(t, err, ErrUnavailable)
-	require.ErrorIs(t, err, keysmith.ErrInvalidKey)
+	require.ErrorIs(t, err, ErrUnavailable)
+	require.NotErrorIs(t, err, ErrBadCredentials)
+	require.NotErrorIs(t, err, keysmith.ErrInvalidKey)
 }
 
 // A key revoked while its validation is in flight: the revoke's Evict runs

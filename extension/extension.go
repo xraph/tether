@@ -118,6 +118,9 @@ type Extension struct {
 	services *api.Services
 	active   store.Store
 	started  bool
+	// contributed is set by Register when the migration group went to
+	// grove's MigrationRegistry.
+	contributed bool
 	// cell is what Start made to run the node in its cell, nil without a
 	// cell. Stop closes it after the broker.
 	cell *cell
@@ -132,7 +135,10 @@ func New(opts ...Option) *Extension {
 		ksPlugin:      events.NewKeysmithPlugin(),
 		wdPlugin:      events.NewWardenPlugin(nil),
 	}
-	e.SetDependencies([]string{"keysmith", "warden"})
+	// grove is optional: forge skips a dependency that is not registered.
+	// When the grove extension is there it registers first, so its
+	// database and migration registry exist when Register looks for them.
+	e.SetDependencies([]string{"grove", "keysmith", "warden"})
 
 	for _, opt := range opts {
 		opt(e)
@@ -157,8 +163,11 @@ func (e *Extension) Services() *api.Services {
 	return e.services
 }
 
-// Register loads the config and puts the extension in the container.
-// Everything else waits for Start, once keysmith and warden have started.
+// Register loads the config and puts the extension in the container. When
+// the app runs central migrations and grove's MigrationRegistry is in the
+// container, it also hands the store's migration group to the registry (see
+// contribute), and Start then leaves migrating to that pass. Everything else
+// waits for Start, once keysmith and warden have started.
 func (e *Extension) Register(app forge.App) error {
 	if err := e.BaseExtension.Register(app); err != nil {
 		return err
@@ -192,6 +201,13 @@ func (e *Extension) Register(app forge.App) error {
 	if err := vessel.Provide(app.Container(), func() (*Extension, error) { return e, nil }); err != nil {
 		return fmt.Errorf("tether: register extension in container: %w", err)
 	}
+
+	contributed, err := e.contribute(app)
+	if err != nil {
+		return err
+	}
+
+	e.contributed = contributed
 
 	return nil
 }
@@ -427,11 +443,17 @@ func (e *Extension) keysmithWired(ks *keysmith.Engine) bool {
 	return slices.ContainsFunc(e.ksExts, func(x *keysmithext.Extension) bool { return x.Engine() == ks })
 }
 
-// openStore resolves the store and migrates it.
+// openStore resolves the store and migrates it, unless migrations are
+// disabled or the group went to the central migrator, which ran it before
+// any extension started.
 func (e *Extension) openStore(ctx context.Context) (store.Store, error) {
 	st, err := e.resolveStore()
 	if err != nil {
 		return nil, err
+	}
+
+	if e.config.DisableMigrate || e.contributed {
+		return st, nil
 	}
 
 	if err := st.Migrate(ctx); err != nil {
@@ -504,10 +526,12 @@ func (e *Extension) resolveStore() (store.Store, error) {
 // mountRoutes mounts the admin API on a group with the admin middleware and
 // POST /v1/publish on a plain group, both under the base path.
 //
-// The middleware goes on with Use, not forge.WithGroupMiddleware: api
-// registers its routes on nested groups, and forge v1.12.10's Group copies
-// the parent's Use middleware but not its group-option middleware, so the
-// admin routes would be mounted open.
+// The middleware goes on with Use. api registers its routes on groups nested
+// in the admin group, and since forge v1.13.0 a nested group inherits its
+// parent's Use and WithGroupMiddleware chains alike. Before that it dropped
+// the WithGroupMiddleware one, which mounted nested routes open, so Use is
+// the form that was always safe. TestAdminMiddlewareGuardsAdminRoutesOnly
+// pins it either way.
 func (e *Extension) mountRoutes(s api.Services) error {
 	r := e.App().Router()
 
