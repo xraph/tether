@@ -1253,7 +1253,9 @@ func TestSharedStaleWriterKeepsBooks(t *testing.T) {
 
 	ids := map[string]map[uint16]bool{}
 
-	deadline := time.Now().Add(3 * time.Second)
+	// Setup, not a bound on the broker: the loop leaves as soon as the log
+	// delivery is in.
+	deadline := time.Now().Add(scaled(3 * time.Second))
 	for time.Now().Before(deadline) {
 		cp := readFor(t, m2, 200*time.Millisecond)
 		if cp == nil {
@@ -1271,6 +1273,10 @@ func TestSharedStaleWriterKeepsBooks(t *testing.T) {
 
 			ids[string(p.Payload)][p.PacketID] = true
 		}
+	}
+
+	if len(ids["log"]) == 0 && cellState != nil {
+		t.Logf("no log delivery on the new connection\n%s", cellState())
 	}
 
 	require.Len(t, ids["log"], 1, "the log delivery reached the new connection before the writer went on")
