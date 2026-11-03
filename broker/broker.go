@@ -475,7 +475,7 @@ func shutdown(srv *mqtt.Server, listenerIDs []string) error {
 
 	for _, cl := range srv.Clients.GetAll() {
 		if !cl.Net.Inline && !cl.Closed() {
-			wg.Go(func() { disconnect(srv, nil, cl, packets.ErrServerShuttingDown) })
+			wg.Go(func() { disconnect(srv, nil, cl, "", packets.ErrServerShuttingDown) })
 		}
 	}
 
@@ -504,7 +504,17 @@ const disconnectWait = time.Second
 //
 // Mochi returns the code itself as the error for every code from 0x80 up,
 // so only a different error, a failed write, is logged (when log is not nil).
-func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, code packets.Code) {
+//
+// name is the client ID the logs carry, passed in because cl.ID is written on
+// the connection's goroutine when the session is established, and a caller
+// that found the client in the registry may be racing that write. Use
+// st.nsID() when a state is at hand and cl.ID only where the client is known
+// to be established. An empty name leaves the client out of the logs.
+func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, name string, code packets.Code) {
+	if log != nil && name != "" {
+		log = log.With(slog.String("client", name))
+	}
+
 	done := make(chan error, 1)
 
 	go func() { done <- srv.DisconnectClient(cl, code) }()
@@ -515,11 +525,11 @@ func disconnect(srv *mqtt.Server, log *slog.Logger, cl *mqtt.Client, code packet
 	select {
 	case err := <-done:
 		if err != nil && !errors.Is(err, code) && log != nil {
-			log.Debug("tether: disconnect write failed", slog.String("client", cl.ID), slog.Any("error", err))
+			log.Debug("tether: disconnect write failed", slog.Any("error", err))
 		}
 	case <-timer.C:
 		if log != nil {
-			log.Info("tether: client did not take its DISCONNECT, closing the connection", slog.String("client", cl.ID))
+			log.Info("tether: client did not take its DISCONNECT, closing the connection")
 		}
 	}
 

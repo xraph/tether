@@ -62,7 +62,7 @@ func (b *Broker) DisconnectPrincipal(principalID string, code packets.Code) int 
 
 		b.log.Info("tether: disconnecting principal", slog.String("client", st.nsID()), slog.String("tenant", st.tenantID),
 			slog.String("principal", principalID), slog.Int("code", int(code.Code)))
-		disconnect(srv, b.log, st.cl, code)
+		disconnect(srv, b.log, st.cl, st.nsID(), code)
 		n++
 	}
 
@@ -141,7 +141,7 @@ func (b *Broker) expireConnection(srv *mqtt.Server, st *clientState) {
 	}
 
 	b.log.Info("tether: credentials expired, disconnecting", slog.String("client", st.nsID()), slog.String("tenant", st.tenantID))
-	disconnect(srv, b.log, st.cl, packets.ErrMaxConnectTime)
+	disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrMaxConnectTime)
 }
 
 // ReloadRole reloads the grants of every live connection whose current
@@ -252,9 +252,9 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 		b.log.Info("tether: tenant disabled, disconnecting", slog.String("client", st.nsID()), slog.String("tenant", tenantID))
 
 		if async {
-			go disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+			go disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrAdministrativeAction)
 		} else {
-			disconnect(srv, b.log, st.cl, packets.ErrAdministrativeAction)
+			disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrAdministrativeAction)
 		}
 	}
 }
@@ -347,7 +347,7 @@ func (b *Broker) reloadLocked(ctx context.Context, srv *mqtt.Server, st *clientS
 	if err != nil {
 		if principalRefused(err) {
 			log.Info("tether: principal no longer authorized, disconnecting", slog.Any("error", err))
-			disconnect(srv, b.log, st.cl, packets.ErrNotAuthorized)
+			disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrNotAuthorized)
 
 			return reloadGone
 		}
@@ -441,7 +441,7 @@ func (b *Broker) retryReload(srv *mqtt.Server, st *clientState, stop chan struct
 		if !time.Now().Before(deadline) {
 			b.log.Warn("tether: permissions still unavailable, disconnecting so the client authorizes again",
 				slog.String("client", st.nsID()), slog.String("tenant", st.tenantID))
-			disconnect(srv, b.log, st.cl, packets.ErrServerUnavailable)
+			disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrServerUnavailable)
 
 			return
 		}
@@ -793,7 +793,7 @@ func (b *Broker) Kick(tenantID, clientID string) error {
 	}
 
 	b.log.Info("tether: kicking client", slog.String("client", nsID), slog.String("tenant", tenantID))
-	disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+	disconnect(srv, b.log, cl, nsID, packets.ErrAdministrativeAction)
 
 	return nil
 }
@@ -872,7 +872,7 @@ func (b *Broker) DeleteSession(tenantID, clientID string) error {
 
 	if !cl.Closed() {
 		log.Info("tether: disconnecting client to delete its session")
-		disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+		disconnect(srv, b.log, cl, nsID, packets.ErrAdministrativeAction)
 	}
 
 	// The storage hook writes the session's record in its OnDisconnect;

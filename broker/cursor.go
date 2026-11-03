@@ -1431,7 +1431,7 @@ func (n *clusterNode) persistNow(s *session, cl *mqtt.Client) bool {
 			code = packets.ErrAdministrativeAction
 		}
 
-		disconnect(n.mochi, n.log, cl, code)
+		disconnect(n.mochi, n.log, cl, s.nsID, code)
 
 		return false
 	}

@@ -1220,14 +1220,14 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 
 	if n.fenced.Load() {
 		// Fenced while this CONNECT was on its way: it goes like the rest.
-		n.dropClient(n.mochi, cl)
+		n.dropClient(n.mochi, cl, cl.ID)
 
 		return
 	}
 
 	if b.state.owner(cl.ID) != st {
 		n.log.Info("tether: connection lost its client ID to a concurrent connect", slog.String("client", cl.ID))
-		disconnect(n.mochi, b.log, cl, packets.ErrSessionTakenOver)
+		disconnect(n.mochi, b.log, cl, cl.ID, packets.ErrSessionTakenOver)
 
 		return
 	}
@@ -1241,7 +1241,7 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 	}
 
 	if lost {
-		disconnect(n.mochi, b.log, cl, packets.ErrSessionTakenOver)
+		disconnect(n.mochi, b.log, cl, cl.ID, packets.ErrSessionTakenOver)
 
 		return
 	}
@@ -1812,7 +1812,7 @@ func (n *clusterNode) lose(s *session, deleted bool) {
 		}
 
 		if !cl.Closed() {
-			disconnect(n.mochi, n.log, cl, code)
+			disconnect(n.mochi, n.log, cl, s.nsID, code)
 		}
 	}()
 }
@@ -2129,7 +2129,7 @@ func (b *Broker) deleteClusterSession(srv *mqtt.Server, tenantID, clientID, nsID
 
 		if !live.Closed() {
 			log.Info("tether: disconnecting client to delete its session")
-			disconnect(srv, b.log, live, packets.ErrAdministrativeAction)
+			disconnect(srv, b.log, live, nsID, packets.ErrAdministrativeAction)
 		}
 
 		if st != nil && !waitEnded(st, b.endWait) && !live.Closed() {

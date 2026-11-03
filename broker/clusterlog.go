@@ -573,7 +573,7 @@ func (p *pubPipe) admit() bool {
 
 		if p.cl.Properties.ProtocolVersion == 5 {
 			p.b.log.Info("tether: receive maximum exceeded", slog.String("client", p.cl.ID), slog.Int("outstanding", out), slog.Int("limit", limit))
-			disconnect(p.srv, p.b.log, p.cl, packets.ErrReceiveMaximum)
+			disconnect(p.srv, p.b.log, p.cl, p.cl.ID, packets.ErrReceiveMaximum)
 
 			return false
 		}

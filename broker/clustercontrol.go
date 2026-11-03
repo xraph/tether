@@ -354,7 +354,7 @@ func (b *Broker) onSessionKick(data []byte) {
 
 	b.log.Info("tether: kicking client for another node", slog.String("client", nsID), slog.String("tenant", ev.Tenant))
 
-	go disconnect(srv, b.log, cl, packets.ErrAdministrativeAction)
+	go disconnect(srv, b.log, cl, nsID, packets.ErrAdministrativeAction)
 }
 
 // onSessionDelete is a session.delete event: the node it names deletes the

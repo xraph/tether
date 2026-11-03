@@ -575,7 +575,7 @@ func (h *hook) reject(cl *mqtt.Client, pk packets.Packet, code packets.Code) (pa
 	h.b.log.Info("tether: publish rejected", slog.String("client", cl.ID), slog.Int("code", int(code.Code)))
 
 	if cl.Properties.ProtocolVersion == 5 {
-		disconnect(h.server, h.b.log, cl, code)
+		disconnect(h.server, h.b.log, cl, cl.ID, code)
 	}
 
 	return pk, packets.ErrRejectPacket
@@ -825,7 +825,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 		switch {
 		case qos == 0:
 		case !v5:
-			disconnect(h.server, h.b.log, cl, packets.ErrNotAuthorized)
+			disconnect(h.server, h.b.log, cl, cl.ID, packets.ErrNotAuthorized)
 		case st.pipe.admit():
 			st.pipe.ackNow(pk.PacketID, qos, packets.ErrNotAuthorized)
 		}

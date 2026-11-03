@@ -387,7 +387,7 @@ func (n *clusterNode) dropClients(srv *mqtt.Server) {
 		wg.Go(func() {
 			defer func() { <-slots }()
 
-			n.dropClient(srv, cl)
+			n.dropClient(srv, cl, "")
 		})
 	}
 
@@ -395,8 +395,9 @@ func (n *clusterNode) dropClients(srv *mqtt.Server) {
 }
 
 // dropClient ends one connection of a fenced node: 0x88 for 5.0, closed for
-// 3.1.1.
-func (n *clusterNode) dropClient(srv *mqtt.Server, cl *mqtt.Client) {
+// 3.1.1. name is the client ID for the logs, which dropClients leaves empty
+// because a connection it finds may not have written its ID yet.
+func (n *clusterNode) dropClient(srv *mqtt.Server, cl *mqtt.Client, name string) {
 	n.fenceDrops.Add(1)
 
 	if cl.Properties.ProtocolVersion < 5 {
@@ -405,7 +406,7 @@ func (n *clusterNode) dropClient(srv *mqtt.Server, cl *mqtt.Client) {
 		return
 	}
 
-	disconnect(srv, n.log, cl, packets.ErrServerUnavailable)
+	disconnect(srv, n.log, cl, name, packets.ErrServerUnavailable)
 }
 
 // ClusterHealth reports whether this node can act for its cell: nil when it
