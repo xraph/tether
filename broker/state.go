@@ -202,6 +202,28 @@ func (st *clientState) closePipe() {
 	}
 }
 
+// takeoverWriteWait bounds the writes to a connection that another one is
+// taking over, the DISCONNECT mochi sends it included: as long as disconnect
+// gives a client to take its DISCONNECT.
+const takeoverWriteWait = disconnectWait
+
+// boundWrites gives the connection's writes takeoverWriteWait to finish, for
+// a connection being taken over. mochi's takeover writes its DISCONNECT
+// (0x8E) under the client's write lock, before the new connection's CONNACK.
+// A peer that stopped reading leaves a write blocked under that lock (a
+// replay's, a shared delivery's, mochi's own), and the takeover would wait
+// for it until the old connection's keepalive ran out, or for good with no
+// keepalive. The deadline fails such a write, which ends the old connection,
+// and a healthy one is done with its writes well before it.
+func (st *clientState) boundWrites() error {
+	conn := st.cl.Net.Conn
+	if conn == nil {
+		return nil
+	}
+
+	return conn.SetWriteDeadline(time.Now().Add(takeoverWriteWait))
+}
+
 // markEnded closes ended. Safe to call more than once.
 func (st *clientState) markEnded() {
 	st.endedOnce.Do(func() { close(st.ended) })
@@ -390,8 +412,10 @@ func (r *registry) get(cl *mqtt.Client) *clientState {
 // dropped and its slot released here.
 //
 // A previous owner is being taken over (or is long gone), so its expiry
-// timer is stopped: it must never fire on the session's new connection.
-func (r *registry) bind(st *clientState) {
+// timer is stopped: it must never fire on the session's new connection. bind
+// returns a previous owner whose connection is still open, the one mochi is
+// about to take over, and nil when there is none.
+func (r *registry) bind(st *clientState) *clientState {
 	r.mu.Lock()
 
 	prev := r.byID[st.cl.ID]
@@ -412,13 +436,19 @@ func (r *registry) bind(st *clientState) {
 
 	r.mu.Unlock()
 
-	if prev != nil && prev != st {
-		prev.stopTimers()
+	if prev == nil || prev == st {
+		return nil
 	}
+
+	prev.stopTimers()
 
 	if stale {
 		prev.releaseSlot()
+
+		return nil
 	}
+
+	return prev
 }
 
 // match returns the state of every connection for which keep is true. keep

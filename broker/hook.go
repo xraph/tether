@@ -441,8 +441,14 @@ func (h *hook) OnSessionEstablish(cl *mqtt.Client, _ packets.Packet) {
 	h.capSessionExpiry(cl, st)
 
 	// bind also abandons the pipe of a connection this one takes over
-	// (clientState.closePipe), before mochi clones its inflight map.
-	h.b.state.bind(st)
+	// (clientState.closePipe), before mochi clones its inflight map. That
+	// connection's writes get a deadline, so mochi's takeover cannot wait on
+	// one that its peer stopped reading (clientState.boundWrites).
+	if prev := h.b.state.bind(st); prev != nil {
+		if err := prev.boundWrites(); err != nil {
+			h.b.log.Debug("tether: no write deadline on the connection taken over", slog.String("client", cl.ID), slog.Any("error", err))
+		}
+	}
 }
 
 // capSessionExpiry holds the session to the connection's expiry cap, the

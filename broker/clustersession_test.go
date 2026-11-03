@@ -304,12 +304,18 @@ func dialRaw(t *testing.T, addr, clientID string, sess *rawSession, noAck bool) 
 }
 
 // dialRawStalled is dialRaw for a client that reads its CONNACK and then
-// nothing more.
+// nothing more. Its receive buffer is small, so a few large messages fill
+// the socket and the server's next write to it blocks, whatever the
+// platform's buffer autotuning would allow.
 func dialRawStalled(t *testing.T, addr, clientID string, sess *rawSession) *rawConn {
 	t.Helper()
 
 	conn, err := dial(t, addr)
 	require.NoError(t, err)
+
+	tc, ok := conn.(*net.TCPConn)
+	require.True(t, ok)
+	require.NoError(t, tc.SetReadBuffer(4096))
 
 	return startRaw(t, conn, clientID, sess, true, true)
 }
