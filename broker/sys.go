@@ -41,11 +41,21 @@ type Stats struct {
 	// MessagesOut counts PUBLISH packets written to the tenant's clients,
 	// $SYS stats included, since the broker started.
 	MessagesOut uint64
+
+	// BytesIn and BytesOut are the payload bytes of the PUBLISH packets that
+	// MessagesIn and MessagesOut count. Topics and properties are not
+	// counted.
+	BytesIn, BytesOut uint64
 }
 
-// tenantCounters are a tenant's message counters.
+// tenantCounters are a tenant's message, byte and connection counters. The
+// message and byte counters are atomics, so the PUBLISH path takes no lock;
+// the connection clock has a mutex of its own, taken when a connection opens
+// or closes and never across a call into mochi or the cell.
 type tenantCounters struct {
-	in, out atomic.Uint64
+	in, out           atomic.Uint64
+	bytesIn, bytesOut atomic.Uint64
+	clock             connClock
 }
 
 // countersFor returns tenantID's counters, creating them on first use.
@@ -72,6 +82,8 @@ func (b *Broker) addCounters(tenantID string, st *Stats) {
 	if c != nil {
 		st.MessagesIn = c.in.Load()
 		st.MessagesOut = c.out.Load()
+		st.BytesIn = c.bytesIn.Load()
+		st.BytesOut = c.bytesOut.Load()
 	}
 }
 

@@ -115,9 +115,11 @@ type Broker struct {
 
 	mu      sync.Mutex
 	started bool
-	server  *mqtt.Server
-	tcpAddr net.Addr
-	tlsAddr net.Addr
+	// startedAt is when Start ran (StartedAt).
+	startedAt time.Time
+	server    *mqtt.Server
+	tcpAddr   net.Addr
+	tlsAddr   net.Addr
 
 	// sysStop stops the $SYS publisher, which closes sysDone when it returns.
 	sysStop chan struct{}
@@ -211,6 +213,7 @@ func (b *Broker) Start(ctx context.Context) error {
 	}
 
 	b.started = true
+	b.startedAt = time.Now()
 
 	caps := mqtt.NewDefaultServerCapabilities()
 	caps.TopicAliasMaximum = 0

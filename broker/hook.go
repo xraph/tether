@@ -356,6 +356,7 @@ func (h *hook) acquire(tenantID string, maxConns int) bool {
 		return false
 	}
 
+	h.b.countersFor(tenantID).connectionOpened()
 	h.b.deps.Metrics.ConnectionOpened()
 
 	return true
@@ -717,6 +718,7 @@ func (h *hook) OnPacketEncode(cl *mqtt.Client, pk packets.Packet) packets.Packet
 
 		pk.TopicName = name
 		counters.out.Add(1)
+		counters.bytesOut.Add(uint64(len(pk.Payload)))
 		h.b.deps.Metrics.MessageOut()
 
 		// Mochi v2.7.9 sets DisallowProblemInfo for a client that connected
@@ -858,6 +860,7 @@ func (h *hook) OnPublish(cl *mqtt.Client, pk packets.Packet) (packets.Packet, er
 	}
 
 	st.counters.in.Add(1)
+	st.counters.bytesIn.Add(uint64(len(pk.Payload)))
 	h.b.deps.Metrics.MessageIn()
 
 	switch {

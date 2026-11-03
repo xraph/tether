@@ -247,6 +247,10 @@ func (st *clientState) releaseSlot() {
 	if st.slot.CompareAndSwap(slotHeld, slotReleased) {
 		st.limiter.ReleaseConnection(st.tenantID)
 
+		if st.counters != nil {
+			st.counters.connectionClosed()
+		}
+
 		if st.metrics != nil {
 			st.metrics.ConnectionClosed()
 		}

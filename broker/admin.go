@@ -1122,7 +1122,9 @@ func (b *Broker) publish(ctx context.Context, tenantID, topicName string, payloa
 	}
 
 	if countIn {
-		b.countersFor(tenantID).in.Add(1)
+		c := b.countersFor(tenantID)
+		c.in.Add(1)
+		c.bytesIn.Add(uint64(len(payload)))
 		b.deps.Metrics.MessageIn()
 	}
 
