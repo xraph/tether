@@ -722,7 +722,7 @@ func (ro *replayOut) send(pk packets.Packet) bool {
 			return false
 		}
 
-		pk.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
+		pk.PacketID = uint16(id) // #nosec G115 -- NextPacketID stays within the uint16 packet ID space.
 
 		// Registered under s.mu with the abandon check, so a stopped
 		// replay never leaves a delivery behind it.

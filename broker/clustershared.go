@@ -576,7 +576,7 @@ func (n *clusterNode) sendShare(nsID string, out *shareOut, it shareItem) {
 			return
 		}
 
-		pk.PacketID = uint16(id) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
+		pk.PacketID = uint16(id) // #nosec G115 -- NextPacketID stays within the uint16 packet ID space.
 
 		// The ID is cl's. If the session has moved to another connection
 		// meanwhile, the books (which the new connection uses) must not be
@@ -701,8 +701,8 @@ func (n *clusterNode) followShare(nsID string, cl *mqtt.Client, pk packets.Packe
 				return true
 			}
 
-			n.renumberShare(nsID, s, pk, uint16(id), seq) //nolint:gosec // NextPacketID stays within the uint16 packet ID space
-			pk.PacketID = uint16(id)                      //nolint:gosec // as above
+			n.renumberShare(nsID, s, pk, uint16(id), seq) // #nosec G115 -- NextPacketID stays within the uint16 packet ID space.
+			pk.PacketID = uint16(id)                      // #nosec G115 -- as above.
 		}
 
 		if pk.FixedHeader.Qos == 2 && !n.repinShare(s, cur, pk.PacketID, seq) {

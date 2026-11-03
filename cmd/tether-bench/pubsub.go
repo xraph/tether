@@ -130,7 +130,7 @@ func (s *subscriber) onMsg(p *paho.Publish) { s.receive(p.Payload, time.Since(ep
 // slot was scheduled for.
 func payload(sched time.Time, k uint64, size int) []byte {
 	buf := make([]byte, max(size, payloadHeader))
-	binary.BigEndian.PutUint64(buf[0:8], uint64(sched.Sub(epoch))) //nolint:gosec // G115: a duration since start, never negative.
+	binary.BigEndian.PutUint64(buf[0:8], uint64(sched.Sub(epoch))) // #nosec G115 -- a duration since start, never negative.
 	binary.BigEndian.PutUint64(buf[8:16], k)
 
 	return buf
@@ -146,7 +146,7 @@ func (s *subscriber) receive(payload []byte, now time.Duration) {
 		return
 	}
 
-	sent := time.Duration(binary.BigEndian.Uint64(payload[0:8])) //nolint:gosec // G115: a send time, far below 2^63 ns.
+	sent := time.Duration(binary.BigEndian.Uint64(payload[0:8])) // #nosec G115 -- a send time, far below 2^63 ns.
 	seq := binary.BigEndian.Uint64(payload[8:16])
 
 	s.mu.Lock()
@@ -724,7 +724,7 @@ func runPubsub(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	o.QoS = byte(*qos) //nolint:gosec // G115: validated to be 0 or 1 below.
+	o.QoS = byte(*qos) // #nosec G115 -- validated to be 0 or 1 below.
 
 	if *qos < 0 || *qos > 1 || (o.Placement != "cross" && o.Placement != "same") || o.Rate <= 0 || o.Parallel < 1 {
 		return errors.New("pubsub: --qos must be 0 or 1, --placement cross or same, --rate above 0 and --parallel at least 1")

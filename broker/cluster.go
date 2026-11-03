@@ -257,7 +257,7 @@ func fitPacketSize(want uint32, maxPayload int64, log *slog.Logger) uint32 {
 		return want
 	}
 
-	fit := uint32(min((maxPayload-cellHeadroom)*3/4, math.MaxUint32)) //nolint:gosec // bounded above
+	fit := uint32(min((maxPayload-cellHeadroom)*3/4, math.MaxUint32)) // #nosec G115 -- bounded above.
 	if want <= fit {
 		return want
 	}

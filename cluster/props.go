@@ -186,7 +186,7 @@ func decodeUserProps(raw []byte) ([]UserProperty, error) {
 			return "", errors.New("truncated frame")
 		}
 
-		size := int(n) //nolint:gosec // n is at most len(rest), checked above
+		size := int(n) // #nosec G115 -- n is at most len(rest), checked above.
 		raw = rest[size:]
 
 		return string(rest[:size]), nil
