@@ -109,6 +109,15 @@ func newCellEnv(t *testing.T) *cellEnv {
 		cancel()
 		require.NoError(t, err)
 
+		if i == 0 {
+			// Every server can route a write to the cell's streams (the log,
+			// the control bus and the three buckets) before a node uses
+			// them: right after Provision a publish through a server their
+			// interest has not reached yet gets no responders.
+			nc.WaitInterest(t, "d.x", "ctl.x",
+				"$KV."+ccfg.SessionsBucket()+".x", "$KV."+ccfg.RetainedBucket()+".x", "$KV."+ccfg.MembersBucket()+".x")
+		}
+
 		conns = append(conns, conn)
 
 		ks := events.NewKeysmithPlugin()

@@ -23,12 +23,14 @@ import (
 )
 
 // startCellConns starts a three-server JetStream cluster, provisions a cell on
-// it and returns one connection per node, node i on server i%3, with the
-// cell's config.
+// it, waits until every server can route a write to the cell's streams, and
+// returns one connection per node, node i on server i%3, with the cell's
+// config.
 func startCellConns(t *testing.T, nodes int) ([]*Conn, Config) {
 	t.Helper()
 
-	urls := clustertest.Start(t, 3)
+	nc := clustertest.StartCluster(t, 3)
+	urls := nc.URLs()
 	out := make([]*Conn, 0, nodes)
 
 	var cfg Config
@@ -53,12 +55,25 @@ func startCellConns(t *testing.T, nodes int) ([]*Conn, Config) {
 			if err := Provision(tctx(t, 30*time.Second), c, cfg, time.Hour); err != nil {
 				t.Fatal(err)
 			}
+
+			nc.WaitInterest(t, cellSubjects(cfg)...)
 		}
 
 		out = append(out, c)
 	}
 
 	return out, cfg
+}
+
+// cellSubjects is a subject of each stream and bucket Provision makes for
+// the cell, for clustertest's WaitInterest: until every server has interest
+// in them, a node's first write through a server the interest has not
+// reached gets no responders.
+func cellSubjects(cfg Config) []string {
+	return []string{
+		"d.x", "ctl.x",
+		"$KV." + cfg.SessionsBucket() + ".x", "$KV." + cfg.RetainedBucket() + ".x", "$KV." + cfg.MembersBucket() + ".x",
+	}
 }
 
 func startRetained(t *testing.T, nodes int) []*Retained {
