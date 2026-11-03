@@ -19,11 +19,14 @@ import (
 
 	"github.com/xraph/forge"
 	"github.com/xraph/grove/drivers/pgdriver"
+	kspostgres "github.com/xraph/keysmith/store/postgres"
 	"github.com/xraph/vessel"
+	wdpostgres "github.com/xraph/warden/store/postgres"
 
 	"github.com/xraph/tether/cluster"
 	"github.com/xraph/tether/cluster/clustertest"
 	"github.com/xraph/tether/extension"
+	tpostgres "github.com/xraph/tether/store/postgres"
 )
 
 // cellWait bounds a node joining its cell: an embedded cell has JetStream
@@ -241,10 +244,12 @@ func TestBinaryCellOnOnePostgres(t *testing.T) {
 	}
 }
 
-// Several processes opening one empty database at the same moment all end up
-// with a working schema. Keysmith's own migration is not safe to run twice at
-// once (it creates and drops a table on every run), so the binary runs it
-// under an advisory lock, and this fails without that.
+// Several nodes opening one empty database at the same moment all end up
+// with a working schema. Each opener runs the three migrations the
+// extensions run at Start, keysmith's, warden's and tether's, on its own
+// pool. They all go through grove's locked orchestrator, so the nodes take
+// turns. keysmith v1.8.0 ran plain statements with no lock and failed here
+// with a duplicate key on pg_type; the binary used to hold a lock around it.
 func TestConcurrentOpenOnAFreshDatabase(t *testing.T) {
 	_, dsn := postgresConfig(t)
 
@@ -257,11 +262,29 @@ func TestConcurrentOpenOnAFreshDatabase(t *testing.T) {
 	for i := range nodes {
 		wg.Go(func() {
 			db, err := openPostgres(dsn)
-			if err == nil {
-				err = db.Close()
+			if err != nil {
+				errs[i] = err
+
+				return
 			}
 
-			errs[i] = err
+			defer func() { _ = db.Close() }()
+
+			ctx := t.Context()
+
+			if err = kspostgres.New(pgdriver.Unwrap(db)).Migrate(ctx); err != nil {
+				errs[i] = fmt.Errorf("keysmith: %w", err)
+
+				return
+			}
+
+			if err = wdpostgres.New(db).Migrate(ctx); err != nil {
+				errs[i] = fmt.Errorf("warden: %w", err)
+
+				return
+			}
+
+			errs[i] = tpostgres.New(db).Migrate(ctx)
 		})
 	}
 

@@ -215,17 +215,8 @@ func newApp(cfg config, token string, insecure bool, appOpts ...forge.AppOption)
 
 	ext := extension.New(extOpts...)
 
-	ksOpts := []keysmithext.ExtOption{keysmithext.WithDisableRoutes()}
-
-	// On PostgreSQL openDB has already migrated keysmith under a lock, which
-	// the extension's own unlocked migration at Start would race against
-	// when several nodes start together.
-	if cfg.Server.usesPostgres() {
-		ksOpts = append(ksOpts, keysmithext.WithDisableMigrate())
-	}
-
 	for _, x := range []forge.Extension{
-		ext.Keysmith(ksOpts...),
+		ext.Keysmith(keysmithext.WithDisableRoutes()),
 		ext.Warden(wardenext.WithDisableRoutes()),
 		ext,
 		dashboard.NewExtension(),

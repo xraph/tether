@@ -14,7 +14,6 @@ import (
 	"github.com/xraph/grove"
 	"github.com/xraph/grove/drivers/pgdriver"
 	"github.com/xraph/grove/drivers/sqlitedriver"
-	kspostgres "github.com/xraph/keysmith/store/postgres"
 
 	"github.com/xraph/tether/store/sqlite"
 )
@@ -32,14 +31,9 @@ const (
 	// config file. When both are set the variable wins.
 	databaseDSNEnv = "TETHER_DATABASE_DSN"
 
-	// openTimeout bounds opening the PostgreSQL pool, which includes the
-	// first connection and the schema step. A DSN's own connect_timeout can
-	// make the connection part shorter.
+	// openTimeout bounds opening the PostgreSQL pool and the first
+	// connection. A DSN's own connect_timeout can make it shorter.
 	openTimeout = 30 * time.Second
-
-	// keysmithMigrationLock is the advisory lock that lets one node at a
-	// time run keysmith's migration. It is the bytes of "tetherks".
-	keysmithMigrationLock int64 = 0x7465746865726b73
 )
 
 // databaseConfig picks where tenants, devices, keys and roles live.
@@ -214,70 +208,7 @@ func openPostgres(dsn string) (*grove.DB, error) {
 		return nil, fmt.Errorf("tether: connect to postgres %s: %w", describeDSN(dsn), err)
 	}
 
-	if err := migrateKeysmith(ctx, db); err != nil {
-		_ = db.Close()
-
-		return nil, err
-	}
-
 	return db, nil
-}
-
-// migrateKeysmith creates keysmith's schema under an advisory lock, before
-// the app starts. The keysmith extension's own migration is switched off on
-// PostgreSQL (see newApp), so this is the only one.
-//
-// Tether's and warden's migrations go through grove's orchestrator, which
-// takes its own lock, so nodes starting at once queue up. Keysmith's
-// Store.Migrate is a list of plain statements with no lock, and it creates
-// keysmith_usage_agg and drops it again on every run. Two nodes starting
-// together can both try to create that table and one fails with a duplicate
-// key on pg_type. That is not only a first-start problem: it happens on any
-// start that overlaps another.
-func migrateKeysmith(ctx context.Context, db *grove.DB) (err error) {
-	pg := pgdriver.Unwrap(db)
-
-	conn, err := pg.AcquireConn(ctx)
-	if err != nil {
-		return fmt.Errorf("tether: migrate keysmith: %w", err)
-	}
-
-	defer conn.Release()
-
-	if _, err = conn.Exec(ctx, "SELECT pg_advisory_lock($1)", keysmithMigrationLock); err != nil {
-		return fmt.Errorf("tether: migrate keysmith: take the lock: %w", err)
-	}
-
-	// The lock belongs to the session, and Release only returns the session
-	// to the pool, so drop it here whatever happens. ctx may be the thing
-	// that failed, so the unlock gets its own. Only this lock is dropped:
-	// pg_advisory_unlock returns false when the session did not hold it,
-	// which means something else released it, and that is an error too. If
-	// the unlock fails, the pooled session may still hold the lock, so
-	// startup fails and the caller closes the pool.
-	defer func() {
-		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		var released bool
-
-		uerr := conn.QueryRow(uctx, "SELECT pg_advisory_unlock($1)", keysmithMigrationLock).Scan(&released)
-
-		switch {
-		case err != nil:
-			// The migration's own error is the one to report.
-		case uerr != nil:
-			err = fmt.Errorf("tether: migrate keysmith: release the lock: %w", uerr)
-		case !released:
-			err = errors.New("tether: migrate keysmith: release the lock: the session no longer held it")
-		}
-	}()
-
-	if err = kspostgres.New(pg).Migrate(ctx); err != nil {
-		return fmt.Errorf("tether: migrate keysmith: %w", err)
-	}
-
-	return nil
 }
 
 // describeDSN is the part of a connection string that is safe to show:
