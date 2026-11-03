@@ -46,3 +46,27 @@ func (a meteringTenants) Get(ctx context.Context, tenantID string) (metering.Ten
 
 	return metering.Tenant{ID: ref.ID, AppID: ref.AppID, ExternalID: ref.ExternalID}, nil
 }
+
+// ledgerChecker answers metering's entitlement checks from ledger.
+type ledgerChecker struct {
+	l *ledger.Ledger
+}
+
+var _ metering.Checker = ledgerChecker{}
+
+// Check asks ledger whether the tenant (its ExternalID in its AppID) is
+// entitled to feature. Ledger answers a soft-limit feature over its limit as
+// allowed. A store outage comes back as an error wrapping
+// ledger.ErrUnavailable, and a canceled or expired ctx as its own error.
+func (c ledgerChecker) Check(ctx context.Context, t metering.Tenant, feature string) (allowed bool, reason string, err error) {
+	res, err := c.l.Check(ledger.WithTenant(ctx, t.ExternalID, t.AppID), feature)
+	if err != nil {
+		return false, "", err
+	}
+
+	if res == nil {
+		return false, "", fmt.Errorf("ledger: no entitlement result for %s", feature)
+	}
+
+	return res.Allowed, res.Reason, nil
+}

@@ -121,13 +121,23 @@ func (m *Meter) Stop(ctx context.Context) error {
 // It returns the errors of every delta the sink did not take, joined. Those
 // deltas go out in a later window, with the growth since. A delta the sink
 // rejected (ErrRejected) is logged and dropped, and is not an error here.
+// While the source's StartedAt is zero (the broker is not started) it sends
+// nothing and the window is not counted.
 func (m *Meter) Flush(ctx context.Context) error {
 	m.flushMu.Lock()
 	defer m.flushMu.Unlock()
 
+	// Ruling R13: the broker has not started yet. A window now would key
+	// its sends with no start time and send the same usage again once
+	// StartedAt is set, so it sends nothing and the window does not count.
+	started := m.src.StartedAt()
+	if started.IsZero() {
+		return nil
+	}
+
 	m.window++
 
-	if started := m.src.StartedAt(); started.UnixNano() != m.started {
+	if started.UnixNano() != m.started {
 		// The broker restarted and its counters began again from zero.
 		m.started = started.UnixNano()
 		clear(m.accepted)

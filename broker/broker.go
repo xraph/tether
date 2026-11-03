@@ -46,6 +46,10 @@ type Deps struct {
 	// Metrics receives the node-wide counters. Nil reports nothing.
 	Metrics Metrics
 
+	// Entitlement decides at CONNECT whether the tenant's plan lets it in
+	// (entitle.go). Nil checks nothing.
+	Entitlement Entitlement
+
 	// Cluster makes the broker one node of a cell. Nil runs it alone,
 	// exactly as without clustering. With a cluster mochi's storage hook is
 	// never added and Config.DataDir is ignored.

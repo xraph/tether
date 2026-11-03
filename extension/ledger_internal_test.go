@@ -10,7 +10,10 @@ import (
 
 	"github.com/xraph/ledger"
 	"github.com/xraph/ledger/meter"
+	"github.com/xraph/ledger/plan"
 	"github.com/xraph/ledger/store/memory"
+	"github.com/xraph/ledger/subscription"
+	"github.com/xraph/ledger/types"
 
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/id"
@@ -265,4 +268,61 @@ func TestLedgerSinkMapsInvalidInputToRejected(t *testing.T) {
 	if !errors.Is(err, ledger.ErrStoreClosed) || errors.Is(err, metering.ErrRejected) {
 		t.Fatalf("got %v, want ErrStoreClosed and not ErrRejected", err)
 	}
+}
+
+// ledgerChecker asks ledger under the tenant's ExternalID and AppID, passes
+// a refusal's reason through, and reports a store outage as an error.
+func TestLedgerCheckerUsesExternalIDAndApp(t *testing.T) {
+	ctx := t.Context()
+	st := memory.New()
+	l := ledger.New(st, ledger.WithLifecycleInterval(0))
+
+	p := &plan.Plan{
+		Name: "tether", Slug: "tether", Currency: "usd", AppID: "app_1",
+		Features: []plan.Feature{{Key: "tether.access", Name: "Tether", Type: plan.FeatureBoolean, Limit: 1}},
+		Pricing:  &plan.Pricing{BaseAmount: types.USD(100), BillingPeriod: plan.PeriodMonthly},
+	}
+	if err := l.CreatePlan(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.ActivatePlan(ctx, p.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.CreateSubscription(ctx, &subscription.Subscription{TenantID: "ext-acme", AppID: "app_1", PlanID: p.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := ledgerChecker{l: l}
+
+	ok, reason, err := c.Check(ctx, metering.Tenant{ID: "ttnt_a", AppID: "app_1", ExternalID: "ext-acme"}, "tether.access")
+	if err != nil || !ok {
+		t.Fatalf("subscribed tenant: allowed %v, reason %q, err %v", ok, reason, err)
+	}
+
+	// Subscribed under its Tether ID only: ledger does not know it.
+	ok, reason, err = c.Check(ctx, metering.Tenant{ID: "ext-acme", AppID: "app_1", ExternalID: "ext-zeta"}, "tether.access")
+	if err != nil || ok || reason == "" {
+		t.Fatalf("unsubscribed tenant: allowed %v, reason %q, err %v; want a refusal with a reason", ok, reason, err)
+	}
+
+	down := errors.New("connection refused")
+	out := ledgerChecker{l: ledger.New(&outageStore{Store: memory.New(), err: down}, ledger.WithLifecycleInterval(0))}
+
+	_, _, err = out.Check(ctx, metering.Tenant{ID: "ttnt_a", AppID: "app_1", ExternalID: "ext-acme"}, "tether.access")
+	if !errors.Is(err, ledger.ErrUnavailable) {
+		t.Fatalf("store outage: got %v, want ErrUnavailable", err)
+	}
+}
+
+// outageStore fails the subscription lookup, the way a dropped connection
+// does.
+type outageStore struct {
+	*memory.Store
+	err error
+}
+
+func (o *outageStore) GetActiveSubscription(context.Context, string, string) (*subscription.Subscription, error) {
+	return nil, o.err
 }

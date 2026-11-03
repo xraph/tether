@@ -80,8 +80,9 @@ func (h *hook) Provides(b byte) bool {
 }
 
 // OnConnectAuthenticate authenticates the client, loads and compiles its
-// grants, checks its will against them and takes a connection slot. On any
-// failure it records the CONNACK reason for OnPacketEncode and returns false.
+// grants, checks its will against them, asks Deps.Entitlement whether the
+// tenant may connect and takes a connection slot. On any failure it records
+// the CONNACK reason for OnPacketEncode and returns false.
 //
 // A key, role or tenant change announced while this runs (Broker.changes
 // moved) may have been handled before this connection's state was in the
@@ -116,6 +117,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 	tenantID := ident.Tenant.ID.String()
 	log = log.With(slog.String("tenant", tenantID))
 
+	if !h.entitled(ctx, cl, tenantID, log) {
+		return false
+	}
+
 	if !h.sessionRoom(tenantID, cl.ID, ident.Tenant.Limits.MaxSessions) {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant session limit reached", nil)
 	}
@@ -141,7 +146,10 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		return h.refuse(cl, log, packets.ErrServerUnavailable, "session is being deleted", nil)
 	}
 
-	if h.b.changes.Load() != gen && !h.reauthorize(ctx, cl, pk, st, log) {
+	// DisconnectTenant moves changes too, so a CONNECT that passed the
+	// entitlement check before the tenant lost it asks again here (from
+	// memory) instead of slipping past the disconnect.
+	if h.b.changes.Load() != gen && (!h.reauthorize(ctx, cl, pk, st, log) || !h.entitled(ctx, cl, tenantID, log)) {
 		h.b.state.remove(cl)
 		st.returnSlot(from)
 
@@ -413,8 +421,15 @@ func (h *hook) take(tenantID string, maxConns, remote int) bool {
 }
 
 func (h *hook) refuse(cl *mqtt.Client, log *slog.Logger, code packets.Code, msg string, err error) bool {
+	return h.refuseAs(cl, log, code, authReason(code), msg, err)
+}
+
+// refuseAs is refuse with an AuthFailure reason other than the code's own,
+// for a refusal that shares its code with another (0x97 for a tenant that is
+// not entitled and for one at its connection limit).
+func (h *hook) refuseAs(cl *mqtt.Client, log *slog.Logger, code packets.Code, reason, msg string, err error) bool {
 	h.b.state.refuse(cl, code)
-	h.b.deps.Metrics.AuthFailure(authReason(code))
+	h.b.deps.Metrics.AuthFailure(reason)
 	log.Info("tether: connection refused", slog.String("reason", msg), slog.Int("code", int(code.Code)), slog.Any("error", err))
 
 	return false

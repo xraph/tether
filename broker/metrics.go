@@ -62,13 +62,15 @@ type ClusterMetrics interface {
 }
 
 // Reasons AuthFailure reports, one per CONNACK reason the broker refuses
-// with.
+// with, and AuthReasonNotEntitled for a tenant Deps.Entitlement refused
+// (0x97, like AuthReasonConnectionLimit).
 const (
 	AuthReasonBadCredentials  = "bad_credentials"
 	AuthReasonNotAuthorized   = "not_authorized"
 	AuthReasonUnavailable     = "unavailable"
 	AuthReasonRateLimited     = "rate_limited"
 	AuthReasonConnectionLimit = "connection_limit"
+	AuthReasonNotEntitled     = "not_entitled"
 	AuthReasonInvalidWill     = "invalid_will"
 	AuthReasonOther           = "other"
 )

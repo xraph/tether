@@ -629,3 +629,39 @@ func TestStartDisabledDoesNothing(t *testing.T) {
 		t.Fatal("a disabled Meter sent usage")
 	}
 }
+
+// R13: before the broker has started (StartedAt zero) a window sends nothing
+// and advances nothing, so a window racing the start cannot count the same
+// usage under two start times.
+func TestFlushBeforeSourceStartsSendsNothing(t *testing.T) {
+	r := newRig(t, onlyMessagesIn(), acme)
+	r.src.restart(time.Time{}, broker.TenantUsage{Tenant: acme.ID, MessagesIn: 5})
+
+	flush(t, r.meter)
+	flush(t, r.meter)
+
+	if got := r.sink.accepted(); len(got) != 0 {
+		t.Fatalf("sent %+v before the source started", got)
+	}
+
+	r.tenants.mu.Lock()
+	gets := r.tenants.gets[acme.ID]
+	r.tenants.mu.Unlock()
+
+	if gets != 0 {
+		t.Fatalf("%d tenant lookups before the source started, want none", gets)
+	}
+
+	r.src.restart(t0, broker.TenantUsage{Tenant: acme.ID, MessagesIn: 5})
+	flush(t, r.meter)
+
+	got := r.sink.accepted()
+	if len(got) != 1 || got[0].Qty != 5 {
+		t.Fatalf("got %+v, want 5 once", got)
+	}
+
+	// The skipped windows did not count: this is window 1.
+	if want := fmt.Sprintf("tether:node-a:%d:1:ttnt_acme:tether.messages.in", t0.UnixNano()); got[0].Key != want {
+		t.Fatalf("key %q, want %q", got[0].Key, want)
+	}
+}

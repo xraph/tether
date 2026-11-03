@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -257,6 +258,72 @@ func (b *Broker) applyTenant(snap *tenant.Tenant, async bool) {
 			disconnect(srv, b.log, st.cl, st.nsID(), packets.ErrAdministrativeAction)
 		}
 	}
+}
+
+// LiveTenants returns, sorted, the tenants with at least one open network
+// connection on this node. Mochi's inline client is not one. Each node
+// answers for itself: in a cell, every node runs its own entitlement loop
+// over its own tenants. Before Start and after Stop it returns nil.
+func (b *Broker) LiveTenants() []string {
+	if b.running() == nil {
+		return nil
+	}
+
+	live := b.state.liveTenants()
+	out := make([]string, 0, len(live))
+
+	for tenantID := range live {
+		out = append(out, tenantID)
+	}
+
+	slices.Sort(out)
+
+	return out
+}
+
+// DisconnectTenant disconnects every open connection of tenantID on this node
+// with code (a 5.0 client gets a DISCONNECT with it first) and returns how
+// many it disconnected. The disconnects run in parallel and each one is
+// bounded by disconnectWait, as for a disabled tenant, so it returns within
+// about a second however the clients behave. It sends nothing to the rest of
+// the cell: the entitlement loop that calls it runs on every node.
+//
+// It moves Broker.changes first, so a CONNECT of the tenant that is past its
+// entitlement check but not yet in the registry asks again and is refused.
+//
+// Before Start, after Stop and for a malformed tenant ID it does nothing and
+// returns 0.
+func (b *Broker) DisconnectTenant(tenantID string, code packets.Code) int {
+	if !validTenant(tenantID) {
+		return 0
+	}
+
+	b.changes.Add(1)
+
+	srv := b.running()
+	if srv == nil {
+		return 0
+	}
+
+	var wg sync.WaitGroup
+
+	n := 0
+
+	for _, st := range b.state.match(func(st *clientState) bool { return st.tenantID == tenantID }) {
+		if st.cl.Closed() {
+			continue
+		}
+
+		b.log.Info("tether: disconnecting tenant", slog.String("client", st.nsID()), slog.String("tenant", tenantID),
+			slog.Int("code", int(code.Code)))
+		wg.Go(func() { disconnect(srv, b.log, st.cl, st.nsID(), code) })
+
+		n++
+	}
+
+	wg.Wait()
+
+	return n
 }
 
 // offerTenant makes snap the connection's tenant snapshot unless the one it
