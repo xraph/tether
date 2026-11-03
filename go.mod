@@ -20,6 +20,7 @@ require (
 	github.com/xraph/grove/drivers/sqlitedriver v1.10.1
 	github.com/xraph/grove/extension v1.10.1
 	github.com/xraph/keysmith v1.9.0
+	github.com/xraph/ledger v1.9.0
 	github.com/xraph/vessel v1.0.5
 	github.com/xraph/warden v1.8.1
 	go.jetify.com/typeid/v2 v2.0.0-alpha.3
@@ -69,7 +70,7 @@ require (
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/gobwas/ws v1.4.0 // indirect
-	github.com/gofrs/uuid/v5 v5.3.2 // indirect
+	github.com/gofrs/uuid/v5 v5.5.1 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/glog v1.2.5 // indirect
 	github.com/golang/groupcache v0.0.0-20200121045136-8c9f03a8e57e // indirect

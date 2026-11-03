@@ -1,0 +1,49 @@
+# tether/metering
+
+Import: github.com/xraph/tether/metering
+
+Sends each tenant's broker usage to a billing sink every interval (ledger, in the extension). Imports `broker` (for `TenantUsage`) and the standard library only. It does not import ledger, and `broker` does not import it. The ledger adapter, `extension/ledger.go`, is not wired into the extension's Start and Stop yet.
+
+## Types
+
+- `Tenant{ID, AppID, ExternalID string}`: the Tether ID and the host application's pair. Ledger's tenant is `ExternalID` and its app is `AppID`.
+- `Tenants`: `Get(ctx, tenantID string) (Tenant, error)`. The extension adapts `service.Tenants.Get` behind a 30 s cache (`tenantCache`, evicted with `service.Tenants` on `tenant.updated`).
+- `Source`: `Usage() []broker.TenantUsage` and `StartedAt() time.Time`. `*broker.Broker` satisfies it.
+- `Sink`: `Meter(ctx, t Tenant, feature string, quantity int64, key string) error`. The key counts the delta once. An error wrapping `ErrRejected` means the value can never be accepted; any other error is temporary.
+- `ErrRejected`: what a Sink wraps for a value it will never take (ledger's `ErrInvalidInput` becomes this in the adapter).
+
+## Config
+
+`Config{Enabled bool; Interval time.Duration; Features Features}`, yaml `enabled`, `interval`, `features`. `Features{MessagesIn, MessagesOut, BytesIn, BytesOut, ConnectionMinutes string}`, yaml `messages_in`, `messages_out`, `bytes_in`, `bytes_out`, `connection_minutes`.
+
+`DefaultConfig()`: not enabled, interval 60 s, features `tether.messages.in`, `tether.messages.out`, `tether.bytes.in`, `tether.bytes.out`, `tether.connection.minutes`. An empty feature key turns that meter off.
+
+`Validate()` refuses a feature key longer than 64 bytes or with a byte outside `[-_.a-zA-Z0-9]`, two meters sharing one key (the sink counts a key once, so one of them would vanish), and a non-positive interval when Enabled.
+
+## Meter
+
+`New(cfg, src, tenants, sink, nodeID, logger) *Meter`. nodeID is the cluster node ID, or `single` without a cluster. A nil logger is `slog.Default()`.
+
+- `Start()`: runs a window every `Interval`. Does nothing unless `Enabled`, or when already running.
+- `Stop(ctx) error`: ends the loop, then runs one last window bounded by ctx. Does nothing when never started or already stopped. Returns the last window's errors.
+- `Flush(ctx) error`: one window. Tests call it. Returns the sink and lookup errors of that window, joined.
+
+A window sends, per tenant and enabled feature, the broker's cumulative value minus the last value the sink accepted, when positive. Connection minutes use the cumulative whole minutes of `ConnectionTime`, so a remainder carries to the next window. A tenant with nothing to send is not looked up. Operator `Broker.Publish` counts nothing, so it is not billed.
+
+The key is `tether:<nodeID>:<StartedAt unix ns>:<window>:<tenantID>:<feature>`, window counting from 1 per Meter. The tenant is in it because ledger dedupes on the key alone across every tenant and app.
+
+## Failure handling
+
+- A sink error (ledger's buffer full, a stopped ledger, anything but `ErrRejected`) leaves that tenant and feature's last-accepted value where it was. The next window sends the sum of both windows' growth under its own key. Nothing is lost and nothing is sent twice.
+- A sink error wrapping `ErrRejected` is logged at Error and the delta is dropped: last-accepted advances, so it is not retried every window. Flush does not return it.
+- A tenant lookup error skips that tenant for the window (returned from Flush, retried next window). Other tenants are sent. A deleted tenant with usage still in the broker's counters logs a warning each window until the broker restarts.
+- If `StartedAt()` changes under a running Meter (the broker restarted), the counters began from zero again, so last-accepted is cleared and the new start time goes in the keys.
+
+## What is lost
+
+Usage a crash leaves unsent: at most one interval per node. A failed final window in Stop loses what it did not send. Once ledger's own buffer has taken an event, ledger retries it until the store accepts it or ledger stops.
+
+## Extension adapters (`extension/ledger.go`, `extension/tenantcache.go`)
+
+- `ledgerSink{l *ledger.Ledger}`: `Meter` calls `l.MeterWithKey(ledger.WithTenant(ctx, t.ExternalID, t.AppID), feature, quantity, key)` and maps `ledger.ErrInvalidInput` to `metering.ErrRejected` (both stay matchable).
+- `tenantCache`: unexported, 30 s, over `service.Tenants.Get`. `lookup(ctx, tenantID) (tenantRef{ID, AppID, ExternalID}, error)` and `evict(tenantID)`. Errors are never cached, and an eviction that lands during a lookup keeps that lookup's result out of the cache. Metering wraps it as `meteringTenants`; the audit package wraps the same instance.

@@ -12,4 +12,4 @@ The `auth` package has its own errors (`auth.ErrBadCredentials`, `ErrNotAuthoriz
 
 Store backends wrap these as `tether/<backend>: <op>: %w`.
 
-The REST layer is in `api/`. The broker is in `broker/`, per-tenant limits in `limits/`, and the keysmith and warden plugins that make live connections react to key and role changes in `events/` (see their llm.txt). The standalone server is `cmd/tether`. The Forge extension in `extension/` wires all of it into a Forge app.
+The REST layer is in `api/`. The broker is in `broker/`, per-tenant limits in `limits/`, and the keysmith and warden plugins that make live connections react to key and role changes in `events/` (see their llm.txt). Per-tenant usage goes to ledger from `metering/`. The standalone server is `cmd/tether`. The Forge extension in `extension/` wires all of it into a Forge app.
