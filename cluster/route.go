@@ -333,6 +333,31 @@ func (r *Router) Close() {
 	}
 }
 
+// NumSubscriptions is how many core NATS subscriptions the router holds for
+// its routes (two for a filter that ends in "#"). Unlike the connection's own
+// count it leaves out the subscriptions of the node's JetStream consumers,
+// which come and go as a consumer is made again.
+func (r *Router) NumSubscriptions() int {
+	r.mu.Lock()
+
+	all := make([]*route, 0, len(r.routes))
+	for _, e := range r.routes {
+		all = append(all, e)
+	}
+
+	r.mu.Unlock()
+
+	n := 0
+
+	for _, e := range all {
+		e.mu.Lock()
+		n += len(e.subs)
+		e.mu.Unlock()
+	}
+
+	return n
+}
+
 // Publish sends one QoS 0 message to the cell: one core NATS publish on
 // subject.QoS0(tenant, topic), with a Tether-Id header, props in headers and,
 // for a retained publish, Tether-Retain: 1 (receivers hand it to deliver, so

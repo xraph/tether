@@ -357,11 +357,11 @@ func TestRoutesReleased(t *testing.T) {
 	c := startClusterWith(t, 1, testConfig(), map[string]*auth.Identity{"u1": ident(t1, "u1")}, perms, nil)
 	b := c.nodes[0]
 	tid := t1.ID.String()
-	nc := b.cluster.Conn.NC()
+	nc := b.cluster.router
 
-	// The tenant's log reader and its retained watch hold NATS
-	// subscriptions of their own from the first connection on; count from
-	// there.
+	// Count the routes' NATS subscriptions only: the tenant's log reader
+	// and retained watch hold their own, and a consumer made again changes
+	// the connection's count for a moment.
 	require.NoError(t, b.ensureReader(tid))
 	b.cluster.ensureRetained(tid)
 	waitRetainedLoaded(t, b, tid)
@@ -474,7 +474,7 @@ func TestRoutesReleased(t *testing.T) {
 func TestRouteRefsExactlyOnce(t *testing.T) {
 	c := startCluster(t, 1)
 	n := c.nodes[0].cluster
-	nc := n.Conn.NC()
+	nc := n.router
 	base := nc.NumSubscriptions()
 	tid := c.t1.ID.String()
 
@@ -607,11 +607,9 @@ func TestSubscribedAfterPruneLeavesNoRoute(t *testing.T) {
 	cl, ok := b.server.Clients.Get(nsID)
 	require.True(t, ok)
 
-	// The connection started the tenant's retained watch, which holds a
-	// NATS subscription of its own; count from there.
 	waitRetainedLoaded(t, b, tid)
 
-	nc := b.cluster.Conn.NC()
+	nc := b.cluster.router
 	base := nc.NumSubscriptions()
 	filter := topic.Namespace(tid, "x/y")
 
