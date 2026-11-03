@@ -473,7 +473,13 @@ func TestDeadNodeWillDelay(t *testing.T) {
 
 		return rerr == nil && rec.Owner == "n2" && rec.Will != nil && !rec.DisconnectedAt.IsZero()
 	})
-	require.ElementsMatch(t, []string{namespacedID(c.t1.ID.String(), "x"), namespacedID(c.t1.ID.String(), "z")}, b.cluster.pendingWills())
+	// B writes a key it takes over before it arms the will's timer, and it
+	// sweeps x and z one after the other, so z's record can show before
+	// either timer is in.
+	held := []string{namespacedID(c.t1.ID.String(), "x"), namespacedID(c.t1.ID.String(), "z")}
+
+	eventually(t, "B holds both wills", func() bool { return len(b.cluster.pendingWills()) == len(held) })
+	require.ElementsMatch(t, held, b.cluster.pendingWills())
 
 	// z comes back, on B, before its delay ends: session present, no will.
 	zb, ca, err := connect5(t, c.addr(1), "z", "u1", false)
