@@ -494,7 +494,7 @@ func (r *controlRun) halt() {
 }
 
 // loop reads events until the run is halted, which returns nil, or the
-// iterator fails, which returns the error (see Log.pump), then deletes the
+// iterator fails, which returns the error (see pumpMsgs), then deletes the
 // consumer.
 func (r *controlRun) loop() error {
 	defer r.cleanup(context.Background())

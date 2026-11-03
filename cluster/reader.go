@@ -49,6 +49,9 @@ type Reader struct {
 	doneOnce sync.Once
 	stall    *stallWatch
 	own      iterOwner
+	// exited is closed when the read loop has returned and the consumer is
+	// dropped, which can be after Done (tests wait on it).
+	exited chan struct{}
 
 	// fnMu is held while fn runs and while Position moves. Stop takes it to
 	// set stopped, which is how it knows fn is not running and will not run
@@ -123,7 +126,7 @@ func (l *Log) Reader(tenant string, fromSeq uint64, fn func(LogMessage) error) (
 
 	r := &Reader{
 		l: l, tenant: tenant, cons: cons, msgs: msgs, fn: fn,
-		stop: make(chan struct{}), done: make(chan struct{}),
+		stop: make(chan struct{}), done: make(chan struct{}), exited: make(chan struct{}),
 		stall: newStallWatch(l.stallAfter),
 	}
 	r.pos.Store(start - 1)
@@ -175,10 +178,11 @@ func (r *Reader) Done() <-chan struct{} { return r.done }
 func (r *Reader) closeDone() { r.doneOnce.Do(func() { close(r.done) }) }
 
 func (r *Reader) run() {
+	defer close(r.exited)
 	defer r.l.dropConsumer(r.cons)
 	defer r.closeDone()
 
-	err := r.l.pump(r.msgs, &r.own, r.stop, r.handle)
+	err := pumpMsgs(r.msgs, &r.own, r.stop, r.handle)
 	if err == nil {
 		return
 	}
@@ -331,24 +335,28 @@ func (l *Log) maxResets() int {
 	return consumerResetAttempts
 }
 
-// pump hands every message of msgs to handle until stop is closed, which
-// returns nil, or the iterator fails, which returns the error. The ordered
-// consumer mends what it can inside Next (a missed heartbeat, a gap, a
-// reconnect) by recreating itself; an error that reaches pump means that
-// failed, and the iterator is finished: retrying Next would only report it
-// closed. The caller ends and makes a new consumer.
+// pumpMsgs hands every message of msgs to handle until stop is closed, which
+// returns nil, or the iterator fails, which returns the error. It is the loop
+// of every log reader, replay and control bus consumer. The ordered consumer
+// mends what it can inside Next (a missed heartbeat, a gap, a reconnect) by
+// recreating itself; an error that reaches pumpMsgs means that failed, and
+// the iterator is finished: retrying Next would only report it closed. The
+// caller ends and makes a new consumer.
 //
-// pump stops msgs itself, on the goroutine that reads it, once it has taken
-// it from own: nats.go's ordered iterator is not safe to Stop from another
-// goroutine while Next is recreating its consumer (the race detector catches
-// jetstream/ordered.go:331 against :370, and the pull iterator's heartbeat
-// timer), and a 1 s pull heartbeat makes such recreates common. A stopper
-// that finds the iterator taken only closes stop; Next then returns through
-// its context. If the stopper took it first, pump reads nothing.
-func (l *Log) pump(msgs jetstream.MessagesContext, own *iterOwner, stop <-chan struct{}, handle func(jetstream.Msg)) error {
-	return pumpMsgs(msgs, own, stop, handle)
-}
-
+// pumpMsgs stops msgs itself, on the goroutine that reads it, once it has
+// taken it from own: nats.go's ordered iterator is not safe to Stop from
+// another goroutine while Next is recreating its consumer (the race detector
+// catches jetstream/ordered.go:331 against :370, and the pull iterator's
+// heartbeat timer), and a short pull heartbeat makes such recreates common. A
+// stopper that finds the iterator taken only closes stop; Next then returns
+// through its context. If the stopper took it first, pumpMsgs reads nothing.
+//
+// The context does not reach a recreate in progress: nats.go's reset retries
+// with backoff until its MaxResetAttempts run out, and only Stop on the
+// iterator would cut that short (jetstream/ordered.go:589-597). So pumpMsgs
+// returns promptly after stop only with finite reset attempts
+// (consumerResetAttempts is 1); with nats.go's endless loop (-1) a consumer
+// that cannot be recreated keeps it running for good.
 func pumpMsgs(msgs jetstream.MessagesContext, own *iterOwner, stop <-chan struct{}, handle func(jetstream.Msg)) error {
 	if !own.takeForLoop() {
 		return nil

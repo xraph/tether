@@ -294,7 +294,7 @@ func (r *replayer) run() {
 
 	go r.stall.run(r.stop, ended, r.behind, r.stalled)
 
-	if err := r.l.pump(msgs, &r.own, r.stop, r.handle); err != nil {
+	if err := pumpMsgs(msgs, &r.own, r.stop, r.handle); err != nil {
 		// The consumer failed and will not mend itself (a closed connection,
 		// a recreate that did not work): the calls still waiting get the
 		// error and try again on a new consumer.

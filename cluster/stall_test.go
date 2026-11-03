@@ -312,18 +312,28 @@ func TestReaderEndsOnOfflineConsumerAndResumes(t *testing.T) {
 	t.Logf("all %d messages delivered %s after the kill", len(want), time.Since(killed).Round(time.Millisecond))
 }
 
-// The stall watch is the second line: with nats.go's endless reset loop put
-// back (resetAttempts -1), the same offline consumer stalls the reader
-// exactly as in the chaos run (nothing more delivered, Done open), until the
-// watch sees the log holding messages past the reader's position with nothing
-// delivered for stallAfter, and ends it.
+// The stall watch is the second line: with a reset loop far longer than one
+// attempt (nats.go's default is endless), the same offline consumer stalls
+// the reader exactly as in the chaos run (nothing more delivered, Done open),
+// until the watch sees the log holding messages past the reader's position
+// with nothing delivered for stallAfter, and ends it. The loop's attempts are
+// finite (resetAttempts) so its goroutine ends after the test's checks: only
+// the reader's own loop stops its iterator (pumpMsgs), and an endless reset
+// loop would keep retrying, consumer and all, for the rest of the binary.
 func TestStallWatchEndsReaderStuckInResetLoop(t *testing.T) {
-	const stallAfter = 3 * time.Second
+	const (
+		stallAfter = 3 * time.Second
+		// Five attempts, 1, 2, 4 and 8 s apart (nats.go's backoff): the
+		// loop gives up no sooner than 15 s after the first, which is well
+		// after the watch, and ends the goroutine before the test does.
+		resetAttempts = 5
+		resetsLast    = 15 * time.Second
+	)
 
 	lk := startLeaderKillCell(t)
 	node, app := NewLog(lk.node, lk.cfg), NewLog(lk.app, lk.cfg)
 	node.heartbeat = 500 * time.Millisecond
-	node.resetAttempts = -1
+	node.resetAttempts = resetAttempts
 	node.stallAfter = stallAfter
 
 	before := make([]uint64, 0, 10)
@@ -353,9 +363,9 @@ func TestStallWatchEndsReaderStuckInResetLoop(t *testing.T) {
 	select {
 	case <-r.Done():
 		// The watch needs stallAfter of silence after the last delivery,
-		// which came before the kill.
-		if quiet := time.Since(killed); quiet < stallAfter-time.Second {
-			t.Fatalf("the reader ended %s after the kill, before the stall bound; not the watch", quiet)
+		// which came before the kill; the reset loop gives up much later.
+		if quiet := time.Since(killed); quiet < stallAfter-time.Second || quiet >= resetsLast {
+			t.Fatalf("the reader ended %s after the kill, outside [%s, %s); not the watch", quiet, stallAfter-time.Second, resetsLast)
 		}
 	case <-time.After(stallAfter + 20*time.Second):
 		t.Fatalf("the stall watch did not end the reader; it delivered %d of %d", len(col.snapshot()), len(before)+len(after))
@@ -382,6 +392,14 @@ func TestStallWatchEndsReaderStuckInResetLoop(t *testing.T) {
 	want := append(slices.Clone(before), after...)
 	if got := seqs(col.waitFor(t, len(want))); !slices.Equal(got, want) {
 		t.Fatalf("delivered %v,\nwant %v", got, want)
+	}
+
+	// The stalled reader's loop runs on until its reset attempts are used up;
+	// nothing of it may outlive the test.
+	select {
+	case <-r.exited:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("the stalled reader's loop never ended")
 	}
 }
 
