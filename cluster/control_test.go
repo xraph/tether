@@ -445,3 +445,42 @@ func TestControlStopWaitsForRunningHandler(t *testing.T) {
 		t.Fatalf("handler ran %d times, want 1: nothing after Stop", n)
 	}
 }
+
+// Control.Start sends its stream lookup again while nobody answers it, as
+// while the control stream elects a leader. It used to send it once, and a
+// node on a loaded runner failed to start with "control bus: open stream:
+// context deadline exceeded" after waiting out the whole 10 s.
+func TestControlStartRetriesUnansweredRequests(t *testing.T) {
+	conns, cfg := startCellConns(t, 1)
+	c := conns[0]
+
+	flaky := &flakyJS{JetStream: c.js, readMisses: map[string]int{cfg.ControlStream(): 2}}
+	c.js = flaky
+
+	ctl := NewControl(c, cfg)
+	t.Cleanup(ctl.Stop)
+
+	got := make(chan struct{}, 1)
+
+	if err := ctl.Subscribe("probe", func([]byte) { got <- struct{}{} }); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ctl.Start(tctx(t, 10*time.Second)); err != nil {
+		t.Fatalf("Start through two unanswered stream lookups: %v", err)
+	}
+
+	if left := flaky.left(); left != 0 {
+		t.Fatalf("%d unanswered lookups left, so Start did not send them again", left)
+	}
+
+	if err := ctl.Publish(tctx(t, 5*time.Second), "probe", struct{}{}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the bus Start retried into delivers nothing")
+	}
+}

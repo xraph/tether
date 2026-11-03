@@ -548,6 +548,56 @@ func TestStartRetriesUnansweredFirstHeartbeat(t *testing.T) {
 	eventually(t, 5*time.Second, "the node to see itself", liveIs(m, "n1"))
 }
 
+// Every JetStream request of Members.Start goes again while nobody answers
+// it: opening the bucket, the first heartbeat and the watch. On a loaded
+// runner the watch's consumer create went unanswered for its whole 5 s and
+// Start failed with "watch members: context deadline exceeded". An error
+// that is not a lack of an answer (here a refused open) fails Start at once.
+func TestStartRetriesUnansweredRequests(t *testing.T) {
+	cell := startMemberCell(t)
+	cfg := memberConfig("n1", cell.urls[0])
+
+	c, err := Connect(tctx(t, 20*time.Second), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(c.Close)
+
+	plain := c.js
+	flaky := &flakyJS{JetStream: plain, openMisses: map[string]int{cfg.MembersBucket(): 2}, putMisses: 2, watchMisses: 2}
+	c.js = flaky
+
+	m := NewMembers(c, cfg)
+	t.Cleanup(m.Stop)
+
+	if err := m.Start(tctx(t, 15*time.Second)); err != nil {
+		t.Fatalf("Start through unanswered opens, heartbeats and watches: %v", err)
+	}
+
+	if left := flaky.left(); left != 0 {
+		t.Fatalf("%d unanswered requests left, so Start did not send them again", left)
+	}
+
+	eventually(t, 5*time.Second, "the node to see itself", liveIs(m, "n1"))
+
+	refused := errors.New("permission denied")
+	c.js = &flakyJS{JetStream: plain, openErr: refused}
+
+	m2 := NewMembers(c, memberConfig("n2", cell.urls[0]))
+	t.Cleanup(m2.Stop)
+
+	began := time.Now()
+
+	if err := m2.Start(tctx(t, 15*time.Second)); !errors.Is(err, refused) {
+		t.Fatalf("Start with a refused open: want the refusal, got %v", err)
+	}
+
+	if took := time.Since(began); took > retryGap {
+		t.Fatalf("a refused open took %s to fail, so it was retried", took)
+	}
+}
+
 func TestFenceOnClosedConnection(t *testing.T) {
 	cell := startMemberCell(t)
 	a := cell.nodeOn(t, "n1", 0)

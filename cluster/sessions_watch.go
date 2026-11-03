@@ -29,7 +29,9 @@ import (
 // call at a time, and must not block for long. The watch ends when ctx ends or
 // stop is called. stop is safe to call more than once and from fn; it does not
 // wait for a running fn, though fn is not called for events that arrive after
-// stop returns.
+// stop returns. Opening the bucket and creating the watch are sent again
+// while nobody answers them, until ctx ends (retryUnanswered); a missing
+// bucket fails at once.
 //
 // A watch that ends by itself (its subscription closed under it) is logged at
 // Error and started again, with backoff while NATS refuses, and its fresh first
@@ -42,7 +44,18 @@ func (s *Sessions) WatchOwned(ctx context.Context, nodeID string, fn func(tenant
 		return nil, fmt.Errorf("cluster: watch sessions: needs a node id and a callback: %w", tether.ErrInvalidInput)
 	}
 
-	h, err := s.handles(ctx)
+	// Opening the bucket and creating the watch's consumer are sent again
+	// while nobody answers them (retryUnanswered), so a node started while
+	// the bucket elects a leader starts once it has one.
+	var h *sessionHandles
+
+	err = retryUnanswered(ctx, func(actx context.Context) error {
+		var herr error
+
+		h, herr = s.handles(actx)
+
+		return herr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +84,16 @@ func (s *Sessions) WatchOwned(ctx context.Context, nodeID string, fn func(tenant
 		s.unregister(w)
 	}
 
-	kw, err := h.kv.WatchAll(wctx)
+	// The watch lives on wctx, so the attempt's context is not its own.
+	var kw jetstream.KeyWatcher
+
+	err = retryUnanswered(ctx, func(context.Context) error {
+		var werr error
+
+		kw, werr = h.kv.WatchAll(wctx)
+
+		return werr
+	})
 	if err != nil {
 		stop()
 

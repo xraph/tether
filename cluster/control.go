@@ -213,6 +213,7 @@ func (c *Control) wrapErr(op string, err error) error {
 // nothing for a while although the stream holds more) the bus logs it at
 // Error and starts a new consumer from the event after the last one handled,
 // retrying with backoff until Stop, so no event is skipped.
+// Making the first consumer is retried while nobody answers (retryUnanswered).
 // ctx bounds the start only (10 s when it has no deadline). Once only: a
 // second call is an error, unless the first one failed. After Stop it fails
 // with an error wrapping ErrUnavailable.
@@ -236,7 +237,17 @@ func (c *Control) Start(ctx context.Context) error {
 	ctx, cancel := opContext(ctx)
 	defer cancel()
 
-	r, err := c.open(ctx, 0)
+	// The stream lookup and the consumer's create are sent again while
+	// nobody answers them, as while the control stream elects a leader.
+	var r *controlRun
+
+	err := retryUnanswered(ctx, func(actx context.Context) error {
+		var oerr error
+
+		r, oerr = c.open(actx, 0)
+
+		return oerr
+	})
 	if err != nil {
 		c.mu.Lock()
 		c.started = false

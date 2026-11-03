@@ -12,11 +12,11 @@ import (
 	"github.com/xraph/tether/cluster/clustertest"
 )
 
-// flakyJS is a JetStream whose stream reads and KV puts go unanswered a set
-// number of times before they reach NATS, the way they do while a stream's
-// leader is being elected (a member that cannot lead drops the request) or
-// before its interest has reached the server the client is on (no
-// responders). Everything else goes straight through.
+// flakyJS is a JetStream whose stream reads, bucket opens, KV puts and KV
+// watches go unanswered a set number of times before they reach NATS, the
+// way they do while a stream's leader is being elected (a member that cannot
+// lead drops the request) or before its interest has reached the server the
+// client is on (no responders). Everything else goes straight through.
 type flakyJS struct {
 	jetstream.JetStream
 
@@ -25,10 +25,34 @@ type flakyJS struct {
 	readMisses map[string]int
 	// readErr, when set, is what every Stream call returns instead.
 	readErr error
+	// openMisses is how many more KeyValue calls for a bucket go unanswered;
+	// openErr, when set, is what every KeyValue call returns instead.
+	openMisses map[string]int
+	openErr    error
 	// putMisses is how many more KV puts get no responders; puts counts the
 	// puts made.
 	putMisses int
 	puts      int
+	// watchMisses is how many more KV watches go unanswered.
+	watchMisses int
+}
+
+// left is how many unanswered calls of every kind are still to come.
+func (f *flakyJS) left() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	n := f.putMisses + f.watchMisses
+
+	for _, m := range f.readMisses {
+		n += m
+	}
+
+	for _, m := range f.openMisses {
+		n += m
+	}
+
+	return n
 }
 
 func (f *flakyJS) Stream(ctx context.Context, name string) (jetstream.Stream, error) {
@@ -50,6 +74,20 @@ func (f *flakyJS) Stream(ctx context.Context, name string) (jetstream.Stream, er
 }
 
 func (f *flakyJS) KeyValue(ctx context.Context, bucket string) (jetstream.KeyValue, error) {
+	f.mu.Lock()
+
+	err := f.openErr
+	if err == nil && f.openMisses[bucket] > 0 {
+		f.openMisses[bucket]--
+		err = context.DeadlineExceeded
+	}
+
+	f.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+
 	kv, err := f.JetStream.KeyValue(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -89,6 +127,23 @@ func (k *flakyKV) Put(ctx context.Context, key string, value []byte) (uint64, er
 	}
 
 	return k.KeyValue.Put(ctx, key, value)
+}
+
+func (k *flakyKV) WatchAll(ctx context.Context, opts ...jetstream.WatchOpt) (jetstream.KeyWatcher, error) {
+	k.f.mu.Lock()
+
+	miss := k.f.watchMisses > 0
+	if miss {
+		k.f.watchMisses--
+	}
+
+	k.f.mu.Unlock()
+
+	if miss {
+		return nil, context.DeadlineExceeded
+	}
+
+	return k.KeyValue.WatchAll(ctx, opts...)
 }
 
 // A node with automatic replicas that counts fewer servers than the cell has

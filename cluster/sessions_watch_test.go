@@ -350,3 +350,28 @@ func TestOwnedWatchResyncDropsUnseen(t *testing.T) {
 		t.Fatal("resync still set")
 	}
 }
+
+// WatchOwned opens the bucket and creates its watch again while nobody
+// answers them. The broker starts it in Start, and a node on a loaded runner
+// failed to start with "watch owned sessions: ... context deadline
+// exceeded" when the one consumer create went unanswered.
+func TestWatchOwnedRetriesUnansweredRequests(t *testing.T) {
+	conns, cfg := startCellConns(t, 1)
+	c := conns[0]
+
+	flaky := &flakyJS{JetStream: c.js, openMisses: map[string]int{cfg.SessionsBucket(): 1}, watchMisses: 2}
+	c.js = flaky
+
+	s := NewSessions(c, cfg)
+
+	stop, err := s.WatchOwned(tctx(t, 10*time.Second), "n1", func(string, string, *SessionRecord, bool) {})
+	if err != nil {
+		t.Fatalf("WatchOwned through an unanswered open and two unanswered watches: %v", err)
+	}
+
+	t.Cleanup(stop)
+
+	if left := flaky.left(); left != 0 {
+		t.Fatalf("%d unanswered requests left, so WatchOwned did not send them again", left)
+	}
+}

@@ -171,7 +171,8 @@ func (m *Members) OnPeerDead(fn func(nodeID string)) {
 // Start writes the first heartbeat, reads the members that exist, and starts
 // the heartbeat, watch and monitor goroutines. It returns once the first
 // heartbeat is acknowledged and the watch has delivered the current members.
-// A first heartbeat that nobody answers is sent again until ctx ends.
+// Opening the bucket, the first heartbeat and the watch are each sent again
+// while nobody answers them, until ctx ends.
 // ctx bounds Start only (10 s when it has no deadline); the goroutines run
 // until Stop. Start can be called once.
 func (m *Members) Start(ctx context.Context) error {
@@ -212,7 +213,20 @@ func (m *Members) start(ctx context.Context) error {
 	stopAfter := context.AfterFunc(m.ctx, cancelCtx)
 	defer stopAfter()
 
-	kv, err := m.c.js.KeyValue(ctx, m.bucket)
+	// Every JetStream request of the start is retried while nobody answers
+	// it (retryUnanswered): a bucket whose leader is being elected, or whose
+	// leader's interest has not reached this node's server yet (right after
+	// Provision made it), answers nothing for a moment, and that must not
+	// keep a node from starting. A missing bucket fails at once.
+	var kv jetstream.KeyValue
+
+	err := retryUnanswered(ctx, func(actx context.Context) error {
+		var kerr error
+
+		kv, kerr = m.c.js.KeyValue(actx, m.bucket)
+
+		return kerr
+	})
 	if err != nil {
 		return m.wrapErr("open members bucket", err)
 	}
@@ -223,15 +237,20 @@ func (m *Members) start(ctx context.Context) error {
 	m.startedAt = time.Now().UTC()
 	m.mu.Unlock()
 
-	// The first write is retried while nobody answers it: a bucket whose
-	// leader is being elected, or whose leader's interest has not reached
-	// this node's server yet (right after Provision made it), has no
-	// responders for a moment, and that must not keep a node from starting.
-	if rerr := retryPlacement(ctx, m.renew); rerr != nil {
+	if rerr := retryUnanswered(ctx, m.renew); rerr != nil {
 		return m.wrapErr("first heartbeat", rerr)
 	}
 
-	w, err := kv.WatchAll(m.ctx)
+	// The watch lives on m.ctx, so the attempt's context is not its own.
+	var w jetstream.KeyWatcher
+
+	err = retryUnanswered(ctx, func(context.Context) error {
+		var werr error
+
+		w, werr = kv.WatchAll(m.ctx)
+
+		return werr
+	})
 	if err != nil {
 		return m.wrapErr("watch members", err)
 	}
