@@ -504,10 +504,12 @@ func (e *Extension) resolveStore() (store.Store, error) {
 // mountRoutes mounts the admin API on a group with the admin middleware and
 // POST /v1/publish on a plain group, both under the base path.
 //
-// The middleware goes on with Use, not forge.WithGroupMiddleware: api
-// registers its routes on nested groups, and forge v1.12.10's Group copies
-// the parent's Use middleware but not its group-option middleware, so the
-// admin routes would be mounted open.
+// The middleware goes on with Use. api registers its routes on groups nested
+// in the admin group, and since forge v1.13.0 a nested group inherits its
+// parent's Use and WithGroupMiddleware chains alike. Before that it dropped
+// the WithGroupMiddleware one, which mounted nested routes open, so Use is
+// the form that was always safe. TestAdminMiddlewareGuardsAdminRoutesOnly
+// pins it either way.
 func (e *Extension) mountRoutes(s api.Services) error {
 	r := e.App().Router()
 

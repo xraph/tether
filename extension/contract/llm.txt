@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/extension/contract
 
-Tether's admin operations as a Forge dashboard contract contributor. The React plugin (`packages/plugin-tether` in forge-dashboard) is the consumer: it reads these shapes. Forge v1.12.10. The handlers call the same services as the REST API in `api/`, so validation and the broker-down rule are the same.
+Tether's admin operations as a Forge dashboard contract contributor. The React plugin (`packages/plugin-tether` in forge-dashboard) is the consumer: it reads these shapes. Forge v1.13.2. The handlers call the same services as the REST API in `api/`, so validation and the broker-down rule are the same.
 
 ## Wiring
 

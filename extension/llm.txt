@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/extension
 
-Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith and warden plugins (`events/`) that make live connections react to key and role changes. Forge v1.12.10, keysmith v1.8.0, warden v1.8.0.
+Tether as a Forge extension: the broker, the REST API (`api/`), and the keysmith and warden plugins (`events/`) that make live connections react to key and role changes. Forge v1.13.2, grove v1.10.1, keysmith v1.8.0, warden v1.8.1.
 
 ## Use
 
@@ -52,7 +52,7 @@ Options: `WithConfig`, `WithBrokerConfig(broker.Config)`, `WithStore(store.Store
 - Built, not started: `NewSessions`, `NewLog`, `NewRetained`, `NewMembers`, `NewControl`, passed as `broker.Cluster{Conn, Config, Sessions, Log, Retained, Members, Control}`. Router and Shared are left nil, so the broker makes them and closes them in its Stop (the broker's Router is always its own; `deliverRouted` is unexported). `events.EvictTenantsOnUpdate` with `service.Tenants.Evict` goes on the bus first, before `broker.New` subscribes the broker's handlers and the cluster reactor its own.
 - `cluster.no_discovery` (R17) and every other `cluster.Config` key pass straight through.
 
-Why `Use` and not `forge.WithGroupMiddleware`: api registers on groups nested in the admin group, and forge v1.12.10's `Group` copies a parent's `Use` middleware but not its `WithGroupMiddleware`. With the option the admin routes would mount open. `TestAdminMiddlewareGuardsAdminRoutesOnly` pins it.
+Why `Use`: api registers on groups nested in the admin group. Since forge v1.13.0 a nested group inherits its parent's `Use` and `WithGroupMiddleware` chains alike, but forge v1.12.10 and earlier dropped `WithGroupMiddleware`, which mounted the admin routes open. `Use` was always safe. `TestAdminMiddlewareGuardsAdminRoutesOnly` pins it.
 
 ## Dashboard contract
 
