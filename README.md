@@ -316,9 +316,9 @@ export TETHER_DATABASE_DSN='postgres://tether:secret@db.internal:5432/tether?ssl
 
 You can put `dsn:` under `server.database` instead, but the variable wins when both are set, and it keeps the password out of anything you commit. A `postgres://` URL and key=value pairs both work, and so do pool settings like `pool_max_conns` (the default is 20 connections). Tether never prints the DSN. When it can't connect it names the user, host and database, and leaves the password out.
 
-Create the database and a role that owns it first. Tether makes the tables itself, for Tether, keysmith and warden, before the node starts serving. Nodes can start at the same moment: they take turns on the schema, and whichever gets there second finds it already done. Nothing is copied over from an existing SQLite file, so a node you switch starts with an empty database.
+Create the database and a role that owns it first. Tether makes the tables itself, for Tether, keysmith and warden, before the node starts serving. Nodes can start at the same moment: they take turns on the schema, and whichever gets there second finds it already done. The turns are session advisory locks (grove's orchestrator uses the same kind), so connect straight to PostgreSQL or through a pooler in session mode. pgbouncer in transaction mode hands each statement to whatever server connection is free, and the lock and the work it guards can land on different sessions. Nothing is copied over from an existing SQLite file, so a node you switch starts with an empty database.
 
-With `driver: postgres` the `server.sqlite_path` key is ignored and no SQLite file is made. Setting a DSN while the driver is `sqlite` is an error, since silently running on a local file would split a cell's state across hosts. We test against PostgreSQL 16.
+With `driver: postgres` the `server.sqlite_path` key is ignored and no SQLite file is made. Setting a DSN while the driver is `sqlite` is an error, since silently running on a local file would split a cell's state across hosts. `driver: postgresql` works too. We've run the tests that need a server against PostgreSQL 16 and 17. CI doesn't run them: nothing there sets `TETHER_TEST_POSTGRES`, so they skip.
 
 ## Configuration
 
@@ -348,7 +348,7 @@ tether:
 | --- | --- | --- |
 | `server.http_address` | `:8080` | Admin API, device publish endpoint and dashboard contract |
 | `server.sqlite_path` | `./data/tether.db` | The SQLite file for tenants, devices, keys and roles. Used when the driver is `sqlite` |
-| `server.database.driver` | `sqlite` | `sqlite` or `postgres`. See [PostgreSQL for a cell across hosts](#postgresql-for-a-cell-across-hosts) |
+| `server.database.driver` | `sqlite` | `sqlite` or `postgres` (`postgresql` works too). See [PostgreSQL for a cell across hosts](#postgresql-for-a-cell-across-hosts) |
 | `server.database.dsn` | empty | The PostgreSQL connection string, needed with `postgres`. `TETHER_DATABASE_DSN` overrides it |
 | `tether.base_path` | `/tether` | Prefix for every REST route |
 | `tether.disable_routes` | `false` | Mounts no REST routes. The broker still runs |
