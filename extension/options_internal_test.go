@@ -7,7 +7,7 @@ import (
 )
 
 // A WithCluster literal with only the fields a cell needs passes Validate:
-// the zero mode, heartbeat, lease, log age and pull heartbeat take cluster's
+// the zero mode, heartbeat, lease, log age, pull heartbeat and load interval take cluster's
 // defaults (M7).
 func TestWithClusterDefaultsZeroFields(t *testing.T) {
 	e := New(WithCluster(cluster.Config{
@@ -21,7 +21,7 @@ func TestWithClusterDefaultsZeroFields(t *testing.T) {
 
 	def := cluster.DefaultConfig()
 	if cfg.Heartbeat != def.Heartbeat || cfg.Lease != def.Lease || cfg.LogMaxAge != def.LogMaxAge ||
-		cfg.PullHeartbeat != def.PullHeartbeat || cfg.Mode != cluster.ModeExternal {
+		cfg.PullHeartbeat != def.PullHeartbeat || cfg.LoadInterval != def.LoadInterval || cfg.Mode != cluster.ModeExternal {
 		t.Fatalf("got %+v", cfg)
 	}
 
