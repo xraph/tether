@@ -1,6 +1,7 @@
 package limits
 
 import (
+	"math"
 	"sync"
 	"testing"
 
@@ -131,4 +132,112 @@ func TestAllowMessageAlternatingSnapshotsStayBounded(t *testing.T) {
 		assert.GreaterOrEqual(t, allowed, 1)
 		assert.LessOrEqual(t, allowed, permissive.Burst+1, "alternating snapshots refilled the bucket")
 	}
+}
+
+func TestAcquireWithRemote(t *testing.T) {
+	l := New()
+
+	assert.True(t, l.AcquireConnectionWithRemote("a", 3, 2), "local 0 + remote 2 < 3")
+	assert.False(t, l.AcquireConnectionWithRemote("a", 3, 2), "local 1 + remote 2 = 3")
+	assert.True(t, l.AcquireConnectionWithRemote("a", 3, 1), "fewer remote connections leave room")
+
+	for range 50 {
+		assert.True(t, l.AcquireConnectionWithRemote("u", 0, 1000), "max 0 is unlimited whatever the remote count")
+	}
+
+	// A remote count over the max leaves no room, even with nothing local.
+	assert.False(t, l.AcquireConnectionWithRemote("b", 2, 5))
+
+	// The plain call is the same with remote 0, and the slot counts.
+	assert.True(t, l.AcquireConnection("c", 1))
+	assert.False(t, l.AcquireConnectionWithRemote("c", 1, 0))
+}
+
+func TestShareScalesRateAndBurst(t *testing.T) {
+	l := New()
+	l.SetShare("a", 0.25)
+
+	lim := tenant.Limits{MessagesPerSecond: 100, Burst: 100}
+	allowed := 0
+
+	for range 200 {
+		if l.AllowMessage("a", lim) {
+			allowed++
+		}
+	}
+
+	// ceil(100 x 0.25) = 25 in the burst, and a few tokens of refill (25/s)
+	// while the loop runs.
+	assert.GreaterOrEqual(t, allowed, 25)
+	assert.LessOrEqual(t, allowed, 28)
+
+	// The default burst scales too: rate 8, no burst, share 0.25 gives 2.
+	l.SetShare("b", 0.25)
+
+	got := 0
+
+	for range 20 {
+		if l.AllowMessage("b", tenant.Limits{MessagesPerSecond: 8}) {
+			got++
+		}
+	}
+
+	assert.GreaterOrEqual(t, got, 2)
+	assert.LessOrEqual(t, got, 3)
+
+	// A tiny share still allows one message.
+	l.SetShare("c", 0.0001)
+	assert.True(t, l.AllowMessage("c", tenant.Limits{MessagesPerSecond: 100, Burst: 100}))
+}
+
+// A changed share updates the bucket in place: a spent budget stays spent.
+func TestShareChangeKeepsTokens(t *testing.T) {
+	l := New()
+	lim := tenant.Limits{MessagesPerSecond: 0.01, Burst: 4}
+
+	for range 4 {
+		assert.True(t, l.AllowMessage("a", lim))
+	}
+
+	assert.False(t, l.AllowMessage("a", lim))
+
+	l.SetShare("a", 1)
+	l.SetShare("a", 0.5)
+	assert.False(t, l.AllowMessage("a", lim), "a new share is no fresh bucket")
+}
+
+func TestShareDefaultOne(t *testing.T) {
+	l := New()
+
+	assert.InDelta(t, 1.0, l.Share("never"), 0)
+
+	lim := tenant.Limits{MessagesPerSecond: 100, Burst: 10}
+	allowed := 0
+
+	for range 30 {
+		if l.AllowMessage("never", lim) {
+			allowed++
+		}
+	}
+
+	assert.GreaterOrEqual(t, allowed, 10, "a tenant without a share gets the whole burst")
+}
+
+func TestShareClamped(t *testing.T) {
+	l := New()
+
+	l.SetShare("a", 5)
+	assert.InDelta(t, 1.0, l.Share("a"), 0)
+
+	for _, bad := range []float64{0, -1, math.NaN(), math.Inf(-1)} {
+		l.SetShare("b", bad)
+		assert.Greater(t, l.Share("b"), 0.0, "share %v", bad)
+		assert.LessOrEqual(t, l.Share("b"), 1.0)
+	}
+
+	l.SetShare("c", math.Inf(1))
+	assert.InDelta(t, 1.0, l.Share("c"), 0)
+
+	l.SetShare("d", 0.4)
+	assert.InDelta(t, 0.4, l.Share("d"), 1e-9)
 }

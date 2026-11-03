@@ -350,9 +350,17 @@ func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) (from *clientSt
 }
 
 // acquire takes a fresh tenant connection slot and reports the connection
-// as opened.
+// as opened. In a cell the tenant's connections on the other nodes, from their
+// latest load reports, count against maxConns too (memory only: no NATS call).
+// Two nodes that both accept at the limit before either has reported can
+// overshoot it by those connections, until the next reports.
 func (h *hook) acquire(tenantID string, maxConns int) bool {
-	if !h.b.deps.Limits.AcquireConnection(tenantID, maxConns) {
+	remote := 0
+	if maxConns > 0 {
+		remote = h.b.RemoteConnections(tenantID)
+	}
+
+	if !h.b.deps.Limits.AcquireConnectionWithRemote(tenantID, maxConns, remote) {
 		return false
 	}
 

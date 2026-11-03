@@ -6,7 +6,10 @@ Per-tenant connection slots and message rates, keyed by tenant ID string. No moc
 
 - `New() *Limiter`.
 - `(*Limiter).AcquireConnection(tenantID string, max int) bool`: takes a slot. `max <= 0` is unlimited but still counted. Every true needs one `ReleaseConnection`.
+- `(*Limiter).AcquireConnectionWithRemote(tenantID string, max, remote int) bool`: refuses when `max > 0` and the local count plus `remote` (the tenant's connections on other nodes) is `max` or more. `AcquireConnection` is the same with remote 0. Only the local slot is counted.
 - `(*Limiter).ReleaseConnection(tenantID string)`: gives a slot back. Extra releases are ignored; the count never goes negative.
 - `(*Limiter).AllowMessage(tenantID string, l tenant.Limits) bool`: one token from the tenant's `golang.org/x/time/rate` bucket. `MessagesPerSecond <= 0` means no limit (the caller substitutes a broker default first if it has one). `Burst <= 0` becomes `ceil(MessagesPerSecond)`, at least 1. One bucket per tenant. When the rate or burst differs from what the bucket last saw, it is updated in place (`SetLimit`, `SetBurst`): tokens carry over, clamped to the new burst. Callers may alternate different snapshots of a tenant's limits (the broker passes each connection's CONNECT-time snapshot); the allowance stays bounded by the most permissive one and is never refilled by the switch.
+
+- `(*Limiter).SetShare(tenantID string, share float64)` and `Share(tenantID string) float64`: the fraction of the tenant's budget this node may spend, for a cell that splits it. `SetShare` clamps to (0, 1]: above 1 is 1; zero, negative or NaN is 0.001. `Share` is 1 for a tenant never given one (and after `SetShare(id, 1)`). `AllowMessage` then refills at `rate x share` with a burst of `max(1, ceil(burst x share))`, the burst being the tenant's (or its default) before scaling. The bucket picks up a changed share on the next call and is updated in place, so its tokens carry over. The broker's share loop is the only caller; a Limiter outside a cell never gets one.
 
 The rate is per tenant, shared by all its connections. Buckets are kept for every tenant seen and never evicted.

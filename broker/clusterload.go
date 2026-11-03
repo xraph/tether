@@ -24,6 +24,9 @@ const (
 	// the bucket has not removed its key yet.
 	loadStaleAfter = 3
 
+	// defaultShareInterval is shareInterval's value.
+	defaultShareInterval = 10 * time.Second
+
 	// loadWarnEvery is how often a failing load report is logged at Warn.
 	// The failures in between go to Debug.
 	loadWarnEvery = time.Minute
@@ -33,6 +36,11 @@ const (
 	loadWatchRetry    = 200 * time.Millisecond
 	loadWatchRetryMax = 5 * time.Second
 )
+
+// shareInterval is how often a node in a cell with a Cluster.Load recomputes
+// each tenant's share of its message rate (runShares). Tests may lower it
+// before Start.
+var shareInterval = defaultShareInterval
 
 // Rates are per-second rates of a tenant's or a node's traffic, from two
 // samples of its cumulative counters.
@@ -102,20 +110,11 @@ type loadView struct {
 	stale time.Duration
 }
 
-// livePeers returns the peers whose latest report is not stale at now. The
-// caller holds mu.
-func (v *loadView) livePeers(now time.Time) map[string]*peerLoad {
-	out := make(map[string]*peerLoad, len(v.peers))
-
-	for id, p := range v.peers {
-		if v.stale > 0 && now.Sub(p.seen) > v.stale {
-			continue
-		}
-
-		out[id] = p
-	}
-
-	return out
+// live reports whether p's latest report is not stale at now. The caller
+// holds mu. Callers walk v.peers and skip a peer that is not live; nothing is
+// allocated for it, since RemoteConnections runs on every CONNECT.
+func (v *loadView) live(p *peerLoad, now time.Time) bool {
+	return v.stale <= 0 || now.Sub(p.seen) <= v.stale
 }
 
 // selfNodeID is this node's ID in its cell, "" outside one.
@@ -158,6 +157,13 @@ func (b *Broker) startLoad(started time.Time) {
 
 	if b.reportsLoad() {
 		b.loadWG.Go(func() { b.watchLoad(ctx) })
+
+		every := shareInterval
+		if every <= 0 {
+			every = defaultShareInterval
+		}
+
+		b.loadWG.Go(func() { b.runShares(ctx, every) })
 	}
 }
 
@@ -327,7 +333,11 @@ func (b *Broker) CellUsage(tenantID string) TenantUsage {
 	b.load.mu.Lock()
 	defer b.load.mu.Unlock()
 
-	for _, p := range b.load.livePeers(now) {
+	for _, p := range b.load.peers {
+		if !b.load.live(p, now) {
+			continue
+		}
+
 		tl, ok := p.last.tenants[tenantID]
 		if !ok {
 			continue
@@ -346,17 +356,25 @@ func (b *Broker) CellUsage(tenantID string) TenantUsage {
 
 // RemoteConnections returns how many network connections tenantID holds on
 // the other nodes of the cell, from their latest reports: 0 outside a cell,
-// in one without Cluster.Load, and before the reports arrive. It takes only
-// the view's lock.
+// in one without Cluster.Load, and before the reports arrive. It runs on every
+// CONNECT of a tenant with a connection limit: it takes only the view's lock
+// and allocates nothing.
 func (b *Broker) RemoteConnections(tenantID string) int {
+	if !b.reportsLoad() {
+		return 0
+	}
+
 	now := time.Now()
 
 	b.load.mu.Lock()
 	defer b.load.mu.Unlock()
 
 	n := 0
-	for _, p := range b.load.livePeers(now) {
-		n += p.last.tenants[tenantID].Connections
+
+	for _, p := range b.load.peers {
+		if b.load.live(p, now) {
+			n += p.last.tenants[tenantID].Connections
+		}
 	}
 
 	return n
@@ -374,8 +392,10 @@ func (b *Broker) TenantRates(tenantID string) Rates {
 
 	r := pairRates(b.load.selfPrev, b.load.selfLast, tenantID)
 
-	for _, p := range b.load.livePeers(now) {
-		r.add(pairRates(p.prev, p.last, tenantID))
+	for _, p := range b.load.peers {
+		if b.load.live(p, now) {
+			r.add(pairRates(p.prev, p.last, tenantID))
+		}
 	}
 
 	return r
@@ -398,11 +418,14 @@ func (b *Broker) Nodes() []NodeUsage {
 	b.load.mu.Lock()
 
 	self.Rates = nodeRates(b.load.selfPrev, b.load.selfLast)
-	peers := b.load.livePeers(now)
-	out := make([]NodeUsage, 0, 1+len(peers))
+	out := make([]NodeUsage, 0, 1+len(b.load.peers))
 	out = append(out, self)
 
-	for id, p := range peers {
+	for id, p := range b.load.peers {
+		if !b.load.live(p, now) {
+			continue
+		}
+
 		n := NodeUsage{NodeID: id, StartedAt: p.last.startedAt, At: p.last.at, Rates: nodeRates(p.prev, p.last)}
 
 		for _, tl := range p.last.tenants {
@@ -520,4 +543,97 @@ func perSec(from, to uint64, secs float64) float64 {
 	}
 
 	return float64(to-from) / secs
+}
+
+// runShares sets each tenant's share of its message rate every interval until
+// ctx ends. It runs only in a cell with a Cluster.Load, whose reports tell it
+// where the tenant's connections are.
+func (b *Broker) runShares(ctx context.Context, interval time.Duration) {
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	var held map[string]struct{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			held = b.updateShares(held)
+		}
+	}
+}
+
+// updateShares gives each tenant this node's share of its message budget: its
+// local connections over all its connections in the cell when it has local
+// ones, else one slice per live node (a publish over HTTP on a node without
+// the tenant's connections still gets a slice). The budget is not a lock-step
+// split: reports are an interval old, so the shares of all nodes may briefly
+// sum above 1. held holds the tenants that got a share under 1 last time, so
+// one that left every node goes back to the whole budget; it returns the new
+// set. No lock is held across the Limiter or Members calls.
+func (b *Broker) updateShares(held map[string]struct{}) map[string]struct{} {
+	now := time.Now()
+	local := make(map[string]int)
+
+	for _, u := range b.usageAt(now) {
+		local[u.Tenant] = u.Connections
+	}
+
+	remote := make(map[string]int)
+	peers := 0
+
+	b.load.mu.Lock()
+
+	for _, p := range b.load.peers {
+		if !b.load.live(p, now) {
+			continue
+		}
+
+		peers++
+
+		for id, tl := range p.last.tenants {
+			remote[id] += tl.Connections
+		}
+	}
+
+	b.load.mu.Unlock()
+
+	nodes := 1 + peers
+
+	if b.cluster != nil && b.cluster.Members != nil {
+		if live := b.cluster.Members.Live(); len(live) > 0 {
+			nodes = len(live)
+		}
+	}
+
+	tenants := make(map[string]struct{}, len(local)+len(remote)+len(held))
+
+	for _, m := range []map[string]int{local, remote} {
+		for id := range m {
+			tenants[id] = struct{}{}
+		}
+	}
+
+	for id := range held {
+		tenants[id] = struct{}{}
+	}
+
+	next := make(map[string]struct{})
+
+	for id := range tenants {
+		share := 1 / float64(nodes)
+
+		if l := local[id]; l > 0 {
+			share = float64(l) / float64(l+remote[id])
+		}
+
+		b.deps.Limits.SetShare(id, share)
+
+		if share < 1 {
+			next[id] = struct{}{}
+		}
+	}
+
+	return next
 }
