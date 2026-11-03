@@ -570,8 +570,9 @@ func (b *Broker) runShares(ctx context.Context, interval time.Duration) {
 // the tenant's connections still gets a slice). The budget is not a lock-step
 // split: reports are an interval old, so the shares of all nodes may briefly
 // sum above 1. held holds the tenants that got a share under 1 last time, so
-// one that left every node goes back to the whole budget; it returns the new
-// set. No lock is held across the Limiter or Members calls.
+// one that left every node is still recomputed: in a cell of more than one
+// node its share is 1/nodes and it stays in held, and only when this node is
+// alone does it go back to the whole budget (1). It returns the new set. No lock is held across the Limiter or Members calls.
 func (b *Broker) updateShares(held map[string]struct{}) map[string]struct{} {
 	now := time.Now()
 	local := make(map[string]int)

@@ -120,7 +120,7 @@ func (h *hook) OnConnectAuthenticate(cl *mqtt.Client, pk packets.Packet) bool {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant session limit reached", nil)
 	}
 
-	from, ok := h.acquireSlot(tenantID, cl.ID, ident.Tenant.Limits.MaxConnections)
+	from, ok := h.acquireSlot(ctx, tenantID, cl.ID, ident.Tenant.Limits.MaxConnections)
 	if !ok {
 		return h.refuse(cl, log, packets.ErrQuotaExceeded, "tenant connection limit reached", nil)
 	}
@@ -325,9 +325,16 @@ func (h *hook) sessionRoom(tenantID, rawID string, limit int) bool {
 // A slot taken here is reported as an opened connection; an inherited one is
 // not, since the connection it came from never reports its close.
 //
+// In a cell the owner may be another node (a device whose old connection
+// died silently there, reconnecting here). On the refusal path only, the
+// session record says so (remoteOwner), and the connection then takes a fresh
+// slot over the limit: the takeover disconnects the old connection on its
+// node, whose slot goes back there, and the overshoot lasts until that node's
+// next load report.
+//
 // from is the connection an inherited slot came from, so a CONNECT refused
 // after this can give it back (clientState.returnSlot); nil for a fresh slot.
-func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) (from *clientState, ok bool) {
+func (h *hook) acquireSlot(ctx context.Context, tenantID, rawID string, maxConns int) (from *clientState, ok bool) {
 	if h.acquire(tenantID, maxConns) {
 		return nil, true
 	}
@@ -338,6 +345,10 @@ func (h *hook) acquireSlot(tenantID, rawID string, maxConns int) (from *clientSt
 
 	prev := h.b.state.owner(namespacedID(tenantID, rawID))
 	if prev == nil {
+		if h.remoteOwner(ctx, tenantID, rawID) {
+			return nil, h.take(tenantID, 0, 0)
+		}
+
 		return nil, false
 	}
 
@@ -360,6 +371,37 @@ func (h *hook) acquire(tenantID string, maxConns int) bool {
 		remote = h.b.RemoteConnections(tenantID)
 	}
 
+	return h.take(tenantID, maxConns, remote)
+}
+
+// remoteOwnerTimeout bounds the session record read of remoteOwner.
+const remoteOwnerTimeout = 2 * time.Second
+
+// remoteOwner reports whether the session record of tenantID's client rawID
+// says another node runs it with a live connection: Owner is another node and
+// DisconnectedAt is zero, the same reading as ClientInfo.Connected. False
+// outside a cell, and when the read fails or times out. No broker lock is
+// held; it reads the cell's KV.
+func (h *hook) remoteOwner(ctx context.Context, tenantID, rawID string) bool {
+	n := h.b.cluster
+	if n == nil || n.Sessions == nil {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, remoteOwnerTimeout)
+	defer cancel()
+
+	rec, _, err := n.Sessions.Get(ctx, tenantID, rawID)
+	if err != nil {
+		return false
+	}
+
+	return rec.Owner != "" && rec.Owner != n.Config.NodeID && rec.DisconnectedAt.IsZero()
+}
+
+// take takes a slot against maxConns and remote and reports the connection as
+// opened.
+func (h *hook) take(tenantID string, maxConns, remote int) bool {
 	if !h.b.deps.Limits.AcquireConnectionWithRemote(tenantID, maxConns, remote) {
 		return false
 	}

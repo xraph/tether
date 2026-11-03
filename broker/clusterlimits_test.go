@@ -84,6 +84,52 @@ func TestCellConnectionLimit(t *testing.T) {
 	assert.Equal(t, byte(0x97), ca.ReasonCode)
 }
 
+// A device whose connection is still live on A (its TCP died silently) and
+// that reconnects to B at the cell's limit replaces its connection: the
+// session record says A runs it, so B takes a slot over the limit and the
+// session takeover disconnects the old one.
+func TestCellConnectionLimitCrossNodeTakeover(t *testing.T) {
+	c := startLimitCell(t, 2, loadTestInterval, tenant.Limits{MaxConnections: 3}, nil)
+	b := c.nodes[1]
+	t1 := c.t1.ID.String()
+
+	oldA1, _, err := connect5(t, c.addr(0), "a1", "u1", true)
+	require.NoError(t, err)
+
+	_, _, err = connect5(t, c.addr(0), "a2", "u1", true)
+	require.NoError(t, err)
+
+	_, _, err = connect5(t, c.addr(1), "b1", "u1", true)
+	require.NoError(t, err)
+
+	eventually(t, "B sees A's two connections", func() bool { return b.RemoteConnections(t1) == 2 })
+
+	_, ca, err := connect5(t, c.addr(1), "fresh", "u1", true)
+	require.Error(t, err, "a new client ID is over the cell's limit")
+	require.NotNil(t, ca)
+	assert.Equal(t, byte(0x97), ca.ReasonCode)
+
+	_, _, err = connect5(t, c.addr(1), "a1", "u1", true)
+	require.NoError(t, err, "a1 moving to B is a takeover, not a new connection")
+
+	select {
+	case d := <-oldA1.disconnects:
+		assert.Equal(t, byte(0x8E), d.ReasonCode, "the old a1 on A is taken over")
+	case <-time.After(waitTimeout):
+		t.Fatal("the old a1 on A was not disconnected")
+	}
+
+	// Once A's slot is back and has been reported, the cell is at three
+	// again and a fresh ID is refused.
+	eventually(t, "B sees A's one connection", func() bool { return b.RemoteConnections(t1) == 1 })
+	eventually(t, "B holds b1 and the moved a1", func() bool { return b.CellUsage(t1).Connections == 3 })
+
+	_, ca, err = connect5(t, c.addr(1), "fresh2", "u1", true)
+	require.Error(t, err)
+	require.NotNil(t, ca)
+	assert.Equal(t, byte(0x97), ca.ReasonCode)
+}
+
 // Each node's share of a tenant's rate follows where its connections are.
 func TestRateShareRebalances(t *testing.T) {
 	setShareInterval(t, 200*time.Millisecond)
