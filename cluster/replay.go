@@ -129,11 +129,20 @@ func (l *Log) join(tenant string, w *waiter) (r *replayer, created bool) {
 
 	r = &replayer{
 		l: l, tenant: tenant, start: w.from, pos: w.from - 1, waiters: []*waiter{w}, stop: make(chan struct{}),
-		stall: newStallWatch(l.stallAfter), began: time.Now(),
+		stall: newStallWatch(l.replayStallAfter()), began: time.Now(),
 	}
 	l.replayers[tenant] = append(l.replayers[tenant], r)
 
 	return r, true
+}
+
+// replayStallAfter is the stall watch bound of a replay consumer.
+func (l *Log) replayStallAfter() time.Duration {
+	if l.stallAfter > 0 {
+		return l.stallAfter
+	}
+
+	return defaultReplayStallAfter
 }
 
 // waiter is one Replay call.
@@ -228,6 +237,7 @@ type replayer struct {
 	waiters []*waiter
 	closed  bool
 	msgs    jetstream.MessagesContext
+	own     iterOwner
 
 	stall *stallWatch
 }
@@ -284,7 +294,7 @@ func (r *replayer) run() {
 
 	go r.stall.run(r.stop, ended, r.behind, r.stalled)
 
-	if err := r.l.pump(msgs, r.stop, r.handle); err != nil {
+	if err := r.l.pump(msgs, &r.own, r.stop, r.handle); err != nil {
 		// The consumer failed and will not mend itself (a closed connection,
 		// a recreate that did not work): the calls still waiting get the
 		// error and try again on a new consumer.
@@ -345,7 +355,9 @@ func (r *replayer) open() (jetstream.Consumer, jetstream.MessagesContext, error)
 
 	if closed {
 		// Every call gave up while the consumer was being made.
-		msgs.Stop()
+		if r.own.takeForStop() {
+			msgs.Stop()
+		}
 		r.l.dropConsumer(cons)
 
 		return nil, nil, errors.New("replay stopped")
@@ -504,7 +516,7 @@ func (r *replayer) shutdownIfIdle() {
 
 	r.l.rmu.Unlock()
 
-	stopMsgs(msgs)
+	r.stopMsgs(msgs)
 }
 
 // shutdown closes the consumer and ends every call still waiting on it with
@@ -514,7 +526,7 @@ func (r *replayer) shutdown(err error) {
 	ws, msgs := r.closeLocked()
 	r.l.rmu.Unlock()
 
-	stopMsgs(msgs)
+	r.stopMsgs(msgs)
 
 	for _, w := range ws {
 		w.end(err)
@@ -554,11 +566,12 @@ func (r *replayer) closeLocked() ([]*waiter, jetstream.MessagesContext) {
 	return ws, r.msgs
 }
 
-// stopMsgs stops the iterator in the background: while NATS is unreachable the
-// stop waits for the ordered consumer to finish an attempt to recreate itself,
-// and the caller may be a Replay whose context has ended.
-func stopMsgs(msgs jetstream.MessagesContext) {
-	if msgs != nil {
+// stopMsgs stops the iterator in the background, unless the consumer's loop
+// has it (pumpMsgs stops it then, once stop is closed): while NATS is
+// unreachable the stop waits for the ordered consumer to finish an attempt to
+// recreate itself, and the caller may be a Replay whose context has ended.
+func (r *replayer) stopMsgs(msgs jetstream.MessagesContext) {
+	if msgs != nil && r.own.takeForStop() {
 		go msgs.Stop()
 	}
 }

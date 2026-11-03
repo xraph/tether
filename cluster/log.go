@@ -91,8 +91,7 @@ type Log struct {
 	// consumers counts the server consumers this Log created, for tests.
 	consumers atomic.Int64
 	// heartbeat is the idle heartbeat of the pull requests of readers and
-	// replays, 0 for the nats.go default (5 s, so a dead server is noticed
-	// after about 10 s). Tests shorten it.
+	// replays, 0 for pullHeartbeat. Tests shorten it.
 	heartbeat time.Duration
 	// resetAttempts is the MaxResetAttempts of the ordered consumers of
 	// readers and replays, 0 for consumerResetAttempts. Tests set -1, nats.go's
@@ -100,7 +99,8 @@ type Log struct {
 	resetAttempts int
 	// stallAfter is how long a reader or replay consumer may deliver nothing
 	// while the log holds more for it before it is ended, 0 for
-	// defaultStallAfter. Tests shorten it.
+	// defaultStallAfter (readers) and defaultReplayStallAfter (replays).
+	// Tests set it.
 	stallAfter time.Duration
 
 	// onAppend is the OnAppend observer, nil for none.

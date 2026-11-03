@@ -18,9 +18,27 @@ const (
 	// failure to the owner, which starts a new consumer under a new name, and
 	// the meta layer places that one on a live server.
 	consumerResetAttempts = 1
+	// pullHeartbeat is the idle heartbeat of the pull requests of the log's
+	// readers and replays and of the control bus. A pull that never reaches
+	// its consumer (it got to the client's server before the new consumer's
+	// interest did, and the server answered it 503, which nats.go's iterator
+	// ignores, or it was lost on a route) gets no heartbeats either, and
+	// nats.go pulls again only after two are missed: then the ordered
+	// consumer recreates itself and pulls anew. Left to nats.go the heartbeat
+	// is half the 30 s pull expiry (its ordered default of 5 s is parsed and
+	// then dropped, jetstream/ordered.go:259 and :275), so such a consumer
+	// delivered nothing for 30 s. At 1 s it is about 2 s, for one heartbeat a
+	// second per idle consumer.
+	pullHeartbeat = time.Second
 	// defaultStallAfter is how long a consumer loop may go without a message
 	// while its stream holds more for it before the stall watch ends it.
 	defaultStallAfter = 30 * time.Second
+	// defaultReplayStallAfter is that for a replay consumer. The broker
+	// bounds a replay call at 10 s and tries again on a fresh consumer, so a
+	// watch longer than that never fired for it. A replay's watch asks no
+	// one (the calls waiting say what they still need), so a short one costs
+	// nothing; 5 s is more than two missed pull heartbeats and a recreate.
+	defaultReplayStallAfter = 5 * time.Second
 	// minStallCheck bounds how often a stall watch looks.
 	minStallCheck = 10 * time.Millisecond
 )
@@ -136,4 +154,13 @@ func jitter(d time.Duration) time.Duration {
 	}
 
 	return d - time.Duration(q) + time.Duration(rand.Int64N(2*q)) // #nosec G404 -- spreads checks, nothing secret
+}
+
+// pullHeartbeatOr is d, or pullHeartbeat when d is not positive.
+func pullHeartbeatOr(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+
+	return pullHeartbeat
 }

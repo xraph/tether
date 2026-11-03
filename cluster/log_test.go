@@ -53,7 +53,12 @@ func startLogs(t *testing.T, nodes int) []*Log {
 			nc.WaitInterest(t, cellSubjects(cfg)...)
 		}
 
-		out = append(out, NewLog(c, cfg))
+		l := NewLog(c, cfg)
+		// Well under the 30 s contexts these tests give a call, so a
+		// consumer that goes quiet shows as stalled, with its position.
+		l.stallAfter = 10 * time.Second
+
+		out = append(out, l)
 	}
 
 	return out

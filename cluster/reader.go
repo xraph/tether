@@ -48,6 +48,7 @@ type Reader struct {
 	once     sync.Once
 	doneOnce sync.Once
 	stall    *stallWatch
+	own      iterOwner
 
 	// fnMu is held while fn runs and while Position moves. Stop takes it to
 	// set stopped, which is how it knows fn is not running and will not run
@@ -157,7 +158,9 @@ func (r *Reader) Stop() {
 
 		close(r.stop)
 
-		go r.msgs.Stop()
+		if r.own.takeForStop() {
+			go r.msgs.Stop()
+		}
 	})
 }
 
@@ -175,7 +178,7 @@ func (r *Reader) run() {
 	defer r.l.dropConsumer(r.cons)
 	defer r.closeDone()
 
-	err := r.l.pump(r.msgs, r.stop, r.handle)
+	err := r.l.pump(r.msgs, &r.own, r.stop, r.handle)
 	if err == nil {
 		return
 	}
@@ -292,13 +295,9 @@ func (l *Log) consumer(ctx context.Context, tenant string, start uint64, inactiv
 	return cons, nil
 }
 
-// messages starts the iterator of cons.
+// messages starts the iterator of cons, with the Log's pull heartbeat.
 func (l *Log) messages(cons jetstream.Consumer) (jetstream.MessagesContext, error) {
-	if l.heartbeat > 0 {
-		return cons.Messages(jetstream.PullHeartbeat(l.heartbeat))
-	}
-
-	return cons.Messages()
+	return cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(l.heartbeat)))
 }
 
 // dropConsumer deletes cons on the server, best effort: the server would
@@ -337,9 +336,40 @@ func (l *Log) maxResets() int {
 // reconnect) by recreating itself; an error that reaches pump means that
 // failed, and the iterator is finished: retrying Next would only report it
 // closed. The caller ends and makes a new consumer.
-func (l *Log) pump(msgs jetstream.MessagesContext, stop <-chan struct{}, handle func(jetstream.Msg)) error {
+//
+// pump stops msgs itself, on the goroutine that reads it, once it has taken
+// it from own: nats.go's ordered iterator is not safe to Stop from another
+// goroutine while Next is recreating its consumer (the race detector catches
+// jetstream/ordered.go:331 against :370, and the pull iterator's heartbeat
+// timer), and a 1 s pull heartbeat makes such recreates common. A stopper
+// that finds the iterator taken only closes stop; Next then returns through
+// its context. If the stopper took it first, pump reads nothing.
+func (l *Log) pump(msgs jetstream.MessagesContext, own *iterOwner, stop <-chan struct{}, handle func(jetstream.Msg)) error {
+	return pumpMsgs(msgs, own, stop, handle)
+}
+
+func pumpMsgs(msgs jetstream.MessagesContext, own *iterOwner, stop <-chan struct{}, handle func(jetstream.Msg)) error {
+	if !own.takeForLoop() {
+		return nil
+	}
+
+	// Stopping can wait out a recreate attempt while NATS is unreachable, so
+	// it runs in the background, after the last Next.
+	defer func() { go msgs.Stop() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
 	for {
-		msg, err := msgs.Next()
+		msg, err := msgs.Next(jetstream.NextContext(ctx))
 		if err == nil {
 			handle(msg)
 
@@ -355,3 +385,14 @@ func (l *Log) pump(msgs jetstream.MessagesContext, stop <-chan struct{}, handle 
 		return err
 	}
 }
+
+// iterOwner gives a pull iterator to whichever of its loop and its stopper
+// comes first: the loop stops it when it ends (pumpMsgs), and the stopper
+// only when no loop ever took it.
+type iterOwner struct {
+	state atomic.Int32 // 0 free, 1 a loop has it, 2 the stopper has it
+}
+
+func (o *iterOwner) takeForLoop() bool { return o.state.CompareAndSwap(0, 1) }
+
+func (o *iterOwner) takeForStop() bool { return o.state.CompareAndSwap(0, 2) }

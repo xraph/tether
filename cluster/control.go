@@ -116,7 +116,7 @@ type Control struct {
 	quitOnce sync.Once
 
 	// heartbeat is the idle heartbeat of the consumer's pull requests, 0 for
-	// the nats.go default (5 s). Tests shorten it.
+	// pullHeartbeat. Tests shorten it.
 	heartbeat time.Duration
 	// resetAttempts is the consumer's MaxResetAttempts, 0 for
 	// consumerResetAttempts; stallAfter is how long it may deliver nothing
@@ -370,12 +370,7 @@ func (c *Control) open(ctx context.Context, start uint64) (*controlRun, error) {
 		return nil, c.wrapErr("control bus: create consumer", err)
 	}
 
-	var msgs jetstream.MessagesContext
-	if c.heartbeat > 0 {
-		msgs, err = cons.Messages(jetstream.PullHeartbeat(c.heartbeat))
-	} else {
-		msgs, err = cons.Messages()
-	}
+	msgs, err := cons.Messages(jetstream.PullHeartbeat(pullHeartbeatOr(c.heartbeat)))
 
 	r := &controlRun{c: c, st: st, cons: cons, msgs: msgs, stop: make(chan struct{}), stall: newStallWatch(c.stallAfter)}
 	r.last.Store(start - 1)
@@ -469,6 +464,7 @@ type controlRun struct {
 	stop  chan struct{}
 	once  sync.Once
 	stall *stallWatch
+	own   iterOwner
 
 	// fnMu is held while handlers run. halt sets stopped first and then
 	// takes fnMu, so it waits for handlers that are running and none start
@@ -479,8 +475,8 @@ type controlRun struct {
 	stalled atomic.Bool
 }
 
-// halt stops handing events to handlers and shuts the iterator down in the
-// background.
+// halt stops handing events to handlers and has the iterator shut down in
+// the background: by the run's loop when it has it (pumpMsgs), else here.
 func (r *controlRun) halt() {
 	r.once.Do(func() {
 		r.stopped.Store(true)
@@ -489,7 +485,7 @@ func (r *controlRun) halt() {
 
 		close(r.stop)
 
-		if r.msgs != nil {
+		if r.msgs != nil && r.own.takeForStop() {
 			go r.msgs.Stop()
 		}
 	})
@@ -508,26 +504,9 @@ func (r *controlRun) loop() error {
 
 	go r.stall.run(r.stop, ended, r.behind, r.onStall)
 
-	for {
-		msg, err := r.msgs.Next()
-		if err == nil {
-			r.handle(msg)
-
-			continue
-		}
-
-		select {
-		case <-r.stop:
-			return nil
-		default:
-		}
-
-		// The iterator is finished; release it. No handler runs after this
-		// loop, so last is final.
-		go r.msgs.Stop()
-
-		return err
-	}
+	// pumpMsgs stops the iterator when it ends. No handler runs after it,
+	// so last is final.
+	return pumpMsgs(r.msgs, &r.own, r.stop, r.handle)
 }
 
 // behind is the stall watch's question: the stream's last sequence (every
