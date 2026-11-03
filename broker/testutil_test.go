@@ -46,9 +46,12 @@ var waitScale = loadWaitScale()
 
 func loadWaitScale() float64 {
 	if v := os.Getenv("TETHER_TEST_WAIT_SCALE"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 1 {
-			return f
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 1 {
+			panic("TETHER_TEST_WAIT_SCALE must be a number of at least 1, got " + strconv.Quote(v))
 		}
+
+		return f
 	}
 
 	if os.Getenv("CI") != "" {
