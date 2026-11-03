@@ -1135,16 +1135,22 @@ func TestAcksPromptAfterLogReturns(t *testing.T) {
 }
 
 // readAcksInOrder reads n PUBACKs for packet IDs 1..n, in that order, all
-// successful.
-func readAcksInOrder(t *testing.T, conn net.Conn, n int) {
+// successful, and returns when each was read.
+func readAcksInOrder(t *testing.T, conn net.Conn, n int) []time.Time {
 	t.Helper()
+
+	at := make([]time.Time, 0, n)
 
 	for id := uint16(1); id <= uint16(n); id++ {
 		cp := readLog(t, conn)
+		at = append(at, time.Now())
+
 		require.Equal(t, packets.PUBACK, cp.Type, "packet %d", id)
 		require.Equal(t, id, cp.Content.(*packets.Puback).PacketID, "acks out of order")
 		require.Equal(t, byte(0), cp.Content.(*packets.Puback).ReasonCode)
 	}
+
+	return at
 }
 
 // storedOnce checks the tenant's log holds the payloads 1..n once each, in
@@ -1270,11 +1276,22 @@ func TestLateAckResentOnceAndAcked(t *testing.T) {
 // a client's publishes are in flight to it, so what was on the routes is lost
 // when they time out, and the survivors sit out a raft election. The client
 // then sends nothing more. Once the log has a leader again the head is sent
-// again and commits promptly, and every publish behind it that is still
-// unanswered goes again at once: all of them are acked within a couple of
-// seconds of the new leader, in order, and stored once. (Resending only an
-// unanswered publish with a later answer behind it left these waiting a
-// late bound each, about a second per lost ack.)
+// again and commits, and every publish behind it that is still unanswered
+// goes again at once: the acks come in order and together, and each is stored
+// once. (Resending only an unanswered publish with a later answer behind it
+// left these waiting out late bounds, 22 s for the lot.)
+//
+// What separates the two is how the acks come, not how long they take in
+// all. Sent again at once, they come together, with at most one gap of a late
+// bound (appendLate, 1 s) between two of them, by design: a head whose commit
+// right after the election is slower than appendLate means a slow log, so
+// only failures go again and the next publish waits out its bound before the
+// rest follow it. Waited out one by one, they come a late bound apart, and
+// the bound grows while they do: with that resend undone the first six acks
+// came 4 s apart before the rest went together, 24 s in all. Two such gaps
+// pass, the one the design has and one for a stall on a loaded runner. The
+// total is only logged: it depends on when this test sees the new leader and
+// on the runner (0 to 3.5 s on CI).
 func TestLostAcksResentWhenLogReturns(t *testing.T) {
 	const n = 20
 
@@ -1351,14 +1368,23 @@ func TestLostAcksResentWhenLogReturns(t *testing.T) {
 		return false
 	}, logWait, 50*time.Millisecond)
 
-	readAcksInOrder(t, conn, n)
+	acked := readAcksInOrder(t, conn, n)
 
 	took := time.Since(elected)
 	attempts := a.cluster.appendAttempts.Load() - base
 
-	t.Logf("leader %s cut off; %d acks %s after the new leader showed, %d append attempts", leader, n, took.Round(time.Millisecond), attempts)
+	lateGaps := 0
 
-	require.Less(t, took, 3*time.Second, "lost acks were waited out one by one")
+	for i := 1; i < len(acked); i++ {
+		if acked[i].Sub(acked[i-1]) >= a.cluster.appendLate {
+			lateGaps++
+		}
+	}
+
+	t.Logf("leader %s cut off; %d acks %s after the new leader showed, %d append attempts, %d gaps of a late bound (%s) between acks",
+		leader, n, took.Round(time.Millisecond), attempts, lateGaps, a.cluster.appendLate)
+
+	require.LessOrEqual(t, lateGaps, 2, "lost acks were waited out one by one")
 	storedOnce(t, a, t1.ID.String(), n)
 }
 
