@@ -48,6 +48,12 @@ type Services struct {
 	Perms  broker.PermLoader
 	Limits *limits.Limiter
 
+	// Entitlement is the broker's entitlement check (broker.Deps.Entitlement),
+	// asked once per POST /v1/publish after the rate limit and before the
+	// grants, so a tenant that may not connect may not publish over HTTP
+	// either. Nil checks nothing.
+	Entitlement broker.Entitlement
+
 	// Logger receives the internal errors the API hides from clients. Nil
 	// discards them.
 	Logger *slog.Logger

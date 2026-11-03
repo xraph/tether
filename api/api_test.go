@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1347,4 +1349,68 @@ func orEmpty(s []string) []string {
 	}
 
 	return s
+}
+
+// entitlementFunc is a broker.Entitlement from a function, counting calls.
+type entitlementFunc struct {
+	n     atomic.Int64
+	allow func(tenantID string) error
+}
+
+func (f *entitlementFunc) Allow(_ context.Context, tenantID string) error {
+	f.n.Add(1)
+
+	return f.allow(tenantID)
+}
+
+// Ruling R22: an HTTP publish follows the same entitlement rule as an MQTT
+// CONNECT. Not entitled is 403, a failed check 503, and a nil Entitlement
+// checks nothing.
+func TestPublishChecksEntitlement(t *testing.T) {
+	var answer atomic.Pointer[error]
+
+	ent := &entitlementFunc{allow: func(string) error {
+		if err := answer.Load(); err != nil {
+			return *err
+		}
+
+		return nil
+	}}
+	refuse := func(err error) { answer.Store(&err) }
+
+	e := newEnvWith(t, func(s *api.Services) { s.Entitlement = ent })
+	d, listener, tid := publisher(t, e, nil)
+
+	body := map[string]any{"topic": "up/open/x", "payload": b64("1")}
+
+	expect(t, e.publish(d.username, d.password, body), http.StatusOK)
+	assert.Equal(t, "1", listener.next(t).Payload)
+	assert.Equal(t, int64(1), ent.n.Load())
+
+	refuse(fmt.Errorf("metering: %w: tether.access: no plan", broker.ErrNotEntitled))
+
+	r := expect(t, e.publish(d.username, d.password, body), http.StatusForbidden)
+	assert.Contains(t, string(r.body), "not entitled")
+	assert.NotContains(t, string(r.body), "no plan", "the reason stays on the server")
+
+	refuse(errors.New("ledger down"))
+	r = expect(t, e.publish(d.username, d.password, body), http.StatusServiceUnavailable)
+	assert.NotContains(t, string(r.body), "ledger down")
+
+	select {
+	case m := <-listener.msgs:
+		require.FailNow(t, "a refused publish was delivered", "%+v", m)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	assert.Equal(t, int64(3), ent.n.Load())
+	assert.Equal(t, uint64(1), e.broker.Stats(tid).MessagesIn, "only the entitled publish counts")
+}
+
+func TestPublishWithoutEntitlementChecksNothing(t *testing.T) {
+	e := newEnvWith(t, func(s *api.Services) { s.Entitlement = nil })
+	d, listener, _ := publisher(t, e, nil)
+
+	expect(t, e.publish(d.username, d.password, map[string]any{"topic": "up/open/x", "payload": b64("1")}), http.StatusOK)
+	assert.Equal(t, "1", listener.next(t).Payload)
 }

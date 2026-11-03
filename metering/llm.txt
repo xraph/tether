@@ -2,7 +2,7 @@
 
 Import: github.com/xraph/tether/metering
 
-Sends each tenant's broker usage to a billing sink every interval (ledger, in the extension), and decides at CONNECT and every interval whether a tenant is entitled to Tether at all (Entitlements, below). Imports `broker` (for `TenantUsage`, `ErrNotEntitled` and `Entitlement`) and the standard library only. It does not import ledger, and `broker` does not import it. The extension wires it (`extension/product.go`, see extension/llm.txt Metering, entitlements and audit) over ledger, through the adapters in `extension/ledger.go`.
+Sends each tenant's broker usage to a billing sink every interval (ledger, in the extension), and decides at CONNECT and every interval whether a tenant is entitled to Tether at all (Entitlements, below). Imports `broker` (for `TenantUsage`, `ErrNotEntitled` and `Entitlement`), the root `tether` package (for `ErrNotFound`) and the standard library only. It does not import ledger, and `broker` does not import it. The extension wires it (`extension/product.go`, see extension/llm.txt Metering, entitlements and audit) over ledger, through the adapters in `extension/ledger.go`.
 
 ## Types
 

@@ -1,8 +1,13 @@
 package extension_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -217,6 +222,39 @@ func TestHardQuotaDisconnects(t *testing.T) {
 	assert.Positive(t, allowed)
 
 	assert.Equal(t, "0", metricValue(t, p.app, extension.MetricMeteringErrors))
+}
+
+// Ruling R22: a tenant that is not entitled can't publish over HTTP either.
+// Its MQTT CONNECT gets 0x97 and its POST /v1/publish gets 403.
+func TestNotEntitledHTTPPublishRefused(t *testing.T) {
+	ent := metering.DefaultEntitlementConfig()
+	ent.Enabled = true
+
+	p := startProduct(t, extension.WithEntitlements(ent)) // no plan for testOrg
+
+	tid := p.tenant()
+	p.role(tid, "sensor", []string{"up"}, nil)
+	d := p.device(tid, "sensor")
+
+	assert.Equal(t, byte(0x97), p.refused5(d.username, d.password, "dev-1"))
+
+	body, err := json.Marshal(map[string]any{"topic": "up", "payload": base64.StdEncoding.EncodeToString([]byte("x"))})
+	require.NoError(t, err)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, p.srv.URL+"/tether/v1/publish", bytes.NewReader(body))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(d.username, d.password)
+
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "body: %s", raw)
+	assert.Contains(t, string(raw), "not entitled")
 }
 
 // refused5 sends an MQTT 5.0 CONNECT that the broker must refuse, and returns

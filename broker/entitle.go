@@ -15,7 +15,9 @@ var ErrNotEntitled = errors.New("tether/broker: not entitled")
 
 // Entitlement decides whether a tenant may connect. The broker asks it once
 // per CONNECT, after the tenant is resolved and before the session and slot
-// checks, and never on the PUBLISH path. Deps.Entitlement nil checks nothing.
+// checks, and never on the MQTT PUBLISH path. The REST publish endpoint asks
+// the same one once per HTTP publish (api.Services.Entitlement), so answer
+// from memory when you can. Deps.Entitlement nil checks nothing.
 //
 // Allow returns nil to let the tenant in. An error wrapping ErrNotEntitled
 // refuses the CONNECT with 0x97 quota exceeded (3.1.1: server unavailable)

@@ -349,6 +349,7 @@ func (e *Extension) Start(ctx context.Context) error {
 		Logger:            slogger,
 		MaxPublishPayload: int(b.MaxPacketSize()),
 		Audit:             prod.emitter(),
+		Entitlement:       prod.entitlement(),
 	}
 
 	if !e.config.DisableRoutes {

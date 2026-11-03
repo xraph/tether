@@ -171,6 +171,16 @@ func (p *product) brokerDeps(d *broker.Deps) {
 	}
 }
 
+// entitlement is the REST publish endpoint's entitlement check, the same
+// one the broker asks at CONNECT; nil when entitlements are off.
+func (p *product) entitlement() broker.Entitlement {
+	if p.ent == nil {
+		return nil
+	}
+
+	return p.ent
+}
+
 // emitter is the REST API's and the dashboard's audit hook, nil when audit is
 // off.
 func (p *product) emitter() audit.Emitter {

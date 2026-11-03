@@ -15,6 +15,7 @@ import (
 	"github.com/xraph/tether"
 	"github.com/xraph/tether/acl"
 	"github.com/xraph/tether/auth"
+	"github.com/xraph/tether/broker"
 	"github.com/xraph/tether/topic"
 )
 
@@ -124,11 +125,13 @@ func (a *API) unauthorized(c forge.Context, err error) error {
 }
 
 // publish runs the checks a device's MQTT PUBLISH goes through: the topic,
-// the tenant's message rate, then the grants, then the broker. The rate comes
-// before the grants on purpose: loading them asks warden, and a device over
-// its budget must not be able to make it do that at will. So the tenant's
-// budget bounds the load, and a publish refused by its grants has still
-// spent a token, as an MQTT PUBLISH refused by the ACL has used the network.
+// the tenant's message rate, its entitlement (what an MQTT client meets at
+// CONNECT), then the grants, then the broker. The rate comes before the
+// entitlement and the grants on purpose: those can ask ledger and warden,
+// and a device over its budget must not be able to make them do that at
+// will. So the tenant's budget bounds the load, and a publish refused later
+// has still spent a token, as an MQTT PUBLISH refused by the ACL has used the
+// network.
 //
 // "$" topics follow MQTT: "$SYS" and "$share" (any casing) are refused, any
 // other "$" name needs a grant that names it, since a filter that starts
@@ -166,6 +169,10 @@ func (a *API) publish(c forge.Context) error {
 		return mapError(fmt.Errorf("%w: tenant message rate exceeded", auth.ErrRateLimited))
 	}
 
+	if refused := a.entitled(c, tn.ID.String()); refused != nil {
+		return refused
+	}
+
 	rules, _, err := a.Perms.Load(c.Context(), ident)
 	if err != nil {
 		return a.loadFailed(err)
@@ -186,6 +193,31 @@ func (a *API) publish(c forge.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, publishResponse{Published: true})
+}
+
+// entitled asks the broker's Entitlement whether tenantID may publish, the
+// same answer a CONNECT gets (ruling R22). A tenant whose plan does not
+// cover Tether is 403 with a fixed text; a check that failed is 503 and is
+// logged. Without an Entitlement every tenant may. A tenant with a
+// remembered answer is answered from memory, so this is not a ledger call
+// per publish.
+func (a *API) entitled(c forge.Context, tenantID string) error {
+	if a.Entitlement == nil {
+		return nil
+	}
+
+	err := a.Entitlement.Allow(c.Context(), tenantID)
+
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, broker.ErrNotEntitled):
+		return forge.NewHTTPError(http.StatusForbidden, "not entitled")
+	default:
+		a.Logger.Error("tether/api: entitlement check failed", "tenant", tenantID, "error", err)
+
+		return mapError(auth.ErrUnavailable)
+	}
 }
 
 // isSys reports whether name is under "$SYS" in any casing, which a client
