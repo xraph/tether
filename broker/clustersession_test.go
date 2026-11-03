@@ -786,8 +786,23 @@ func TestSlowSubscriberCursorNeverSkips(t *testing.T) {
 		require.Equal(t, byte(0), publishQ(t, pub, "flood/x", strconv.Itoa(i), 1))
 	}
 
-	// The window is full; mochi dropped the rest for this connection.
-	eventually(t, "the first 100 deliveries", func() bool { return slow.pubs.Load() >= 100 })
+	// The window is full; mochi dropped the rest for this connection. This is
+	// setup, not a bound on the broker: it normally takes milliseconds, but
+	// it once ran past waitTimeout on CI with no clue why, so it waits as
+	// long as the replay below, logs how long it took, and on a timeout
+	// says where the deliveries stood.
+	began := time.Now()
+	deadline := began.Add(logWait)
+
+	for slow.pubs.Load() < 100 {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for the first 100 deliveries: %s", slowDeliveryState(c.nodes[0], tid, "slow", slow.pubs.Load()))
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Logf("first 100 deliveries %s after the last publish", time.Since(began).Round(time.Millisecond))
 	require.Less(t, slow.pubs.Load(), int64(total))
 
 	// The connection dies without a DISCONNECT.
@@ -814,6 +829,33 @@ func TestSlowSubscriberCursorNeverSkips(t *testing.T) {
 
 		return true
 	})
+}
+
+// slowDeliveryState describes where deliveries to clientID on b stood, for a
+// test that waited for them in vain: how many reached the client, how far
+// the node's reader got, the session's mode and position and mochi's
+// inflight count.
+func slowDeliveryState(b *Broker, tenantID, clientID string, got int64) string {
+	n := b.cluster
+	nsID := namespacedID(tenantID, clientID)
+	tt := n.track(tenantID)
+
+	sess := "no session"
+
+	if s := n.sessionByID(nsID); s != nil {
+		s.mu.Lock()
+		sess = fmt.Sprintf("mode %d (0 live, 1 replay, 2 waiting), pos %d, flip floor %d, queued %d, pinned %v, lost %v, ended %v",
+			s.mode, s.pos, s.flipFloor, len(s.queued), s.pinned, s.lost, s.ended)
+		s.mu.Unlock()
+	}
+
+	inflight := -1
+	if cl, ok := n.mochi.Clients.Get(nsID); ok {
+		inflight = cl.State.Inflight.Len()
+	}
+
+	return fmt.Sprintf("%d on the wire; reader delivered %d, live position %d, last message %d; session %s; inflight %d",
+		got, n.logDelivered.Load(), tt.livePos.Load(), tt.lastMsg.Load(), sess, inflight)
 }
 
 // A clean session takes its key for ownership and deletes it when it ends.
