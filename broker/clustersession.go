@@ -1201,7 +1201,9 @@ func (b *Broker) established(cl *mqtt.Client, st *clientState) {
 // deliveries (deliveriesOf takes the old connection) and in no inflight map
 // that will ever be resent. Each delivery of the session that the new
 // connection's inflight map does not hold under the same packet ID and
-// sequence is dropped from the books and the session is pinned below it, so
+// sequence (for a QoS 2 flow at PUBREL, which mochi sends untagged: a PUBREL
+// under the ID whose QoS2Out entry is at PUBREL for that sequence) is
+// dropped from the books and the session is pinned below it, so
 // a repin replays it (as onPublishDropped does). followShare does the same
 // for shared deliveries. It runs at the CONNACK (established), after
 // Clients.Add, when nothing more can go to the old connection.
@@ -1213,6 +1215,14 @@ func (n *clusterNode) recoverHandover(s *session, cl *mqtt.Client) {
 	for id, seq := range s.out {
 		if held, ok := cl.State.Inflight.Get(id); ok {
 			if hs, tagged := seqOf(held); tagged && hs == seq {
+				continue
+			}
+
+			// A QoS 2 flow at PUBREL: mochi's PUBREL (buildAck) carries no
+			// sequence tag, so the record says whose it is. Mochi resends
+			// it; sending the message again would deliver it twice.
+			if or, found := s.qos2Out[id]; found && held.FixedHeader.Type == packets.Pubrel &&
+				or.Seq == seq && or.State == outPubrel {
 				continue
 			}
 		}

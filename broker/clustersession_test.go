@@ -1609,3 +1609,71 @@ func TestRetainedQoS2PubrelResumedElsewhere(t *testing.T) {
 		}
 	}
 }
+
+// A log QoS 2 delivery at PUBREL when the client reconnects on the same node
+// is a flow mochi resends as a PUBREL: mochi's PUBREL carries no sequence
+// tag, and it still counts as held, so the session is not pinned below it
+// and the message is not sent again as a new PUBLISH, which the client would
+// take as a second message (exactly once).
+func TestHandoverPubrelNotResentAsPublish(t *testing.T) {
+	c := startCluster(t, 1)
+
+	pub, _, err := connect5(t, c.addr(0), "hp-pub", "u1", true)
+	require.NoError(t, err)
+
+	expiry := uint32(3600)
+	connect := func() net.Conn {
+		return rawConnect(t, c.addr(0), &packets.Connect{
+			ProtocolName: "MQTT", ProtocolVersion: 5, ClientID: "hp", CleanStart: false, KeepAlive: 30,
+			Username: "u1", UsernameFlag: true, Password: []byte("s"), PasswordFlag: true,
+			Properties: &packets.Properties{SessionExpiryInterval: &expiry},
+		})
+	}
+
+	old := connect()
+	writePacket(t, old, &packets.Subscribe{PacketID: 1, Subscriptions: []packets.SubOptions{{Topic: "hp/#", QoS: 2}}, Properties: &packets.Properties{}})
+	require.Equal(t, packets.SUBACK, readPacket(t, old).Type)
+
+	require.Equal(t, byte(0), publishQ(t, pub, "hp/x", "once", 2))
+
+	var id uint16
+
+	for id == 0 {
+		if p, ok := readPacket(t, old).Content.(*packets.Publish); ok {
+			require.Equal(t, "once", string(p.Payload))
+			id = p.PacketID
+		}
+	}
+
+	writePacket(t, old, &packets.Pubrec{PacketID: id, Properties: &packets.Properties{}})
+	require.Equal(t, packets.PUBREL, readPacket(t, old).Type)
+
+	// No PUBCOMP: the client reconnects with the flow at PUBREL and takes
+	// the session over on the same node.
+	cur := connect()
+
+	sawPubrel := false
+	deadline := time.Now().Add(2 * time.Second)
+
+	for time.Now().Before(deadline) {
+		require.NoError(t, cur.SetReadDeadline(deadline))
+
+		cp, rerr := packets.ReadPacket(cur)
+		if rerr != nil {
+			break
+		}
+
+		switch p := cp.Content.(type) {
+		case *packets.Pubrel:
+			require.Equal(t, id, p.PacketID)
+			sawPubrel = true
+
+			writePacket(t, cur, &packets.Pubcomp{PacketID: p.PacketID, Properties: &packets.Properties{}})
+		case *packets.Publish:
+			t.Fatalf("%q sent again as a PUBLISH (id %d, dup %v) after its PUBREL", p.Payload, p.PacketID, p.Duplicate)
+		}
+	}
+
+	require.True(t, sawPubrel, "the flow's PUBREL was not resent")
+	require.Zero(t, c.nodes[0].cluster.handoverLost.Load(), "the PUBREL was taken for a lost delivery")
+}
