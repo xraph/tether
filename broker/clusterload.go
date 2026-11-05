@@ -155,7 +155,7 @@ func (b *Broker) startLoad(started time.Time) {
 	b.load.stale = loadStaleAfter * interval
 	b.load.mu.Unlock()
 
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // G118: Stop calls it, through b.loadCancel.
+	ctx, cancel := context.WithCancel(context.Background()) // #nosec G118 -- Stop calls it, through b.loadCancel.
 	b.loadCancel = cancel
 
 	b.loadWG.Go(func() { b.runLoad(ctx, started, interval) })
