@@ -9,17 +9,18 @@ require (
 	github.com/eclipse/paho.mqtt.golang v1.5.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
-	github.com/jackc/pgx/v5 v5.11.0
+	github.com/jackc/pgx/v5 v5.12.0
 	github.com/mochi-mqtt/server/v2 v2.7.9
 	github.com/nats-io/nats-server/v2 v2.15.1
 	github.com/nats-io/nats.go v1.54.0
 	github.com/stretchr/testify v1.12.1
-	github.com/xraph/chronicle v1.10.0
+	github.com/xraph/chronicle v1.11.0
+	github.com/xraph/chronicle/extension v1.11.0
 	github.com/xraph/forge v1.13.2
 	github.com/xraph/forge/extensions/auth v1.13.2
-	github.com/xraph/grove v1.10.1
-	github.com/xraph/grove/drivers/pgdriver v1.10.1
-	github.com/xraph/grove/drivers/sqlitedriver v1.10.1
+	github.com/xraph/grove v1.10.2
+	github.com/xraph/grove/drivers/pgdriver v1.10.2
+	github.com/xraph/grove/drivers/sqlitedriver v1.10.2
 	github.com/xraph/grove/extension v1.10.1
 	github.com/xraph/keysmith v1.9.0
 	github.com/xraph/ledger v1.9.0
@@ -97,7 +98,7 @@ require (
 	github.com/hashicorp/serf v0.10.4 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/puddle/v2 v2.2.2 // indirect
+	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
@@ -120,7 +121,7 @@ require (
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.61.0 // indirect
 	github.com/quic-go/webtransport-go v0.12.0 // indirect
-	github.com/redis/go-redis/v9 v9.22.0 // indirect
+	github.com/redis/go-redis/v9 v9.23.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
@@ -131,13 +132,18 @@ require (
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.2.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
+	github.com/xraph/chronicle/handler v1.11.0 // indirect
+	github.com/xraph/chronicle/store/mongo v1.11.0 // indirect
+	github.com/xraph/chronicle/store/postgres v1.11.0 // indirect
+	github.com/xraph/chronicle/store/redis v1.11.0 // indirect
+	github.com/xraph/chronicle/store/sqlite v1.11.0 // indirect
 	github.com/xraph/confy v1.1.0 // indirect
 	github.com/xraph/go-utils v1.5.0 // indirect
-	github.com/xraph/grove/drivers/mongodriver v1.10.1 // indirect
-	github.com/xraph/grove/kv v1.10.1 // indirect
-	github.com/xraph/grove/kv/drivers/redisdriver v1.10.1 // indirect
+	github.com/xraph/grove/drivers/mongodriver v1.10.2 // indirect
+	github.com/xraph/grove/kv v1.10.2 // indirect
+	github.com/xraph/grove/kv/drivers/redisdriver v1.10.2 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
-	go.mongodb.org/mongo-driver/v2 v2.9.1 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.9.2 // indirect
 	go.opencensus.io v0.22.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect
@@ -148,12 +154,12 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
-	go.opentelemetry.io/otel/sdk v1.45.0 // indirect
+	go.opentelemetry.io/otel/sdk v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk/log v0.21.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.45.0 // indirect
+	go.opentelemetry.io/otel/sdk/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
-	go.uber.org/atomic v1.11.0 // indirect
+	go.uber.org/atomic v1.12.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
