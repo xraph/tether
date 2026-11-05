@@ -313,10 +313,11 @@ func TestReaderFromSeq(t *testing.T) {
 		t.Fatalf("from %d: got %v, want %v", from, seqs(got), all[8:])
 	}
 
-	// Position starts below the first sequence it will read.
-	if pos := r.Position(); pos != all[len(all)-1] {
-		t.Fatalf("Position %d, want %d", pos, all[len(all)-1])
-	}
+	// Position moves once the handler returns, so the collector can hold the
+	// last message a moment before Position reaches it.
+	eventually(t, 5*time.Second, fmt.Sprintf("Position to reach %d", all[len(all)-1]), func() bool {
+		return r.Position() == all[len(all)-1]
+	})
 
 	// From the future: nothing now, then what arrives from that sequence on.
 	last := mustAppend(t, l, LogMessage{Tenant: testTenant, Topic: "t"})
