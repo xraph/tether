@@ -15,21 +15,21 @@ require (
 	github.com/nats-io/nats.go v1.54.0
 	github.com/stretchr/testify v1.12.1
 	github.com/xraph/chronicle v1.11.0
-	github.com/xraph/chronicle/extension v1.11.0
-	github.com/xraph/forge v1.13.2
-	github.com/xraph/forge/extensions/auth v1.13.2
-	github.com/xraph/grove v1.10.2
-	github.com/xraph/grove/drivers/pgdriver v1.10.2
-	github.com/xraph/grove/drivers/sqlitedriver v1.10.2
-	github.com/xraph/grove/extension v1.10.1
-	github.com/xraph/keysmith v1.9.0
-	github.com/xraph/ledger v1.9.0
-	github.com/xraph/vessel v1.0.5
-	github.com/xraph/warden v1.8.1
+	github.com/xraph/chronicle/extension v1.11.1
+	github.com/xraph/forge v1.14.0
+	github.com/xraph/forge/extensions/auth v1.14.0
+	github.com/xraph/grove v1.10.3
+	github.com/xraph/grove/drivers/pgdriver v1.10.3
+	github.com/xraph/grove/drivers/sqlitedriver v1.10.3
+	github.com/xraph/grove/extension v1.10.4
+	github.com/xraph/keysmith v1.9.2
+	github.com/xraph/ledger v1.9.4
+	github.com/xraph/vessel v1.0.7
+	github.com/xraph/warden v1.8.4
 	go.jetify.com/typeid/v2 v2.0.0-alpha.3
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
-	modernc.org/sqlite v1.46.1
+	modernc.org/sqlite v1.62.0
 )
 
 require (
@@ -43,7 +43,7 @@ require (
 	github.com/dgraph-io/badger/v4 v4.2.0 // indirect
 	github.com/dgraph-io/ristretto v0.1.1 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/dustin/go-humanize v1.1.0 // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
@@ -100,7 +100,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
@@ -112,7 +112,7 @@ require (
 	github.com/nats-io/jwt/v2 v2.8.2 // indirect
 	github.com/nats-io/nkeys v0.4.16 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -129,21 +129,20 @@ require (
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
-	github.com/xdg-go/scram v1.2.0 // indirect
+	github.com/xdg-go/scram v1.4.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
-	github.com/xraph/chronicle/handler v1.11.0 // indirect
+	github.com/xraph/chronicle/handler v1.11.1 // indirect
 	github.com/xraph/chronicle/store/mongo v1.11.0 // indirect
 	github.com/xraph/chronicle/store/postgres v1.11.0 // indirect
 	github.com/xraph/chronicle/store/redis v1.11.0 // indirect
 	github.com/xraph/chronicle/store/sqlite v1.11.0 // indirect
 	github.com/xraph/confy v1.1.0 // indirect
-	github.com/xraph/go-utils v1.5.0 // indirect
-	github.com/xraph/grove/drivers/mongodriver v1.10.2 // indirect
+	github.com/xraph/go-utils v1.5.1 // indirect
+	github.com/xraph/grove/drivers/mongodriver v1.10.3 // indirect
 	github.com/xraph/grove/kv v1.10.2 // indirect
 	github.com/xraph/grove/kv/drivers/redisdriver v1.10.2 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
-	go.mongodb.org/mongo-driver/v2 v2.9.2 // indirect
+	go.mongodb.org/mongo-driver/v2 v2.10.0 // indirect
 	go.opencensus.io v0.22.5 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.70.0 // indirect
@@ -166,8 +165,8 @@ require (
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
@@ -182,9 +181,9 @@ require (
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad // indirect
 	k8s.io/utils v0.0.0-20260707023825-cf1189d6abe3 // indirect
-	modernc.org/libc v1.68.0 // indirect
+	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
-	modernc.org/memory v1.11.0 // indirect
+	modernc.org/memory v1.12.1 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect
