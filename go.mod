@@ -15,17 +15,17 @@ require (
 	github.com/nats-io/nats.go v1.54.0
 	github.com/stretchr/testify v1.12.1
 	github.com/xraph/chronicle v1.11.0
-	github.com/xraph/chronicle/extension v1.11.1
-	github.com/xraph/forge v1.14.0
-	github.com/xraph/forge/extensions/auth v1.14.0
+	github.com/xraph/chronicle/extension v1.11.2
+	github.com/xraph/forge v1.14.1
+	github.com/xraph/forge/extensions/auth v1.14.1
 	github.com/xraph/grove v1.10.3
 	github.com/xraph/grove/drivers/pgdriver v1.10.3
 	github.com/xraph/grove/drivers/sqlitedriver v1.10.3
-	github.com/xraph/grove/extension v1.10.4
-	github.com/xraph/keysmith v1.9.2
-	github.com/xraph/ledger v1.9.4
-	github.com/xraph/vessel v1.0.7
-	github.com/xraph/warden v1.8.4
+	github.com/xraph/grove/extension v1.10.5
+	github.com/xraph/keysmith v1.9.3
+	github.com/xraph/ledger v1.9.5
+	github.com/xraph/vessel v1.0.8
+	github.com/xraph/warden v1.8.5
 	go.jetify.com/typeid/v2 v2.0.0-alpha.3
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -131,7 +131,7 @@ require (
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xdg-go/scram v1.4.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
-	github.com/xraph/chronicle/handler v1.11.1 // indirect
+	github.com/xraph/chronicle/handler v1.11.2 // indirect
 	github.com/xraph/chronicle/store/mongo v1.11.0 // indirect
 	github.com/xraph/chronicle/store/postgres v1.11.0 // indirect
 	github.com/xraph/chronicle/store/redis v1.11.0 // indirect
